@@ -70,16 +70,18 @@ required by conservative stack scanning, same as Boehm GC).
    map-indexed keep-indexed partition-all zipmap merge-with reduce-kv
    repeatedly doto letfn (works via late binding!) assert; natives int?
    double?. Also fixed: ~@ splicing inside vector templates ([~@(...)]).
-5. ~~HAMT persistent maps~~ ✅ done 2026-06-10 — bit-partitioned trie
+5. ~~HAMT persistent maps + persistent vectors~~ ✅ done 2026-06-10 — bit-partitioned trie
    (5-bit chunks, bitmap+popcount nodes, collision nodes, path-copying).
    Nodes are ordinary GC cells (CLJC_HNODE) with kids interleaved
    [k1,v1,...], k==NULL → subnode. cljc_hash agrees with cljc_eq
    ((= 1 1.0), list/vector seq equality, order-independent map hash).
    Reader errors on duplicate literal keys; map iteration order is hash
    order (divergence: literal eval order + print order not source order).
-   100k assoc+lookup ≈ 0.35s. STILL TODO from this milestone: persistent
-   vectors (32-way dense tries + tail) and sets (#{...} over HAMT) —
-   vectors still copy O(n) on conj/assoc.
+   100k assoc+lookup ≈ 0.35s. Vectors: Clojure-style 32-way position
+   tries + owned tail of ≤32 elems (amortized O(1) conj — 100k conjs in
+   ~33ms), path-copying assoc, trie nodes reuse CLJC_HNODE; all access
+   behind vec_len/vec_nth/vec_conj1/vec_assoc_idx. STILL TODO: sets
+   (#{...} over the HAMT) — start the next session with these.
 6. **More surface**: sets (#{...}) — fold into the HAMT milestone; regex
    (`re-find`/`re-matches`; needs a decision: POSIX ERE divergence vs tiny
    regex engine); `condp`, `for` :when/:let modifiers, `..`,

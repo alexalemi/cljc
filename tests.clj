@@ -428,4 +428,27 @@
 (spit "/tmp/cljc-test.txt" "hello file")
 (assert= "hello file" (slurp "/tmp/cljc-test.txt"))
 
+
+; ── persistent vectors ──
+(def bigv (reduce conj [] (range 5000)))
+(assert= 5000 (count bigv))
+(assert= 0 (nth bigv 0))
+(assert= 31 (nth bigv 31))      ; tail boundary
+(assert= 32 (nth bigv 32))      ; first tree leaf
+(assert= 1023 (nth bigv 1023))  ; one level
+(assert= 1024 (nth bigv 1024))  ; two levels
+(assert= 4999 (nth bigv 4999))
+(assert= 4999 (last bigv))
+(def bv2 (assoc bigv 2500 :changed))
+(assert= :changed (nth bv2 2500))
+(assert= 2500 (nth bigv 2500))  ; persistence
+(assert= 5000 (count bv2))
+(def bv3 (conj bigv :end))
+(assert= :end (nth bv3 5000))
+(assert= 5000 (count bigv))
+(gc)
+(assert= 2500 (nth bigv 2500))  ; structural sharing survives GC
+(assert= :changed (nth bv2 2500))
+(assert= true (= (vec (range 100)) (reduce conj [] (range 100))))
+(assert= [1 2 :x] (assoc [1 2] 2 :x))   ; assoc at len appends
 (println "tests complete")

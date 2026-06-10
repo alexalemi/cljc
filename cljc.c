@@ -60,7 +60,10 @@ struct Cljc {
         const char *kw;
         char *str;
         struct { Cljc *head; Cljc *tail; } cons;
-        struct { Cljc **items; size_t len; size_t cap; } vec;
+        /* Persistent vector: 32-way position trie + tail of the last ≤32
+         * elements. tail is owned by THIS cell (copied per derived vector);
+         * tree nodes are shared CLJC_HNODE cells. root NULL → all in tail. */
+        struct { Cljc *root; Cljc **tail; uint32_t count; uint8_t shift; uint8_t taillen; } vec;
         /* HAMT persistent map: root tree node (NULL when empty) + entry count */
         struct { Cljc *root; size_t count; } map;
         /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
@@ -101,6 +104,8 @@ static double as_num(Cljc *v);
 static Cljc *to_seq(Cljc *v);
 static Cljc *cell_alloc(void);
 static CljcEnv *env_alloc(void);
+static size_t vec_len(Cljc *v);
+static Cljc *vec_nth(Cljc *v, size_t i);
 static Cljc *NIL, *TRUE, *FALSE;
 
 /* ───── Error handling ───────────────────────────────────────────────── */
@@ -296,8 +301,9 @@ static void gc_mark(Cljc *v) {
                 v = v->as.cons.tail;      /* iterate tails: lists can be huge */
                 break;
             case CLJC_VECTOR:
-                for (size_t i = 0; i < v->as.vec.len; i++) gc_mark(v->as.vec.items[i]);
-                return;
+                for (size_t i = 0; i < v->as.vec.taillen; i++) gc_mark(v->as.vec.tail[i]);
+                v = v->as.vec.root;  /* NULL-safe */
+                break;
             case CLJC_MAP:
                 v = v->as.map.root;  /* NULL-safe: loop condition handles it */
                 break;
@@ -389,7 +395,7 @@ static void gc_collect(void) {
             if (c->tag != CLJC_FREE) {
                 switch (c->tag) {
                     case CLJC_STRING: free(c->as.str); break;
-                    case CLJC_VECTOR: free(c->as.vec.items); break;
+                    case CLJC_VECTOR: free(c->as.vec.tail); break;
                     case CLJC_HNODE:  free(c->as.hnode.kids); break;
                     case CLJC_RECUR:  free(c->as.recur.vals); break;
                     default: break;  /* maps own nothing — their root is a cell */
@@ -469,8 +475,8 @@ static uint32_t cljc_hash(Cljc *v) {
         }
         case CLJC_VECTOR: {
             uint32_t h = 1;  /* same scheme as lists — sequential equality */
-            for (size_t i = 0; i < v->as.vec.len; i++)
-                h = h * 31 + cljc_hash(v->as.vec.items[i]);
+            for (size_t i = 0; i < vec_len(v); i++)
+                h = h * 31 + cljc_hash(vec_nth(v, i));
             return h;
         }
         case CLJC_MAP: {
@@ -747,6 +753,138 @@ static Cljc *map_entry_list(Cljc *m) {
     return out;
 }
 
+/* ───── Persistent vectors ───────────────────────────────────────────── */
+
+/* Clojure-style: a 32-way trie indexed by position bits plus a tail array
+ * holding the last ≤32 elements. conj is amortized O(1) (tail copy); every
+ * 32nd conj pushes the tail into the trie as a leaf by path copying.
+ * Trie nodes reuse CLJC_HNODE with 32 fixed kid slots (bitmap unused). */
+
+static size_t vec_len(Cljc *v) { return v->as.vec.count; }
+
+static size_t vec_tailoff(Cljc *v) {
+    uint32_t cnt = v->as.vec.count;
+    return cnt < 32 ? 0 : ((size_t)((cnt - 1) >> 5)) << 5;
+}
+
+static Cljc *vec_nth(Cljc *v, size_t i) {
+    if (i >= v->as.vec.count) cljc_error("vector index out of bounds: %zu", i);
+    size_t off = vec_tailoff(v);
+    if (i >= off) return v->as.vec.tail[i - off];
+    Cljc *node = v->as.vec.root;
+    for (int level = v->as.vec.shift; level > 0; level -= 5)
+        node = node->as.hnode.kids[(i >> level) & 31];
+    return node->as.hnode.kids[i & 31];
+}
+
+static Cljc *vec_node32(void) { return mk_hnode(0, 32, false, 0); }
+
+/* Fresh vector cell sharing v's tree but with its own (copied) tail. */
+static Cljc *vec_cell(Cljc *root, uint8_t shift, uint32_t count,
+                      Cljc **tail_src, uint8_t taillen, Cljc *append) {
+    Cljc *nv = alloc(CLJC_VECTOR);  /* union zeroed: safe if GC fires below */
+    uint8_t n = (uint8_t)(taillen + (append ? 1 : 0));
+    nv->as.vec.tail = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    if (taillen) memcpy(nv->as.vec.tail, tail_src, sizeof(Cljc *) * taillen);
+    if (append) nv->as.vec.tail[taillen] = append;
+    nv->as.vec.taillen = n;
+    nv->as.vec.root = root;
+    nv->as.vec.shift = shift;
+    nv->as.vec.count = count;
+    return nv;
+}
+
+static Cljc *mk_empty_vec(void) { return vec_cell(NULL, 0, 0, NULL, 0, NULL); }
+
+static Cljc *vec_newpath(int level, Cljc *node) {
+    while (level > 0) {
+        Cljc *wrap = vec_node32();  /* node stays stack-rooted */
+        wrap->as.hnode.kids[0] = node;
+        node = wrap;
+        level -= 5;
+    }
+    return node;
+}
+
+static Cljc *vec_pushtail(int level, Cljc *parent, Cljc *tailnode, uint32_t cnt) {
+    size_t subidx = ((cnt - 1) >> level) & 31;
+    Cljc *newchild;
+    if (level == 5) {
+        newchild = tailnode;
+    } else {
+        Cljc *child = parent->as.hnode.kids[subidx];
+        newchild = child ? vec_pushtail(level - 5, child, tailnode, cnt)
+                         : vec_newpath(level - 5, tailnode);
+    }
+    Cljc *ret = vec_node32();  /* newchild computed first: stack-rooted */
+    memcpy(ret->as.hnode.kids, parent->as.hnode.kids, sizeof(Cljc *) * 32);
+    ret->as.hnode.kids[subidx] = newchild;
+    return ret;
+}
+
+static Cljc *vec_conj1(Cljc *v, Cljc *x) {
+    uint32_t cnt = v->as.vec.count;
+    if (cnt - vec_tailoff(v) < 32)  /* room in tail: the cheap path */
+        return vec_cell(v->as.vec.root, v->as.vec.shift, cnt + 1,
+                        v->as.vec.tail, v->as.vec.taillen, x);
+    /* Tail full: push it into the trie as a leaf. */
+    Cljc *leaf = vec_node32();
+    memcpy(leaf->as.hnode.kids, v->as.vec.tail, sizeof(Cljc *) * 32);
+    Cljc *newroot;
+    uint8_t newshift = v->as.vec.shift;
+    if (v->as.vec.root == NULL) {
+        newroot = leaf;             /* first leaf IS the root (shift 0) */
+        newshift = 0;
+    } else if ((cnt >> 5) > (1u << v->as.vec.shift)) {
+        Cljc *path = vec_newpath(v->as.vec.shift, leaf);
+        newroot = vec_node32();
+        newroot->as.hnode.kids[0] = v->as.vec.root;
+        newroot->as.hnode.kids[1] = path;
+        newshift = (uint8_t)(v->as.vec.shift + 5);
+    } else {
+        newroot = vec_pushtail(v->as.vec.shift, v->as.vec.root, leaf, cnt);
+    }
+    return vec_cell(newroot, newshift, cnt + 1, &x, 0, x) /* tail = [x] */;
+}
+
+static Cljc *vec_doassoc(int level, Cljc *node, size_t i, Cljc *x) {
+    Cljc *newchild = NULL;
+    size_t subidx;
+    if (level == 0) {
+        subidx = i & 31;
+    } else {
+        subidx = (i >> level) & 31;
+        newchild = vec_doassoc(level - 5, node->as.hnode.kids[subidx], i, x);
+    }
+    Cljc *ret = vec_node32();
+    memcpy(ret->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 32);
+    ret->as.hnode.kids[subidx] = level == 0 ? x : newchild;
+    return ret;
+}
+
+static Cljc *vec_assoc_idx(Cljc *v, size_t i, Cljc *x) {
+    uint32_t cnt = v->as.vec.count;
+    if (i == cnt) return vec_conj1(v, x);  /* assoc at len appends */
+    if (i > cnt) cljc_error("assoc on vector: index out of bounds");
+    size_t off = vec_tailoff(v);
+    if (i >= off) {
+        Cljc *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt,
+                            v->as.vec.tail, v->as.vec.taillen, NULL);
+        nv->as.vec.tail[i - off] = x;
+        return nv;
+    }
+    Cljc *newroot = vec_doassoc(v->as.vec.shift, v->as.vec.root, i, x);
+    return vec_cell(newroot, v->as.vec.shift, cnt,
+                    v->as.vec.tail, v->as.vec.taillen, NULL);
+}
+
+/* Build a vector from a C array (small n — entry pairs, literals). */
+static Cljc *mk_vector(Cljc **items, size_t n) {
+    Cljc *v = mk_empty_vec();
+    for (size_t i = 0; i < n; i++) v = vec_conj1(v, items[i]);
+    return v;
+}
+
 static Cljc *cell_alloc(void) {
     maybe_gc();
     Cljc *c;
@@ -933,13 +1071,9 @@ static Cljc *read_form(const char **p) {
          * now use the list reader and rewrap. Persistent vectors arrive
          * with the PVec milestone. */
         Cljc *list = read_list(p, ']');
-        Cljc *v = alloc(CLJC_VECTOR);
-        size_t n = list_len(list);
-        v->as.vec.items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-        v->as.vec.len = n; v->as.vec.cap = n;
-        size_t i = 0;
+        Cljc *v = mk_empty_vec();
         for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
-            v->as.vec.items[i++] = l->as.cons.head;
+            v = vec_conj1(v, l->as.cons.head);
         return v;
     }
     if (c == '{') {
@@ -1021,18 +1155,18 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
         static const char *KW_AS;
         if (!KW_AS) KW_AS = intern("as", 2);
         Cljc *s = value == NIL ? NIL : to_seq(value);
-        for (size_t i = 0; i < pattern->as.vec.len; i++) {
-            Cljc *pe = pattern->as.vec.items[i];
+        for (size_t i = 0; i < vec_len(pattern); i++) {
+            Cljc *pe = vec_nth(pattern, i);
             if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) {
-                if (i + 1 >= pattern->as.vec.len)
+                if (i + 1 >= vec_len(pattern))
                     cljc_error("destructure: & needs a binding form");
-                destructure(scope, pattern->as.vec.items[++i], s);
+                destructure(scope, vec_nth(pattern, ++i), s);
                 continue;
             }
             if (pe->tag == CLJC_KEYWORD && pe->as.kw == KW_AS) {
-                if (i + 1 >= pattern->as.vec.len)
+                if (i + 1 >= vec_len(pattern))
                     cljc_error("destructure: :as needs a symbol");
-                env_define(scope, sym_name(pattern->as.vec.items[++i], ":as"), value);
+                env_define(scope, sym_name(vec_nth(pattern, ++i), ":as"), value);
                 continue;
             }
             destructure(scope, pe, s == NIL ? NIL : s->as.cons.head);
@@ -1065,15 +1199,15 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
                 if (k->as.kw == KW_KEYS) {
                     if (spec == NIL || spec->tag != CLJC_VECTOR)
                         cljc_error("destructure: :keys needs a vector of symbols");
-                    for (size_t j = 0; j < spec->as.vec.len; j++) {
-                        const char *nm = sym_name(spec->as.vec.items[j], ":keys");
+                    for (size_t j = 0; j < vec_len(spec); j++) {
+                        const char *nm = sym_name(vec_nth(spec, j), ":keys");
                         Cljc *kw = mk_kw(nm);
                         Cljc *v = NIL;
                         bool found = value != NIL && value->tag == CLJC_MAP &&
                                      map_find(value, kw, &v);
                         if (!found && defaults && defaults->tag == CLJC_MAP) {
                             Cljc *d;
-                            if (map_find(defaults, spec->as.vec.items[j], &d))
+                            if (map_find(defaults, vec_nth(spec, j), &d))
                                 v = eval(scope, d);
                         }
                         env_define(scope, nm, v);
@@ -1171,9 +1305,9 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc *args) {
     if (fn->tag == CLJC_VECTOR) {
         Cljc *k = args->as.cons.head;
         if (k->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
-        if (k->as.i < 0 || (size_t)k->as.i >= fn->as.vec.len)
+        if (k->as.i < 0 || (size_t)k->as.i >= vec_len(fn))
             cljc_error("vector index out of bounds: %lld", (long long)k->as.i);
-        return fn->as.vec.items[k->as.i];
+        return vec_nth(fn, (size_t)k->as.i);
     }
     cljc_error("not callable");
     return NIL;
@@ -1184,10 +1318,10 @@ static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
     if (params_vec == NIL || params_vec->tag != CLJC_VECTOR)
         cljc_error("fn params must be a vector");
     Cljc *params = NIL, **t = &params;
-    for (size_t i = 0; i < params_vec->as.vec.len; i++) {
-        Cljc *p = params_vec->as.vec.items[i];
+    for (size_t i = 0; i < vec_len(params_vec); i++) {
+        Cljc *p = vec_nth(params_vec, i);
         bool is_amp = p->tag == CLJC_SYMBOL && p->as.sym == sym_amp();
-        if (is_amp && i + 2 != params_vec->as.vec.len)
+        if (is_amp && i + 2 != vec_len(params_vec))
             cljc_error("fn params: & must be followed by exactly one binding");
         if (!is_amp && p->tag != CLJC_SYMBOL && p->tag != CLJC_VECTOR && p->tag != CLJC_MAP)
             cljc_error("fn params: unsupported binding form");
@@ -1255,8 +1389,8 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
         /* Expand into a list first so ~@ splices work inside vector
          * templates ([~@(...)]), then convert. The list is stack-rooted. */
         Cljc *out = NIL, **t = &out;
-        for (size_t i = 0; i < form->as.vec.len; i++) {
-            Cljc *el = form->as.vec.items[i];
+        for (size_t i = 0; i < vec_len(form); i++) {
+            Cljc *el = vec_nth(form, i);
             if (el != NIL && el->tag == CLJC_LIST && el->as.cons.head->tag == CLJC_SYMBOL
                 && el->as.cons.head->as.sym == SYM_UQS) {
                 Cljc *spliced = to_seq(eval(env, el->as.cons.tail->as.cons.head));
@@ -1269,15 +1403,9 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
                 t = &(*t)->as.cons.tail;
             }
         }
-        size_t n = list_len(out);
-        Cljc *v = alloc(CLJC_VECTOR);
-        v->as.vec.items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-        v->as.vec.len = 0;
-        v->as.vec.cap = n;
-        for (Cljc *l = out; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
-            v->as.vec.items[v->as.vec.len] = l->as.cons.head;
-            v->as.vec.len++;
-        }
+        Cljc *v = mk_empty_vec();
+        for (Cljc *l = out; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+            v = vec_conj1(v, l->as.cons.head);
         return v;
     }
     if (form->tag == CLJC_MAP) {
@@ -1307,15 +1435,9 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
             /* Vector literals evaluate each element: [(+ 1 2)] => [3].
              * len grows as slots fill so a mid-eval GC marks exactly the
              * elements written so far. */
-            Cljc *v = alloc(CLJC_VECTOR);
-            size_t n = form->as.vec.len;
-            v->as.vec.items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-            v->as.vec.len = 0;
-            v->as.vec.cap = n;
-            for (size_t i = 0; i < n; i++) {
-                v->as.vec.items[i] = eval(env, form->as.vec.items[i]);
-                v->as.vec.len = i + 1;
-            }
+            Cljc *v = mk_empty_vec();
+            for (size_t i = 0; i < vec_len(form); i++)
+                v = vec_conj1(v, eval(env, vec_nth(form, i)));
             return v;
         }
         case CLJC_MAP: {
@@ -1472,12 +1594,12 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     /* (let [a 1 b 2] body...) — bindings live in a vector. */
                     Cljc *binds_vec = rest->as.cons.head;
                     if (binds_vec == NIL || binds_vec->tag != CLJC_VECTOR ||
-                        binds_vec->as.vec.len % 2 != 0)
+                        vec_len(binds_vec) % 2 != 0)
                         cljc_error("let needs an even-sized binding vector");
                     CljcEnv *scope = env_new(env);
-                    for (size_t i = 0; i < binds_vec->as.vec.len; i += 2) {
-                        Cljc *val = eval(scope, binds_vec->as.vec.items[i + 1]);
-                        destructure(scope, binds_vec->as.vec.items[i], val);
+                    for (size_t i = 0; i < vec_len(binds_vec); i += 2) {
+                        Cljc *val = eval(scope, vec_nth(binds_vec, i + 1));
+                        destructure(scope, vec_nth(binds_vec, i), val);
                     }
                     return eval_body(scope, rest->as.cons.tail);
                 }
@@ -1538,14 +1660,14 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                      * but body re-runs whenever it produces a (recur ...) value. */
                     Cljc *binds_vec = rest->as.cons.head;
                     if (binds_vec == NIL || binds_vec->tag != CLJC_VECTOR ||
-                        binds_vec->as.vec.len % 2 != 0)
+                        vec_len(binds_vec) % 2 != 0)
                         cljc_error("loop needs an even-sized binding vector");
-                    size_t nparams = binds_vec->as.vec.len / 2;
+                    size_t nparams = vec_len(binds_vec) / 2;
                     const char **names = xmalloc(sizeof(char *) * (nparams ? nparams : 1));
                     CljcEnv *scope = env_new(env);
                     for (size_t i = 0; i < nparams; i++) {
-                        names[i] = sym_name(binds_vec->as.vec.items[i * 2], "loop binding");
-                        Cljc *val = eval(scope, binds_vec->as.vec.items[i * 2 + 1]);
+                        names[i] = sym_name(vec_nth(binds_vec, i * 2), "loop binding");
+                        Cljc *val = eval(scope, vec_nth(binds_vec, i * 2 + 1));
                         env_define(scope, names[i], val);
                     }
                     Cljc *body = rest->as.cons.tail;
@@ -1632,9 +1754,9 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         }
         case CLJC_VECTOR: {
             sb_putc(sb, '[');
-            for (size_t i = 0; i < v->as.vec.len; i++) {
+            for (size_t i = 0; i < vec_len(v); i++) {
                 if (i) sb_putc(sb, ' ');
-                print_to(sb, v->as.vec.items[i], readably);
+                print_to(sb, vec_nth(v, i), readably);
             }
             sb_putc(sb, ']');
             break;
@@ -1768,11 +1890,11 @@ static bool seq_eq(Cljc *a, Cljc *b) {
     Cljc *lb = (b->tag == CLJC_LIST) ? b : NULL;
     size_t ia = 0, ib = 0;
     for (;;) {
-        bool done_a = la ? (la == NIL) : (ia >= a->as.vec.len);
-        bool done_b = lb ? (lb == NIL) : (ib >= b->as.vec.len);
+        bool done_a = la ? (la == NIL) : (ia >= vec_len(a));
+        bool done_b = lb ? (lb == NIL) : (ib >= vec_len(b));
         if (done_a || done_b) return done_a && done_b;
-        Cljc *xa = la ? la->as.cons.head : a->as.vec.items[ia];
-        Cljc *xb = lb ? lb->as.cons.head : b->as.vec.items[ib];
+        Cljc *xa = la ? la->as.cons.head : vec_nth(a, ia);
+        Cljc *xb = lb ? lb->as.cons.head : vec_nth(b, ib);
         if (!cljc_eq(xa, xb)) return false;
         if (la) la = la->as.cons.tail; else ia++;
         if (lb) lb = lb->as.cons.tail; else ib++;
@@ -1903,7 +2025,7 @@ static Cljc *prim_count(CljcEnv *env, Cljc *args) {
     Cljc *v = args->as.cons.head;
     if (v == NIL) return mk_int(0);
     if (v->tag == CLJC_LIST) return mk_int((int64_t)list_len(v));
-    if (v->tag == CLJC_VECTOR) return mk_int((int64_t)v->as.vec.len);
+    if (v->tag == CLJC_VECTOR) return mk_int((int64_t)vec_len(v));
     if (v->tag == CLJC_MAP) return mk_int((int64_t)v->as.map.count);
     if (v->tag == CLJC_STRING) return mk_int((int64_t)strlen(v->as.str));
     cljc_error("count: not countable");
@@ -1917,7 +2039,7 @@ static Cljc *prim_nth(CljcEnv *env, Cljc *args) {
     Cljc *not_found = args->as.cons.tail->as.cons.tail != NIL
         ? args->as.cons.tail->as.cons.tail->as.cons.head : NULL;
     if (coll && coll->tag == CLJC_VECTOR) {
-        if (n >= 0 && (size_t)n < coll->as.vec.len) return coll->as.vec.items[n];
+        if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
     } else if (coll && coll->tag == CLJC_LIST) {
         for (Cljc *l = coll; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
             if (n-- == 0) return l->as.cons.head;
@@ -1925,14 +2047,6 @@ static Cljc *prim_nth(CljcEnv *env, Cljc *args) {
     if (not_found) return not_found;
     cljc_error("nth: index out of bounds");
     return NIL;
-}
-
-static Cljc *mk_vector(Cljc **items, size_t n) {
-    Cljc *v = alloc(CLJC_VECTOR);
-    v->as.vec.items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-    if (n) memcpy(v->as.vec.items, items, sizeof(Cljc *) * n);
-    v->as.vec.len = n; v->as.vec.cap = n;
-    return v;
 }
 
 static Cljc *prim_conj(CljcEnv *env, Cljc *args) {
@@ -1943,13 +2057,7 @@ static Cljc *prim_conj(CljcEnv *env, Cljc *args) {
         if (r == NIL || r->tag == CLJC_LIST) {
             r = mk_cons(x, r);                      /* lists grow at the front */
         } else if (r->tag == CLJC_VECTOR) {
-            Cljc *nv = alloc(CLJC_VECTOR);          /* vectors grow at the back */
-            size_t n = r->as.vec.len;
-            nv->as.vec.items = xmalloc(sizeof(Cljc *) * (n + 1));
-            memcpy(nv->as.vec.items, r->as.vec.items, sizeof(Cljc *) * n);
-            nv->as.vec.items[n] = x;
-            nv->as.vec.len = nv->as.vec.cap = n + 1;
-            r = nv;
+            r = vec_conj1(r, x);                    /* vectors grow at the back */
         } else cljc_error("conj: not a collection");
     }
     return r;
@@ -1980,8 +2088,8 @@ static Cljc *prim_apply(CljcEnv *env, Cljc *args) {
             if (last == NIL) break;
             if (last->tag == CLJC_LIST) { *t = last; }
             else if (last->tag == CLJC_VECTOR) {
-                for (size_t i = 0; i < last->as.vec.len; i++) {
-                    *t = mk_cons(last->as.vec.items[i], NIL);
+                for (size_t i = 0; i < vec_len(last); i++) {
+                    *t = mk_cons(vec_nth(last, i), NIL);
                     t = &(*t)->as.cons.tail;
                 }
             } else cljc_error("apply: last argument must be a collection");
@@ -2019,7 +2127,7 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc *args) {
     Cljc *v = args->as.cons.head;
     if (v == NIL) return TRUE;
     if (v->tag == CLJC_LIST) return FALSE;  /* a cons is never empty */
-    if (v->tag == CLJC_VECTOR) return mk_bool(v->as.vec.len == 0);
+    if (v->tag == CLJC_VECTOR) return mk_bool(vec_len(v) == 0);
     if (v->tag == CLJC_MAP) return mk_bool(v->as.map.count == 0);
     if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
     cljc_error("empty?: not a collection");
@@ -2072,8 +2180,8 @@ static Cljc *prim_get(CljcEnv *env, Cljc *args) {
         Cljc *out;
         if (map_find(coll, k, &out)) return out;
     } else if (coll != NIL && coll->tag == CLJC_VECTOR && k->tag == CLJC_INT) {
-        if (k->as.i >= 0 && (size_t)k->as.i < coll->as.vec.len)
-            return coll->as.vec.items[k->as.i];
+        if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
+            return vec_nth(coll, (size_t)k->as.i);
     }
     return dflt;
 }
@@ -2088,16 +2196,9 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc *args) {
         Cljc *k = a->as.cons.head, *v = a->as.cons.tail->as.cons.head;
         if (r->tag == CLJC_MAP) r = map_assoc(r, k, v);
         else if (r->tag == CLJC_VECTOR) {
-            if (k->tag != CLJC_INT || k->as.i < 0 || (size_t)k->as.i > r->as.vec.len)
+            if (k->tag != CLJC_INT || k->as.i < 0)
                 cljc_error("assoc on vector: index out of bounds");
-            size_t n = r->as.vec.len, idx = (size_t)k->as.i;
-            Cljc *nv = alloc(CLJC_VECTOR);
-            size_t newlen = idx == n ? n + 1 : n;  /* assoc at len appends */
-            nv->as.vec.items = xmalloc(sizeof(Cljc *) * newlen);
-            memcpy(nv->as.vec.items, r->as.vec.items, sizeof(Cljc *) * n);
-            nv->as.vec.items[idx] = v;
-            nv->as.vec.len = nv->as.vec.cap = newlen;
-            r = nv;
+            r = vec_assoc_idx(r, (size_t)k->as.i, v);  /* assoc at len appends */
         } else cljc_error("assoc: not associative");
     }
     return r;
@@ -2146,7 +2247,7 @@ static Cljc *prim_contains_p(CljcEnv *env, Cljc *args) {
     if (coll == NIL) return FALSE;
     if (coll->tag == CLJC_MAP) return mk_bool(map_find(coll, k, NULL));
     if (coll->tag == CLJC_VECTOR)  /* contains? checks INDEX presence on vectors */
-        return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < coll->as.vec.len);
+        return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
     cljc_error("contains?: not associative");
     return NIL;
 }
@@ -2211,8 +2312,8 @@ static Cljc *to_seq(Cljc *v) {
     if (v->tag == CLJC_LIST) return v;
     if (v->tag == CLJC_VECTOR) {
         Cljc *out = NIL, **t = &out;
-        for (size_t i = 0; i < v->as.vec.len; i++) {
-            *t = mk_cons(v->as.vec.items[i], NIL);
+        for (size_t i = 0; i < vec_len(v); i++) {
+            *t = mk_cons(vec_nth(v, i), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
@@ -2522,15 +2623,9 @@ static Cljc *prim_sort(CljcEnv *env, Cljc *args) {
 static Cljc *prim_vec(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *s = to_seq(args->as.cons.head);
-    size_t n = list_len(s);
-    Cljc *v = alloc(CLJC_VECTOR);
-    v->as.vec.items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-    v->as.vec.len = 0;
-    v->as.vec.cap = n;
-    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
-        v->as.vec.items[v->as.vec.len] = l->as.cons.head;
-        v->as.vec.len++;
-    }
+    Cljc *v = mk_empty_vec();
+    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+        v = vec_conj1(v, l->as.cons.head);
     return v;
 }
 

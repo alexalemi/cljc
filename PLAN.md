@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~2,100 lines, zero warnings, 95+ assertions in `tests.clj`, ASan/UBSan clean
+~3,250 lines, zero warnings, 262 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -20,8 +20,8 @@ required by conservative stack scanning, same as Boehm GC).
   both `loop` and `fn` (CLJC_RECUR sentinel caught by the enclosing form),
   keywords/maps/vectors callable
 - **Data**: int64/double arithmetic with Clojure unary semantics, value
-  equality incl. cross-type sequential `(= [1 2] '(1 2))`, copy-on-write
-  assoc-array maps (O(n), interface-compatible with a future HAMT)
+  equality incl. cross-type sequential `(= [1 2] '(1 2))`, HAMT persistent
+  maps + 32-way trie persistent vectors (see roadmap item 5 for details)
 - **Prelude** (cljc source in `PRELUDE` string): `identity some? not= even?
   odd? abs max min complement constantly comp partial into mapv filterv
   repeat -> ->> if-not when-not`

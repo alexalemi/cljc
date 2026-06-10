@@ -174,4 +174,57 @@
 (gc)
 (assert= 17 (add10 7))
 
+; ── try/catch/finally + throw ──
+
+(assert= :caught (try (throw (ex-info "boom" {})) (catch Exception e :caught)))
+(assert= :ok (try :ok (catch Exception e :never)))
+(assert= "boom" (ex-message (try (throw (ex-info "boom" {})) (catch Exception e e))))
+(assert= 7 (:code (ex-data (try (throw (ex-info "boom" {:code 7})) (catch Exception e e)))))
+
+; interpreter errors are catchable too; their value is the message string
+(assert= true (string? (try (/ 1 0) (catch Exception e e))))
+(assert= :div (try (/ 1 0) (catch Exception e :div)))
+(assert= :unresolved (try no-such-symbol (catch Exception e :unresolved)))
+
+; throw any value
+(assert= 42 (try (throw 42) (catch Exception e e)))
+
+; nested: inner try without catch rethrows outward
+(assert= :outer (try (try (throw (ex-info "x" {}))) (catch Exception e :outer)))
+
+; errors in the handler propagate
+(assert= :outer2 (try
+                   (try (throw 1) (catch Exception e (throw 2)))
+                   (catch Exception e :outer2)))
+
+; ── atoms ──
+
+(def counter (atom 0))
+(assert= 0 @counter)
+(assert= 5 (reset! counter 5))
+(assert= 6 (swap! counter inc))
+(assert= 16 (swap! counter + 10))
+(assert= 16 @counter)
+(assert= 5 @(atom 5))
+
+; atoms keep their contents alive across GC
+(def boxed (atom [1 2 {:k "v"}]))
+(gc)
+(assert= [1 2 {:k "v"}] @boxed)
+
+; finally runs on normal exit, on body throw, and on handler throw
+(def fin-log (atom []))
+(try :ok (finally (swap! fin-log conj :normal)))
+(try (throw 1) (catch Exception e e) (finally (swap! fin-log conj :caught)))
+(try (try (throw 1) (finally (swap! fin-log conj :uncaught))) (catch Exception e e))
+(try
+  (try (throw 1) (catch Exception e (throw 2)) (finally (swap! fin-log conj :handler-threw)))
+  (catch Exception e e))
+(assert= [:normal :caught :uncaught :handler-threw] @fin-log)
+
+; exception value survives a GC between throw and catch
+(assert= {:message "gced" :data {:n 1}}
+         (try (throw (ex-info "gced" {:n 1}))
+              (catch Exception e (do (gc) e))))
+
 (println "tests complete")

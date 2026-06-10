@@ -39,6 +39,7 @@ typedef enum {
     CLJC_MAP,       /* v0: assoc-array with copy-on-write; HAMT later */
     CLJC_FN,        /* interpreted */
     CLJC_NATIVE,    /* C function */
+    CLJC_ATOM,      /* mutable box: (atom x), @a, swap!, reset! */
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
 } CljcTag;
@@ -62,6 +63,7 @@ struct Cljc {
         struct { Cljc **keys; Cljc **vals; size_t len; } map;
         struct { Cljc *params; Cljc *body; CljcEnv *env; bool is_macro; } fn;
         CljcNativeFn native;
+        struct { Cljc *value; } atom;
         struct { Cljc **vals; size_t n; } recur;
     } as;
 };
@@ -95,19 +97,46 @@ static Cljc *cell_alloc(void);
 static CljcEnv *env_alloc(void);
 static Cljc *NIL, *TRUE, *FALSE;
 
-/* ───── Error handling: longjmp out of the evaluator ─────────────────── */
+/* ───── Error handling ───────────────────────────────────────────────── */
 
+/* Errors unwind to the innermost handler frame — pushed by the `try`
+ * special form — or, with no try in flight, to the top-level err_jmp set by
+ * the REPL/script/eval-string entry points. The exception itself is a value:
+ * cur_exc when (throw x) raised it, or NULL meaning "use err_msg" for
+ * interpreter-raised errors. */
+
+typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; } ErrFrame;
+static ErrFrame *err_top;
 static jmp_buf err_jmp;
 static char err_msg[256];
+static Cljc *cur_exc;   /* exception value in flight; a GC root */
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
+static void cljc_raise(void) {
+    if (err_top) longjmp(err_top->jb, 1);
+    longjmp(err_jmp, 1);
+}
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn, format(printf, 1, 2)))
 #endif
 static void cljc_error(const char *fmt, ...) {
+    cur_exc = NULL;  /* message-style error */
     va_list ap; va_start(ap, fmt);
     vsnprintf(err_msg, sizeof err_msg, fmt, ap);
     va_end(ap);
-    longjmp(err_jmp, 1);
+    cljc_raise();
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
+static void cljc_throw_value(Cljc *v) {
+    cur_exc = v;
+    snprintf(err_msg, sizeof err_msg, "uncaught exception");
+    cljc_raise();
 }
 
 static void *xmalloc(size_t n) {
@@ -277,6 +306,9 @@ static void gc_mark(Cljc *v) {
                 gc_mark_env(v->as.fn.env);
                 v = v->as.fn.body;
                 break;
+            case CLJC_ATOM:
+                v = v->as.atom.value;
+                break;
             default:
                 return;
         }
@@ -330,6 +362,7 @@ static void gc_collect(void) {
     setjmp(regs);
 
     gc_mark(NIL); gc_mark(TRUE); gc_mark(FALSE);
+    gc_mark(cur_exc);  /* exception value may be in flight between throw and catch */
     for (int i = 0; i < gc_n_root_envs; i++) gc_mark_env(gc_root_envs[i]);
 
     if (gc_stack_base) {
@@ -493,7 +526,7 @@ static void skip_ws(const char **p) {
 
 static bool is_sym_char(int c) {
     if (c == '\0' || isspace(c)) return false;
-    return !strchr("()[]{}\";'`,~", c);
+    return !strchr("()[]{}\";'`,~@", c);
 }
 
 static Cljc *read_atom(const char **p) {
@@ -623,6 +656,11 @@ static Cljc *read_form(const char **p) {
         if (**p == '@') { (*p)++; tag = "unquote-splicing"; taglen = 16; }
         Cljc *form = read_form(p);
         return mk_cons(mk_sym(intern(tag, taglen)), mk_cons(form, NIL));
+    }
+    if (c == '@') {
+        (*p)++;
+        Cljc *form = read_form(p);
+        return mk_cons(mk_sym(intern("deref", 5)), mk_cons(form, NIL));
     }
     return read_atom(p);
 }
@@ -804,6 +842,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL:
         case CLJC_STRING: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
+        case CLJC_ATOM:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
             return form;
         case CLJC_FREE:
@@ -855,7 +894,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                 const char *s = head->as.sym;
                 static const char *SYM_QUOTE, *SYM_IF, *SYM_DO, *SYM_DEF, *SYM_LET, *SYM_FN, *SYM_LOOP, *SYM_RECUR,
                                   *SYM_AND, *SYM_OR, *SYM_WHEN, *SYM_COND, *SYM_DEFN,
-                                  *SYM_DEFMACRO, *SYM_QUASIQUOTE;
+                                  *SYM_DEFMACRO, *SYM_QUASIQUOTE, *SYM_TRY, *SYM_CATCH, *SYM_FINALLY;
                 if (!SYM_QUOTE) {
                     SYM_QUOTE = intern("quote", 5); SYM_IF = intern("if", 2);
                     SYM_DO = intern("do", 2);       SYM_DEF = intern("def", 3);
@@ -866,6 +905,84 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     SYM_DEFN = intern("defn", 4);
                     SYM_DEFMACRO = intern("defmacro", 8);
                     SYM_QUASIQUOTE = intern("quasiquote", 10);
+                    SYM_TRY = intern("try", 3);
+                    SYM_CATCH = intern("catch", 5);
+                    SYM_FINALLY = intern("finally", 7);
+                }
+                if (s == SYM_TRY) {
+                    /* (try body... (catch ExClass e handler...) (finally fin...))
+                     * The class symbol is accepted and ignored (untyped catch —
+                     * a documented divergence). finally runs on every exit:
+                     * normal, body throw, or handler throw. */
+                    Cljc *body = NIL, **bt = &body;
+                    Cljc *catch_clause = NULL, *finally_clause = NULL;
+                    for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
+                        Cljc *f = c->as.cons.head;
+                        const char *fh = (f != NIL && f->tag == CLJC_LIST &&
+                                          f->as.cons.head->tag == CLJC_SYMBOL)
+                                         ? f->as.cons.head->as.sym : NULL;
+                        if (fh == SYM_CATCH) {
+                            if (catch_clause) cljc_error("try: only one catch clause is supported");
+                            if (finally_clause) cljc_error("try: catch must precede finally");
+                            catch_clause = f;
+                        } else if (fh == SYM_FINALLY) {
+                            if (finally_clause) cljc_error("try: only one finally clause is allowed");
+                            finally_clause = f;
+                        } else {
+                            if (catch_clause || finally_clause)
+                                cljc_error("try: body form after catch/finally");
+                            *bt = mk_cons(f, NIL);
+                            bt = &(*bt)->as.cons.tail;
+                        }
+                    }
+                    if (catch_clause) {
+                        need_args(catch_clause->as.cons.tail, 2, "catch");
+                        sym_name(catch_clause->as.cons.tail->as.cons.head, "catch class");
+                        sym_name(catch_clause->as.cons.tail->as.cons.tail->as.cons.head,
+                                 "catch binding");
+                    }
+
+                    /* volatile: read after a longjmp back into this frame. */
+                    Cljc * volatile body_v = body;
+                    Cljc * volatile catch_v = catch_clause;
+                    Cljc * volatile finally_v = finally_clause;
+                    Cljc * volatile result = NIL;
+                    volatile bool pending = false;  /* unhandled exception to rethrow */
+
+                    ErrFrame frame;
+                    frame.prev = err_top;
+                    err_top = &frame;
+                    if (setjmp(frame.jb) == 0) {
+                        result = eval_body(env, body_v);
+                        err_top = frame.prev;
+                    } else {
+                        err_top = frame.prev;
+                        if (catch_v) {
+                            /* Bind the exception value; run the handler under
+                             * its own frame so finally still runs if it throws. */
+                            Cljc *exc = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
+                            cur_exc = NULL;
+                            CljcEnv *scope = env_new(env);
+                            Cljc *cc = catch_v->as.cons.tail;       /* (Class e body...) */
+                            env_define(scope, cc->as.cons.tail->as.cons.head->as.sym, exc);
+                            ErrFrame hframe;
+                            hframe.prev = err_top;
+                            err_top = &hframe;
+                            if (setjmp(hframe.jb) == 0) {
+                                result = eval_body(scope, cc->as.cons.tail->as.cons.tail);
+                                err_top = hframe.prev;
+                            } else {
+                                err_top = hframe.prev;
+                                pending = true;     /* handler threw */
+                            }
+                        } else {
+                            pending = true;         /* no catch: rethrow after finally */
+                        }
+                    }
+                    if (finally_v)  /* a throwing finally replaces any pending exception */
+                        eval_body(env, finally_v->as.cons.tail);
+                    if (pending) cljc_raise();
+                    return result;
                 }
                 if (s == SYM_QUASIQUOTE) return qq_expand(env, rest->as.cons.head);
                 if (s == SYM_DEFMACRO) {
@@ -1089,6 +1206,11 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         }
         case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
         case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
+        case CLJC_ATOM:
+            sb_puts(sb, "#atom[");
+            print_to(sb, v->as.atom.value, readably);
+            sb_putc(sb, ']');
+            break;
         case CLJC_RECUR:  sb_puts(sb, "#<recur>"); break;
         case CLJC_FREE:   sb_puts(sb, "#<freed!>"); break;  /* seeing this is a GC bug */
     }
@@ -1098,6 +1220,21 @@ static void print(Cljc *v) {
     SBuf sb = {0};
     print_to(&sb, v, true);
     if (sb.data) { fwrite(sb.data, 1, sb.len, stdout); free(sb.data); }
+}
+
+/* Top-level (uncaught) error report. Resets the in-flight exception. */
+static void print_error(void) {
+    fputs("error: ", stderr);
+    if (cur_exc) {
+        SBuf sb = {0};
+        print_to(&sb, cur_exc, true);
+        if (sb.data) { fwrite(sb.data, 1, sb.len, stderr); free(sb.data); }
+        cur_exc = NULL;
+    } else {
+        fputs(err_msg, stderr);
+    }
+    fputc('\n', stderr);
+    err_top = NULL;  /* hygiene: no handler frames survive a top-level unwind */
 }
 
 /* ───── Primitives ───────────────────────────────────────────────────── */
@@ -1836,6 +1973,87 @@ static Cljc *prim_gc(CljcEnv *env, Cljc *args) {
     return mk_int((int64_t)gc_freed_last);  /* cells freed by this collection */
 }
 
+/* ── Exceptions ── */
+
+static Cljc *prim_throw(CljcEnv *env, Cljc *args) {
+    (void)env;
+    cljc_throw_value(args->as.cons.head);
+    return NIL;  /* unreachable */
+}
+
+static const char *kw_message(void) { return intern("message", 7); }
+static const char *kw_data(void)    { return intern("data", 4); }
+
+static Cljc *prim_ex_info(CljcEnv *env, Cljc *args) {
+    /* (ex-info msg data) => {:message msg :data data} — exceptions are plain
+     * maps here, so all map functions work on them. */
+    (void)env;
+    Cljc *msg = args->as.cons.head;
+    Cljc *data = args->as.cons.tail->as.cons.head;
+    Cljc *m = mk_map(2);
+    m = map_assoc(m, mk_kw(kw_message()), msg);
+    m = map_assoc(m, mk_kw(kw_data()), data);
+    return m;
+}
+
+static Cljc *prim_ex_message(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *e = args->as.cons.head;
+    if (e != NIL && e->tag == CLJC_STRING) return e;  /* interpreter errors are strings */
+    if (e != NIL && e->tag == CLJC_MAP) {
+        Cljc *out;
+        if (map_find(e, mk_kw(kw_message()), &out)) return out;
+    }
+    return NIL;
+}
+
+static Cljc *prim_ex_data(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *e = args->as.cons.head;
+    if (e != NIL && e->tag == CLJC_MAP) {
+        Cljc *out;
+        if (map_find(e, mk_kw(kw_data()), &out)) return out;
+    }
+    return NIL;
+}
+
+/* ── Atoms ── */
+
+static Cljc *as_atom(Cljc *v, const char *what) {
+    if (v == NIL || v->tag != CLJC_ATOM) cljc_error("%s: expected an atom", what);
+    return v;
+}
+
+static Cljc *prim_atom(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *a = alloc(CLJC_ATOM);
+    a->as.atom.value = args->as.cons.head;
+    return a;
+}
+
+static Cljc *prim_deref(CljcEnv *env, Cljc *args) {
+    (void)env;
+    return as_atom(args->as.cons.head, "deref")->as.atom.value;
+}
+
+static Cljc *prim_reset(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *a = as_atom(args->as.cons.head, "reset!");
+    Cljc *v = args->as.cons.tail->as.cons.head;
+    a->as.atom.value = v;
+    return v;
+}
+
+static Cljc *prim_swap(CljcEnv *env, Cljc *args) {
+    /* (swap! a f x y) => sets a to (f @a x y), returns the new value. */
+    Cljc *a = as_atom(args->as.cons.head, "swap!");
+    Cljc *f = args->as.cons.tail->as.cons.head;
+    Cljc *extra = args->as.cons.tail->as.cons.tail;
+    Cljc *nv = apply(env, f, mk_cons(a->as.atom.value, extra));
+    a->as.atom.value = nv;
+    return nv;
+}
+
 /* ───── Public C API ─────────────────────────────────────────────────── */
 
 CljcEnv *cljc_new_env(void);
@@ -1980,6 +2198,14 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "concat",  prim_concat);
     cljc_define_native(e, "gensym",  prim_gensym);
     cljc_define_native(e, "gc",      prim_gc);
+    cljc_define_native(e, "throw",      prim_throw);
+    cljc_define_native(e, "ex-info",    prim_ex_info);
+    cljc_define_native(e, "ex-message", prim_ex_message);
+    cljc_define_native(e, "ex-data",    prim_ex_data);
+    cljc_define_native(e, "atom",    prim_atom);
+    cljc_define_native(e, "deref",   prim_deref);
+    cljc_define_native(e, "reset!",  prim_reset);
+    cljc_define_native(e, "swap!",   prim_swap);
     cljc_eval_string(e, PRELUDE);
     return e;
 }
@@ -1988,7 +2214,7 @@ Cljc *cljc_eval_string(CljcEnv *env, const char *src) {
     char stack_anchor;
     cljc_set_stack_base(&stack_anchor);  /* ensure at least this frame is scanned */
     Cljc * volatile result = NIL;  /* survives the error longjmp */
-    if (setjmp(err_jmp) != 0) { fprintf(stderr, "error: %s\n", err_msg); return NIL; }
+    if (setjmp(err_jmp) != 0) { print_error(); return NIL; }
     while (*src) {
         skip_ws(&src);
         if (!*src) break;
@@ -2025,7 +2251,7 @@ static int run_stream(CljcEnv *env, FILE *f) {
     }
     src[len] = '\0';
     if (setjmp(err_jmp) != 0) {
-        fprintf(stderr, "error: %s\n", err_msg);
+        print_error();
         free(src);
         return 1;
     }
@@ -2073,7 +2299,7 @@ static int run_repl(CljcEnv *env) {
         }
         if (depth > 0 || in_str) continue;  /* keep reading lines */
 
-        if (setjmp(err_jmp) != 0) { fprintf(stderr, "error: %s\n", err_msg); buflen = 0; continue; }
+        if (setjmp(err_jmp) != 0) { print_error(); buflen = 0; continue; }
         const char *p = buf;
         while (*p) {
             skip_ws(&p);

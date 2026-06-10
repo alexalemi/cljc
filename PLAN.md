@@ -4,7 +4,7 @@ Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
 (`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test` (runs the
 suite twice — normal and `CLJC_GC_STRESS=1`).
 
-## Status (as of 2026-06-09)
+## Status (as of 2026-06-10)
 
 ~2,100 lines, zero warnings, 95+ assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
@@ -28,6 +28,13 @@ required by conservative stack scanning, same as Boehm GC).
 - **GC**: mark-and-sweep over block pools (cells + envs), conservative
   C-stack + register scanning, adaptive threshold, `(gc)` native,
   `CLJC_GC_STRESS` env var. Key invariants documented below.
+- **Errors as values**: `try`/`catch`/`finally` via a stack of handler frames
+  (ErrFrame) threaded through the C stack; `throw` any value; `ex-info`
+  exceptions are plain maps `{:message m :data d}` (`ex-message`/`ex-data`);
+  interpreter errors caught as message strings; `cur_exc` is a GC root.
+  finally runs on normal exit, body throw, and handler throw. Divergence:
+  catch is untyped — `(catch Exception e ...)` accepts and ignores the class.
+- **Atoms**: `atom deref reset! swap!` + `@` reader sugar; printed `#atom[v]`.
 - **Modes**: interactive REPL (multi-line, paren-balance), `./cljc file.clj`,
   piped stdin (babashka-style: no result echo). Embed API: `cljc_new_env`,
   `cljc_eval_string`, `cljc_define_native`, `cljc_set_stack_base`,
@@ -45,11 +52,7 @@ required by conservative stack scanning, same as Boehm GC).
 
 ## Roadmap (agreed order)
 
-1. **try/catch + atoms** — error handling as catchable values instead of
-   longjmp-to-toplevel (`cljc_error` currently aborts the whole eval);
-   `atom/deref/@/swap!/reset!`. Design note: try/catch likely means an
-   err-handler stack of jmp_bufs, or converting eval to return an error
-   sentinel like CLJC_RECUR.
+1. ~~try/catch + atoms~~ ✅ done 2026-06-10
 2. **Destructuring + multi-arity fn** — `(fn ([x] ...) ([x y] ...))`,
    `(let [[a b] pair, {:keys [x]} m] ...)`. Destructuring can be a macro-time
    rewrite once `let*` exists.

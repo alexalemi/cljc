@@ -61,7 +61,8 @@ struct Cljc {
         struct { Cljc *head; Cljc *tail; } cons;
         struct { Cljc **items; size_t len; size_t cap; } vec;
         struct { Cljc **keys; Cljc **vals; size_t len; } map;
-        struct { Cljc *params; Cljc *body; CljcEnv *env; bool is_macro; } fn;
+        /* arities: list of (params-list . body-list) pairs; dispatch by argc */
+        struct { Cljc *arities; CljcEnv *env; bool is_macro; } fn;
         CljcNativeFn native;
         struct { Cljc *value; } atom;
         struct { Cljc **vals; size_t n; } recur;
@@ -302,9 +303,8 @@ static void gc_mark(Cljc *v) {
                 for (size_t i = 0; i < v->as.recur.n; i++) gc_mark(v->as.recur.vals[i]);
                 return;
             case CLJC_FN:
-                gc_mark(v->as.fn.params);
                 gc_mark_env(v->as.fn.env);
-                v = v->as.fn.body;
+                v = v->as.fn.arities;  /* a list of cons pairs — generic list marking */
                 break;
             case CLJC_ATOM:
                 v = v->as.atom.value;
@@ -686,33 +686,142 @@ static Cljc *eval_body(CljcEnv *env, Cljc *body) {
     return r;
 }
 
-/* Bind params to args in `call`. Supports (fn [x y & rest] ...) — after '&',
- * one name collects remaining args as a list. */
+static const char *sym_amp(void) { return intern("&", 1); }
+
+/* Recursive destructuring: bind `pattern` to `value` in `scope`.
+ *   symbol            → plain binding
+ *   [a b & r :as v]   → sequential destructuring (nil-fills past the end)
+ *   {a :k}            → bind a to (get value :k)
+ *   {:keys [a b] :or {a 1} :as m}
+ * :or defaults are forms, evaluated in `scope` when the key is missing. */
+static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
+    if (pattern != NIL && pattern->tag == CLJC_SYMBOL) {
+        env_define(scope, pattern->as.sym, value);
+        return;
+    }
+    if (pattern != NIL && pattern->tag == CLJC_VECTOR) {
+        static const char *KW_AS;
+        if (!KW_AS) KW_AS = intern("as", 2);
+        Cljc *s = value == NIL ? NIL : to_seq(value);
+        for (size_t i = 0; i < pattern->as.vec.len; i++) {
+            Cljc *pe = pattern->as.vec.items[i];
+            if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) {
+                if (i + 1 >= pattern->as.vec.len)
+                    cljc_error("destructure: & needs a binding form");
+                destructure(scope, pattern->as.vec.items[++i], s);
+                continue;
+            }
+            if (pe->tag == CLJC_KEYWORD && pe->as.kw == KW_AS) {
+                if (i + 1 >= pattern->as.vec.len)
+                    cljc_error("destructure: :as needs a symbol");
+                env_define(scope, sym_name(pattern->as.vec.items[++i], ":as"), value);
+                continue;
+            }
+            destructure(scope, pe, s == NIL ? NIL : s->as.cons.head);
+            if (s != NIL) s = s->as.cons.tail;
+        }
+        return;
+    }
+    if (pattern != NIL && pattern->tag == CLJC_MAP) {
+        static const char *KW_KEYS, *KW_AS, *KW_OR;
+        if (!KW_KEYS) {
+            KW_KEYS = intern("keys", 4);
+            KW_AS = intern("as", 2);
+            KW_OR = intern("or", 2);
+        }
+        Cljc *defaults = NULL;  /* the :or map, if present */
+        for (size_t i = 0; i < pattern->as.map.len; i++) {
+            Cljc *k = pattern->as.map.keys[i];
+            if (k->tag == CLJC_KEYWORD && k->as.kw == KW_OR) defaults = pattern->as.map.vals[i];
+        }
+        for (size_t i = 0; i < pattern->as.map.len; i++) {
+            Cljc *k = pattern->as.map.keys[i];
+            Cljc *spec = pattern->as.map.vals[i];
+            if (k->tag == CLJC_KEYWORD) {
+                if (k->as.kw == KW_OR) continue;
+                if (k->as.kw == KW_AS) {
+                    env_define(scope, sym_name(spec, ":as"), value);
+                    continue;
+                }
+                if (k->as.kw == KW_KEYS) {
+                    if (spec == NIL || spec->tag != CLJC_VECTOR)
+                        cljc_error("destructure: :keys needs a vector of symbols");
+                    for (size_t j = 0; j < spec->as.vec.len; j++) {
+                        const char *nm = sym_name(spec->as.vec.items[j], ":keys");
+                        Cljc *kw = mk_kw(nm);
+                        Cljc *v = NIL;
+                        bool found = value != NIL && value->tag == CLJC_MAP &&
+                                     map_find(value, kw, &v);
+                        if (!found && defaults && defaults->tag == CLJC_MAP) {
+                            Cljc *d;
+                            if (map_find(defaults, spec->as.vec.items[j], &d))
+                                v = eval(scope, d);
+                        }
+                        env_define(scope, nm, v);
+                    }
+                    continue;
+                }
+                cljc_error("destructure: unsupported map directive :%s", k->as.kw);
+            }
+            /* {binding-form lookup-key} */
+            Cljc *v = NIL;
+            bool found = value != NIL && value->tag == CLJC_MAP && map_find(value, spec, &v);
+            if (!found && defaults && defaults->tag == CLJC_MAP && k->tag == CLJC_SYMBOL) {
+                Cljc *d;
+                if (map_find(defaults, k, &d)) v = eval(scope, d);
+            }
+            destructure(scope, k, v);
+        }
+        return;
+    }
+    cljc_error("unsupported binding form");
+}
+
+/* Bind an arity's params to args. Each param may be any destructuring
+ * pattern; '&' collects the remaining args as a list. */
 static void bind_params(CljcEnv *call, Cljc *params, Cljc *args) {
-    static const char *SYM_AMP;
-    if (!SYM_AMP) SYM_AMP = intern("&", 1);
     Cljc *p = params, *a = args;
     while (p && p->tag == CLJC_LIST) {
-        const char *name = p->as.cons.head->as.sym;
-        if (name == SYM_AMP) {
-            Cljc *rest_name = p->as.cons.tail->as.cons.head;
-            env_define(call, rest_name->as.sym, a == NIL ? NIL : a);
+        Cljc *pat = p->as.cons.head;
+        if (pat->tag == CLJC_SYMBOL && pat->as.sym == sym_amp()) {
+            destructure(call, p->as.cons.tail->as.cons.head, a);
             return;
         }
         if (a == NIL || a->tag != CLJC_LIST) cljc_error("not enough arguments");
-        env_define(call, name, a->as.cons.head);
+        destructure(call, pat, a->as.cons.head);
         p = p->as.cons.tail; a = a->as.cons.tail;
     }
     if (a != NIL) cljc_error("too many arguments");
+}
+
+static void arity_info(Cljc *params, size_t *fixed, bool *variadic) {
+    *fixed = 0; *variadic = false;
+    for (Cljc *p = params; p && p->tag == CLJC_LIST; p = p->as.cons.tail) {
+        Cljc *h = p->as.cons.head;
+        if (h->tag == CLJC_SYMBOL && h->as.sym == sym_amp()) { *variadic = true; return; }
+        (*fixed)++;
+    }
 }
 
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc *args) {
     if (fn->tag == CLJC_NATIVE) return fn->as.native(env, args);
     if (fn->tag == CLJC_FN) {
         for (;;) {
+            /* Dispatch: exact param-count match wins; variadic is fallback. */
+            size_t nargs = list_len(args);
+            Cljc *chosen = NULL, *fallback = NULL;
+            for (Cljc *ar = fn->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
+                Cljc *arity = ar->as.cons.head;
+                size_t fixed; bool variadic;
+                arity_info(arity->as.cons.head, &fixed, &variadic);
+                if (!variadic && nargs == fixed) { chosen = arity; break; }
+                if (variadic && nargs >= fixed && !fallback) fallback = arity;
+            }
+            if (!chosen) chosen = fallback;
+            if (!chosen) cljc_error("no matching arity for %zu args", nargs);
             CljcEnv *call = env_new(fn->as.fn.env);
-            bind_params(call, fn->as.fn.params, args);
-            Cljc *result = eval_body(call, fn->as.fn.body);
+            bind_params(call, chosen->as.cons.head, args);
+            Cljc *result = eval_body(call, chosen->as.cons.tail);
             if (!(result && result->tag == CLJC_RECUR)) return result;
             /* (recur ...) in fn tail position: rebuild the arg list and loop. */
             Cljc *newargs = NIL, **t = &newargs;
@@ -751,24 +860,42 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc *args) {
     return NIL;
 }
 
-/* Build an interpreted fn from a [params] vector and a body form-list. */
-static Cljc *make_fn(CljcEnv *env, Cljc *params_vec, Cljc *body, bool is_macro) {
-    static const char *SYM_AMP;
-    if (!SYM_AMP) SYM_AMP = intern("&", 1);
+/* One arity: validate a [params] vector and pair it with its body. */
+static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
     if (params_vec == NIL || params_vec->tag != CLJC_VECTOR)
         cljc_error("fn params must be a vector");
     Cljc *params = NIL, **t = &params;
     for (size_t i = 0; i < params_vec->as.vec.len; i++) {
-        const char *name = sym_name(params_vec->as.vec.items[i], "fn params");
-        /* '&' must be followed by exactly one rest-arg name. */
-        if (name == SYM_AMP && i + 2 != params_vec->as.vec.len)
-            cljc_error("fn params: & must be followed by exactly one symbol");
-        *t = mk_cons(params_vec->as.vec.items[i], NIL);
+        Cljc *p = params_vec->as.vec.items[i];
+        bool is_amp = p->tag == CLJC_SYMBOL && p->as.sym == sym_amp();
+        if (is_amp && i + 2 != params_vec->as.vec.len)
+            cljc_error("fn params: & must be followed by exactly one binding");
+        if (!is_amp && p->tag != CLJC_SYMBOL && p->tag != CLJC_VECTOR && p->tag != CLJC_MAP)
+            cljc_error("fn params: unsupported binding form");
+        *t = mk_cons(p, NIL);
         t = &(*t)->as.cons.tail;
     }
+    return mk_cons(params, body);
+}
+
+/* Build an interpreted fn from the forms after `fn` (or after a defn name):
+ * single arity ([params] body...) or multi-arity (([p] b...) ([p q] b...)). */
+static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
+    Cljc *arities = NIL, **t = &arities;
+    if (forms != NIL && forms->as.cons.head->tag == CLJC_VECTOR) {
+        *t = mk_cons(build_arity(forms->as.cons.head, forms->as.cons.tail), NIL);
+    } else {
+        for (Cljc *c = forms; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
+            Cljc *clause = c->as.cons.head;
+            if (clause == NIL || clause->tag != CLJC_LIST)
+                cljc_error("fn: expected ([params] body...) clauses");
+            *t = mk_cons(build_arity(clause->as.cons.head, clause->as.cons.tail), NIL);
+            t = &(*t)->as.cons.tail;
+        }
+        if (arities == NIL) cljc_error("fn needs at least one arity");
+    }
     Cljc *f = alloc(CLJC_FN);
-    f->as.fn.params = params;
-    f->as.fn.body = body;
+    f->as.fn.arities = arities;
     f->as.fn.env = env;
     f->as.fn.is_macro = is_macro;
     return f;
@@ -990,8 +1117,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                      * eval calls it on unevaluated forms and re-evals the result. */
                     need_args(rest, 2, "defmacro");
                     const char *name = sym_name(rest->as.cons.head, "defmacro");
-                    Cljc *m = make_fn(env, rest->as.cons.tail->as.cons.head,
-                                      rest->as.cons.tail->as.cons.tail, true);
+                    Cljc *m = make_fn(env, rest->as.cons.tail, true);
                     env_define(env_root(env), name, m);
                     return m;
                 }
@@ -1029,9 +1155,8 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                         cljc_error("let needs an even-sized binding vector");
                     CljcEnv *scope = env_new(env);
                     for (size_t i = 0; i < binds_vec->as.vec.len; i += 2) {
-                        const char *name = sym_name(binds_vec->as.vec.items[i], "let binding");
                         Cljc *val = eval(scope, binds_vec->as.vec.items[i + 1]);
-                        env_define(scope, name, val);
+                        destructure(scope, binds_vec->as.vec.items[i], val);
                     }
                     return eval_body(scope, rest->as.cons.tail);
                 }
@@ -1120,8 +1245,8 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     }
                 }
                 if (s == SYM_FN)
-                    /* (fn [x y] body...) — params as a vector, n-ary body. */
-                    return make_fn(env, rest->as.cons.head, rest->as.cons.tail, false);
+                    /* (fn [x y] body...) or (fn ([x] ...) ([x y] ...)) */
+                    return make_fn(env, rest, false);
             }
 
             /* Application. Macros get the unevaluated forms; the expansion

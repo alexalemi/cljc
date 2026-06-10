@@ -227,4 +227,48 @@
          (try (throw (ex-info "gced" {:n 1}))
               (catch Exception e (do (gc) e))))
 
+; ── multi-arity fn ──
+
+(defn greet
+  ([] (greet "world"))
+  ([who] (str "hello " who))
+  ([who & more] (str "hello " who " and " (count more) " others")))
+(assert= "hello world" (greet))
+(assert= "hello rich" (greet "rich"))
+(assert= "hello a and 2 others" (greet "a" "b" "c"))
+
+; recur works inside an arity
+(defn sum-to
+  ([n] (sum-to n 0))
+  ([n acc] (if (zero? n) acc (recur (dec n) (+ acc n)))))
+(assert= 55 (sum-to 10))
+
+; ── destructuring ──
+
+; sequential
+(assert= 3 (let [[a b] [1 2]] (+ a b)))
+(assert= 1 (let [[a] [1 2 3]] a))
+(assert= nil (let [[a b c] [1 2]] c))               ; nil-fills past the end
+(assert= (list 2 3) (let [[_ & r] [1 2 3]] r))
+(assert= [1 2 3] (let [[a :as whole] [1 2 3]] whole))
+(assert= 6 (let [[[a b] c] [[1 2] 3]] (+ a b c)))   ; nested
+(assert= 3 (let [[a b] (list 1 2)] (+ a b)))        ; lists destructure too
+
+; map
+(assert= 1 (let [{a :x} {:x 1}] a))
+(assert= 3 (let [{:keys [x y]} {:x 1 :y 2}] (+ x y)))
+(assert= 42 (let [{:keys [missing] :or {missing 42}} {}] missing))
+(assert= {:x 1} (let [{:keys [x] :as m} {:x 1}] m))
+(assert= 7 (let [{{:keys [inner]} :outer} {:outer {:inner 7}}] inner))
+
+; in fn params
+(defn dist2 [[x1 y1] [x2 y2]] (+ (* (- x2 x1) (- x2 x1)) (* (- y2 y1) (- y2 y1))))
+(assert= 25 (dist2 [0 0] [3 4]))
+(defn full-name [{:keys [first last]}] (str first " " last))
+(assert= "Rich Hickey" (full-name {:first "Rich" :last "Hickey"}))
+
+; destructured & rest
+(defn first-two [& [a b]] [a b])
+(assert= [1 2] (first-two 1 2 3 4))
+
 (println "tests complete")

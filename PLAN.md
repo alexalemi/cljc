@@ -66,16 +66,20 @@ required by conservative stack scanning, same as Boehm GC).
    juxt sort-by update get-in assoc-in update-in select-keys if-let
    when-let dotimes doseq while case for. case quotes its test constants;
    for supports multiple bindings, no :when/:let yet.
-4. **HAMT persistent collections** — replace assoc-array maps and
+4. ~~Batch 5-lite~~ ✅ done 2026-06-10 — prelude: boolean true? false?
+   map-indexed keep-indexed partition-all zipmap merge-with reduce-kv
+   repeatedly doto letfn (works via late binding!) assert; natives int?
+   double?. Also fixed: ~@ splicing inside vector templates ([~@(...)]).
+5. **HAMT persistent collections** — replace assoc-array maps and
    copying vectors; the public interface (get/assoc/conj/...) is already
    stable so this is engine-swap only. Also a real ISeq so `to_seq` stops
-   copying.
-5. **More surface**: sets (#{...}), regex (`re-find`/`re-matches`; needs a
-   decision: POSIX ERE divergence vs tiny regex engine), `letfn`, `condp`,
-   `for` :when/:let modifiers, `doto`, `..`, `partition-all`, `keep-indexed`,
-   `map-indexed`, `reduce-kv`, `merge-with`, `zipmap`, `repeatedly`,
+   copying. NOTE: deliberately deferred behind batch 5-lite — it's a large
+   isolated engine swap, best started with a fresh session/context.
+6. **More surface**: sets (#{...}) — fold into the HAMT milestone; regex
+   (`re-find`/`re-matches`; needs a decision: POSIX ERE divergence vs tiny
+   regex engine); `condp`, `for` :when/:let modifiers, `..`,
    `iterate` (eager n-limited?), `format`?
-6. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
+7. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
    bytecode VM. Not before semantics are broader.
 
 ## Known divergences from Clojure (deliberate, v0)

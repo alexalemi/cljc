@@ -933,15 +933,31 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
         return out;
     }
     if (form->tag == CLJC_VECTOR) {
-        /* Incremental len: mid-expansion GC marks only the filled slots. */
+        /* Expand into a list first so ~@ splices work inside vector
+         * templates ([~@(...)]), then convert. The list is stack-rooted. */
+        Cljc *out = NIL, **t = &out;
+        for (size_t i = 0; i < form->as.vec.len; i++) {
+            Cljc *el = form->as.vec.items[i];
+            if (el != NIL && el->tag == CLJC_LIST && el->as.cons.head->tag == CLJC_SYMBOL
+                && el->as.cons.head->as.sym == SYM_UQS) {
+                Cljc *spliced = to_seq(eval(env, el->as.cons.tail->as.cons.head));
+                for (Cljc *s = spliced; s && s->tag == CLJC_LIST; s = s->as.cons.tail) {
+                    *t = mk_cons(s->as.cons.head, NIL);
+                    t = &(*t)->as.cons.tail;
+                }
+            } else {
+                *t = mk_cons(qq_expand(env, el), NIL);
+                t = &(*t)->as.cons.tail;
+            }
+        }
+        size_t n = list_len(out);
         Cljc *v = alloc(CLJC_VECTOR);
-        size_t n = form->as.vec.len;
         v->as.vec.items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
         v->as.vec.len = 0;
         v->as.vec.cap = n;
-        for (size_t i = 0; i < n; i++) {
-            v->as.vec.items[i] = qq_expand(env, form->as.vec.items[i]);
-            v->as.vec.len = i + 1;
+        for (Cljc *l = out; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+            v->as.vec.items[v->as.vec.len] = l->as.cons.head;
+            v->as.vec.len++;
         }
         return v;
     }
@@ -1690,6 +1706,8 @@ TYPE_PRED(map_p,     v != NIL && v->tag == CLJC_MAP)
 TYPE_PRED(list_p,    v != NIL && v->tag == CLJC_LIST)
 TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
 TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE))
+TYPE_PRED(int_p,     v != NIL && v->tag == CLJC_INT)
+TYPE_PRED(double_p,  v != NIL && v->tag == CLJC_DOUBLE)
 TYPE_PRED(string_p,  v != NIL && v->tag == CLJC_STRING)
 TYPE_PRED(keyword_p, v != NIL && v->tag == CLJC_KEYWORD)
 TYPE_PRED(symbol_p,  v != NIL && v->tag == CLJC_SYMBOL)
@@ -2597,6 +2615,53 @@ static const char *PRELUDE =
     "    `(map (fn [~(nth bindings 0)] ~body) ~(nth bindings 1))\n"
     "    `(mapcat (fn [~(nth bindings 0)] (for ~(vec (drop 2 bindings)) ~body))\n"
     "             ~(nth bindings 1))))\n"
+    /* batch 5-lite */
+    "(defn boolean [x] (if x true false))\n"
+    "(defn true? [x] (= x true))\n"
+    "(defn false? [x] (= x false))\n"
+    "(defn map-indexed [f coll]\n"
+    "  (loop [s (seq coll) i 0 acc (list)]\n"
+    "    (if s\n"
+    "      (recur (next s) (inc i) (cons (f i (first s)) acc))\n"
+    "      (reverse acc))))\n"
+    "(defn keep-indexed [f coll] (filter some? (map-indexed f coll)))\n"
+    "(defn partition-all [n coll]\n"
+    "  (loop [s (seq coll) acc (list)]\n"
+    "    (if s\n"
+    "      (recur (seq (drop n s)) (cons (take n s) acc))\n"
+    "      (reverse acc))))\n"
+    "(defn zipmap [ks vs]\n"
+    "  (loop [k (seq ks) v (seq vs) m {}]\n"
+    "    (if (and k v)\n"
+    "      (recur (next k) (next v) (assoc m (first k) (first v)))\n"
+    "      m)))\n"
+    "(defn merge-with [f & ms]\n"
+    "  (reduce (fn [acc m]\n"
+    "            (reduce (fn [a [k v]]\n"
+    "                      (if (contains? a k)\n"
+    "                        (assoc a k (f (get a k) v))\n"
+    "                        (assoc a k v)))\n"
+    "                    acc (seq m)))\n"
+    "          {} ms))\n"
+    "(defn reduce-kv [f init m]\n"
+    "  (reduce (fn [acc [k v]] (f acc k v)) init (seq m)))\n"
+    "(defn repeatedly [n f] (map (fn [_] (f)) (range n)))\n"
+    "(defmacro doto [x & forms]\n"
+    "  (let [g (gensym \"doto\")]\n"
+    "    `(let [~g ~x]\n"
+    "       ~@(map (fn [f]\n"
+    "                (if (list? f)\n"
+    "                  (concat (list (first f) g) (rest f))\n"
+    "                  (list f g)))\n"
+    "              forms)\n"
+    "       ~g)))\n"
+    "(defmacro letfn [fnspecs & body]\n"
+    "  `(let [~@(mapcat (fn [spec] (list (first spec) (cons 'fn (rest spec))))\n"
+    "                   fnspecs)]\n"
+    "     ~@body))\n"
+    "(defmacro assert [x]\n"
+    "  `(when-not ~x\n"
+    "     (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"
     ;
 
 CljcEnv *cljc_new_env(void) {
@@ -2667,6 +2732,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "list?",   prim_list_p);
     cljc_define_native(e, "vector?", prim_vector_p);
     cljc_define_native(e, "number?", prim_number_p);
+    cljc_define_native(e, "int?",    prim_int_p);
+    cljc_define_native(e, "double?", prim_double_p);
     cljc_define_native(e, "string?", prim_string_p);
     cljc_define_native(e, "keyword?", prim_keyword_p);
     cljc_define_native(e, "symbol?", prim_symbol_p);

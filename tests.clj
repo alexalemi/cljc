@@ -355,6 +355,27 @@
 (assert= (list 11 21 12 22) (for [x [1 2] y [10 20]] (+ x y)))
 (assert= (list 1 4 9) (for [x [1 2 3]] (* x x)))
 
+; ── batch 5-lite ──
+(assert= (list [0 :a] [1 :b]) (map-indexed (fn [i x] [i x]) [:a :b]))
+(assert= (list 0 2) (keep-indexed (fn [i x] (when (even? i) i)) [:a :b :c]))
+(assert= (list (list 0 1) (list 2 3) (list 4)) (partition-all 2 (range 5)))
+(assert= {:a 1 :b 2} (zipmap [:a :b] [1 2]))
+(assert= {:a 4 :b 2} (merge-with + {:a 1} {:a 3 :b 2}))
+(assert= 6 (reduce-kv (fn [acc k v] (+ acc v)) 0 {:a 1 :b 2 :c 3}))
+(assert= (list 7 7 7) (repeatedly 3 (constantly 7)))
+(assert= true (boolean 1))
+(assert= false (boolean nil))
+(assert= true (int? 3))
+(assert= false (int? 3.5))
+(assert= true (double? 3.5))
+(def dlog (atom []))
+(assert= 5 (doto 5 (->> (swap! dlog conj))))
+(assert= [5] @dlog)
+(assert= 8 (letfn [(f [x] (if (zero? x) 0 (+ 2 (g (dec x))))) (g [x] (f x))] (f 4)))
+(assert= :ok (try (assert (= 1 1)) :ok))
+(assert= true (string? (ex-message (try (assert (= 1 2)) (catch Exception e e)))))
+(assert= [1 2 3] `[1 ~@(list 2 3)])   ; splice inside vector template
+
 ; ── file IO round trip ──
 (spit "/tmp/cljc-test.txt" "hello file")
 (assert= "hello file" (slurp "/tmp/cljc-test.txt"))

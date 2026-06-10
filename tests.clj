@@ -376,6 +376,54 @@
 (assert= true (string? (ex-message (try (assert (= 1 2)) (catch Exception e e)))))
 (assert= [1 2 3] `[1 ~@(list 2 3)])   ; splice inside vector template
 
+; ── HAMT engine ──
+
+; big map: build, count, lookup, overwrite, dissoc back down
+(def big (reduce (fn [m i] (assoc m i (* i i))) {} (range 2000)))
+(assert= 2000 (count big))
+(assert= 1024 (get big 32))
+(assert= 3996001 (get big 1999))
+(assert= :missing (get big 99999 :missing))
+(assert= 2000 (count (assoc big 7 :changed)))       ; overwrite doesn't grow
+(assert= :changed (get (assoc big 7 :changed) 7))
+(assert= 49 (get big 7))                            ; original untouched
+(def shrunk (reduce dissoc big (range 1000)))
+(assert= 1000 (count shrunk))
+(assert= false (contains? shrunk 500))
+(assert= true (contains? shrunk 1500))
+(assert= 0 (count (reduce dissoc big (range 2000))))
+
+; structural sharing survives GC
+(def base-m (reduce (fn [m i] (assoc m (keyword (str "k" i)) i)) {} (range 100)))
+(def derived (assoc base-m :extra :v))
+(gc)
+(assert= 100 (count base-m))
+(assert= 101 (count derived))
+(assert= 50 (:k50 derived))
+
+; mixed key types, hash/equality coherence
+(def mixed {1 :int "1" :string :one :kw [1 2] :vec})
+(assert= :int (get mixed 1))
+(assert= :int (get mixed 1.0))                      ; (= 1 1.0) → same bucket
+(assert= :string (get mixed "1"))
+(assert= :vec (get mixed [1 2]))
+(assert= :vec (get mixed (list 1 2)))               ; seq equality crosses types
+(assert= 4 (count mixed))
+
+; maps as keys (recursive hashing); map hash is order-independent
+(def mk {{:a 1 :b 2} :found})
+(assert= :found (get mk {:b 2 :a 1}))
+
+; keys/vals/seq agree with each other
+(def kvm {:a 1 :b 2 :c 3})
+(assert= 3 (count (keys kvm)))
+(assert= 6 (reduce + (vals kvm)))
+(assert= (sort [:a :b :c]) (sort (keys kvm)))
+(assert= true (every? (fn [[k v]] (= v (get kvm k))) (seq kvm)))
+
+; duplicate literal keys are a reader error
+; (checked manually: {:a 1 :a 2} => error: duplicate key in map literal)
+
 ; ── file IO round trip ──
 (spit "/tmp/cljc-test.txt" "hello file")
 (assert= "hello file" (slurp "/tmp/cljc-test.txt"))

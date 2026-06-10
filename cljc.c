@@ -40,6 +40,7 @@ typedef enum {
     CLJC_FN,        /* interpreted */
     CLJC_NATIVE,    /* C function */
     CLJC_ATOM,      /* mutable box: (atom x), @a, swap!, reset! */
+    CLJC_HNODE,     /* internal: HAMT tree node — never user-visible */
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
 } CljcTag;
@@ -60,7 +61,11 @@ struct Cljc {
         char *str;
         struct { Cljc *head; Cljc *tail; } cons;
         struct { Cljc **items; size_t len; size_t cap; } vec;
-        struct { Cljc **keys; Cljc **vals; size_t len; } map;
+        /* HAMT persistent map: root tree node (NULL when empty) + entry count */
+        struct { Cljc *root; size_t count; } map;
+        /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
+         * subnode. Collision nodes hold same-hash entries linearly. */
+        struct { Cljc **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids; bool collision; } hnode;
         /* arities: list of (params-list . body-list) pairs; dispatch by argc */
         struct { Cljc *arities; CljcEnv *env; bool is_macro; } fn;
         CljcNativeFn native;
@@ -294,10 +299,11 @@ static void gc_mark(Cljc *v) {
                 for (size_t i = 0; i < v->as.vec.len; i++) gc_mark(v->as.vec.items[i]);
                 return;
             case CLJC_MAP:
-                for (size_t i = 0; i < v->as.map.len; i++) {
-                    gc_mark(v->as.map.keys[i]);
-                    gc_mark(v->as.map.vals[i]);
-                }
+                v = v->as.map.root;  /* NULL-safe: loop condition handles it */
+                break;
+            case CLJC_HNODE:
+                for (size_t i = 0; i < v->as.hnode.nkids; i++)
+                    gc_mark(v->as.hnode.kids[i]);  /* NULL slots skip in gc_mark */
                 return;
             case CLJC_RECUR:
                 for (size_t i = 0; i < v->as.recur.n; i++) gc_mark(v->as.recur.vals[i]);
@@ -384,9 +390,9 @@ static void gc_collect(void) {
                 switch (c->tag) {
                     case CLJC_STRING: free(c->as.str); break;
                     case CLJC_VECTOR: free(c->as.vec.items); break;
-                    case CLJC_MAP:    free(c->as.map.keys); free(c->as.map.vals); break;
+                    case CLJC_HNODE:  free(c->as.hnode.kids); break;
                     case CLJC_RECUR:  free(c->as.recur.vals); break;
-                    default: break;
+                    default: break;  /* maps own nothing — their root is a cell */
                 }
                 c->tag = CLJC_FREE;
                 freed++;
@@ -423,6 +429,322 @@ static void gc_collect(void) {
 
 static void maybe_gc(void) {
     if (++gc_allocs >= (gc_stress ? 512 : gc_threshold)) gc_collect();
+}
+
+/* ───── Hashing ──────────────────────────────────────────────────────── */
+
+/* Must agree with cljc_eq: (= 1 1.0) → same hash; (= [1 2] '(1 2)) → lists
+ * and vectors hash identically (ordered); maps hash order-independently. */
+
+static uint32_t mix64(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (uint32_t)x;
+}
+
+static Cljc *map_entry_list(Cljc *m);
+
+static uint32_t cljc_hash(Cljc *v) {
+    if (v == NULL || v == NIL) return 0x9e3779b9u;
+    switch (v->tag) {
+        case CLJC_NIL:  return 0x9e3779b9u;
+        case CLJC_BOOL: return v->as.b ? 1231u : 1237u;
+        case CLJC_INT:  return mix64((uint64_t)v->as.i);
+        case CLJC_DOUBLE: {
+            double d = v->as.d;
+            if (d == (double)(int64_t)d) return mix64((uint64_t)(int64_t)d);  /* = int cross-equality */
+            uint64_t bits;
+            memcpy(&bits, &d, sizeof bits);
+            return mix64(bits);
+        }
+        case CLJC_STRING:  return fnv1a(v->as.str, strlen(v->as.str));
+        case CLJC_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
+        case CLJC_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
+        case CLJC_LIST: {
+            uint32_t h = 1;
+            for (Cljc *l = v; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+                h = h * 31 + cljc_hash(l->as.cons.head);
+            return h;
+        }
+        case CLJC_VECTOR: {
+            uint32_t h = 1;  /* same scheme as lists — sequential equality */
+            for (size_t i = 0; i < v->as.vec.len; i++)
+                h = h * 31 + cljc_hash(v->as.vec.items[i]);
+            return h;
+        }
+        case CLJC_MAP: {
+            uint32_t h = 0;  /* order-independent sum */
+            for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+                h += cljc_hash(e->as.cons.head->as.cons.head) * 31
+                   + cljc_hash(e->as.cons.head->as.cons.tail);
+            return h;
+        }
+        default:  /* fns, natives, atoms: identity hash (cells never move) */
+            return mix64((uint64_t)(uintptr_t)v);
+    }
+}
+
+/* ───── HAMT persistent maps ─────────────────────────────────────────── */
+
+#define HAMT_BITS 5u
+#define HAMT_MASK 31u
+
+static unsigned popcnt32(uint32_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return (unsigned)__builtin_popcount(x);
+#else
+    unsigned n = 0;
+    while (x) { x &= x - 1; n++; }
+    return n;
+#endif
+}
+
+/* Allocate a node with zeroed kid slots. Callers fill the slots immediately
+ * (no allocation in between), so a mid-fill GC can never trace garbage. */
+static Cljc *mk_hnode(uint32_t bitmap, uint16_t nkids, bool collision, uint32_t chash) {
+    Cljc *n = alloc(CLJC_HNODE);
+    n->as.hnode.kids = xmalloc(sizeof(Cljc *) * (nkids ? nkids : 1));
+    memset(n->as.hnode.kids, 0, sizeof(Cljc *) * (nkids ? nkids : 1));
+    n->as.hnode.bitmap = bitmap;
+    n->as.hnode.nkids = nkids;
+    n->as.hnode.collision = collision;
+    n->as.hnode.chash = chash;
+    return n;
+}
+
+static bool hamt_find(Cljc *node, uint32_t shift, uint32_t hash, Cljc *key, Cljc **out) {
+    while (node) {
+        if (node->as.hnode.collision) {
+            if (hash != node->as.hnode.chash) return false;
+            for (size_t i = 0; i < node->as.hnode.nkids; i += 2)
+                if (cljc_eq(node->as.hnode.kids[i], key)) {
+                    if (out) *out = node->as.hnode.kids[i + 1];
+                    return true;
+                }
+            return false;
+        }
+        uint32_t bit = 1u << ((hash >> shift) & HAMT_MASK);
+        if (!(node->as.hnode.bitmap & bit)) return false;
+        size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
+        Cljc *k = node->as.hnode.kids[2 * pos];
+        Cljc *v = node->as.hnode.kids[2 * pos + 1];
+        if (k) {
+            if (cljc_eq(k, key)) { if (out) *out = v; return true; }
+            return false;
+        }
+        node = v;          /* descend into subnode */
+        shift += HAMT_BITS;
+    }
+    return false;
+}
+
+/* Build the smallest tree holding two distinct-hash entries below `shift`. */
+static Cljc *hamt_two(uint32_t shift, uint32_t h1, Cljc *k1, Cljc *v1,
+                      uint32_t h2, Cljc *k2, Cljc *v2) {
+    if (shift >= 32) {  /* full hash consumed: true collision */
+        Cljc *n = mk_hnode(0, 4, true, h1);
+        n->as.hnode.kids[0] = k1; n->as.hnode.kids[1] = v1;
+        n->as.hnode.kids[2] = k2; n->as.hnode.kids[3] = v2;
+        return n;
+    }
+    uint32_t i1 = (h1 >> shift) & HAMT_MASK, i2 = (h2 >> shift) & HAMT_MASK;
+    if (i1 == i2) {
+        Cljc *child = hamt_two(shift + HAMT_BITS, h1, k1, v1, h2, k2, v2);
+        Cljc *n = mk_hnode(1u << i1, 2, false, 0);
+        n->as.hnode.kids[0] = NULL; n->as.hnode.kids[1] = child;
+        return n;
+    }
+    Cljc *n = mk_hnode((1u << i1) | (1u << i2), 4, false, 0);
+    if (i1 < i2) {
+        n->as.hnode.kids[0] = k1; n->as.hnode.kids[1] = v1;
+        n->as.hnode.kids[2] = k2; n->as.hnode.kids[3] = v2;
+    } else {
+        n->as.hnode.kids[0] = k2; n->as.hnode.kids[1] = v2;
+        n->as.hnode.kids[2] = k1; n->as.hnode.kids[3] = v1;
+    }
+    return n;
+}
+
+/* Path-copying insert. Children are computed before parents are allocated,
+ * so every intermediate node is stack-reachable when a GC can fire. */
+static Cljc *hamt_assoc(Cljc *node, uint32_t shift, uint32_t hash,
+                        Cljc *key, Cljc *val, bool *added) {
+    if (!node) {
+        Cljc *n = mk_hnode(1u << ((hash >> shift) & HAMT_MASK), 2, false, 0);
+        n->as.hnode.kids[0] = key; n->as.hnode.kids[1] = val;
+        *added = true;
+        return n;
+    }
+    if (node->as.hnode.collision) {
+        if (hash == node->as.hnode.chash) {
+            uint16_t n_old = node->as.hnode.nkids;
+            for (size_t i = 0; i < n_old; i += 2) {
+                if (cljc_eq(node->as.hnode.kids[i], key)) {
+                    Cljc *n = mk_hnode(0, n_old, true, hash);
+                    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+                    n->as.hnode.kids[i + 1] = val;
+                    *added = false;
+                    return n;
+                }
+            }
+            Cljc *n = mk_hnode(0, (uint16_t)(n_old + 2), true, hash);
+            memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+            n->as.hnode.kids[n_old] = key;
+            n->as.hnode.kids[n_old + 1] = val;
+            *added = true;
+            return n;
+        }
+        /* Different hash: wrap the collision node one level down and retry. */
+        Cljc *wrap = mk_hnode(1u << ((node->as.hnode.chash >> shift) & HAMT_MASK), 2, false, 0);
+        wrap->as.hnode.kids[0] = NULL;
+        wrap->as.hnode.kids[1] = node;
+        return hamt_assoc(wrap, shift, hash, key, val, added);
+    }
+    uint32_t bit = 1u << ((hash >> shift) & HAMT_MASK);
+    size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
+    uint16_t n_old = node->as.hnode.nkids;
+    if (!(node->as.hnode.bitmap & bit)) {
+        /* New slot: copy with a 2-wide gap at the insertion point. */
+        Cljc *n = mk_hnode(node->as.hnode.bitmap | bit, (uint16_t)(n_old + 2), false, 0);
+        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 2 * pos);
+        n->as.hnode.kids[2 * pos] = key;
+        n->as.hnode.kids[2 * pos + 1] = val;
+        memcpy(n->as.hnode.kids + 2 * pos + 2, node->as.hnode.kids + 2 * pos,
+               sizeof(Cljc *) * (n_old - 2 * pos));
+        *added = true;
+        return n;
+    }
+    Cljc *ek = node->as.hnode.kids[2 * pos];
+    Cljc *ev = node->as.hnode.kids[2 * pos + 1];
+    Cljc *replacement_k, *replacement_v;
+    if (!ek) {                                   /* descend into subnode */
+        replacement_k = NULL;
+        replacement_v = hamt_assoc(ev, shift + HAMT_BITS, hash, key, val, added);
+    } else if (cljc_eq(ek, key)) {               /* replace value in place */
+        replacement_k = ek;
+        replacement_v = val;
+        *added = false;
+    } else {                                     /* push both entries deeper */
+        uint32_t ehash = cljc_hash(ek);
+        replacement_k = NULL;
+        if (ehash == hash) {
+            Cljc *coll = mk_hnode(0, 4, true, hash);
+            coll->as.hnode.kids[0] = ek;  coll->as.hnode.kids[1] = ev;
+            coll->as.hnode.kids[2] = key; coll->as.hnode.kids[3] = val;
+            replacement_v = coll;
+        } else {
+            replacement_v = hamt_two(shift + HAMT_BITS, ehash, ek, ev, hash, key, val);
+        }
+        *added = true;
+    }
+    Cljc *n = mk_hnode(node->as.hnode.bitmap, n_old, false, 0);
+    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+    n->as.hnode.kids[2 * pos] = replacement_k;
+    n->as.hnode.kids[2 * pos + 1] = replacement_v;
+    return n;
+}
+
+static Cljc *hamt_dissoc(Cljc *node, uint32_t shift, uint32_t hash,
+                         Cljc *key, bool *removed) {
+    if (!node) { *removed = false; return NULL; }
+    if (node->as.hnode.collision) {
+        if (hash != node->as.hnode.chash) { *removed = false; return node; }
+        uint16_t n_old = node->as.hnode.nkids;
+        for (size_t i = 0; i < n_old; i += 2) {
+            if (cljc_eq(node->as.hnode.kids[i], key)) {
+                *removed = true;
+                if (n_old == 2) return NULL;
+                Cljc *n = mk_hnode(0, (uint16_t)(n_old - 2), true, hash);
+                memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * i);
+                memcpy(n->as.hnode.kids + i, node->as.hnode.kids + i + 2,
+                       sizeof(Cljc *) * (n_old - i - 2));
+                return n;
+            }
+        }
+        *removed = false;
+        return node;
+    }
+    uint32_t bit = 1u << ((hash >> shift) & HAMT_MASK);
+    if (!(node->as.hnode.bitmap & bit)) { *removed = false; return node; }
+    size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
+    uint16_t n_old = node->as.hnode.nkids;
+    Cljc *ek = node->as.hnode.kids[2 * pos];
+    Cljc *ev = node->as.hnode.kids[2 * pos + 1];
+    if (ek) {
+        if (!cljc_eq(ek, key)) { *removed = false; return node; }
+        *removed = true;
+        if (n_old == 2) return NULL;
+        Cljc *n = mk_hnode(node->as.hnode.bitmap & ~bit, (uint16_t)(n_old - 2), false, 0);
+        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 2 * pos);
+        memcpy(n->as.hnode.kids + 2 * pos, node->as.hnode.kids + 2 * pos + 2,
+               sizeof(Cljc *) * (n_old - 2 * pos - 2));
+        return n;
+    }
+    Cljc *child = hamt_dissoc(ev, shift + HAMT_BITS, hash, key, removed);
+    if (!*removed) return node;
+    if (child == NULL) {
+        if (n_old == 2) return NULL;
+        Cljc *n = mk_hnode(node->as.hnode.bitmap & ~bit, (uint16_t)(n_old - 2), false, 0);
+        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 2 * pos);
+        memcpy(n->as.hnode.kids + 2 * pos, node->as.hnode.kids + 2 * pos + 2,
+               sizeof(Cljc *) * (n_old - 2 * pos - 2));
+        return n;
+    }
+    Cljc *n = mk_hnode(node->as.hnode.bitmap, n_old, false, 0);
+    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+    n->as.hnode.kids[2 * pos + 1] = child;
+    return n;
+}
+
+/* ── public map interface (same contract as the old assoc-array engine) ── */
+
+static Cljc *mk_map(void) {
+    return alloc(CLJC_MAP);  /* union zeroed: root NULL, count 0 */
+}
+
+static bool map_find(Cljc *m, Cljc *key, Cljc **out) {
+    if (!m->as.map.root) return false;
+    return hamt_find(m->as.map.root, 0, cljc_hash(key), key, out);
+}
+
+static Cljc *map_assoc(Cljc *m, Cljc *k, Cljc *v) {
+    bool added = false;
+    Cljc *root = hamt_assoc(m->as.map.root, 0, cljc_hash(k), k, v, &added);
+    Cljc *nm = alloc(CLJC_MAP);  /* root is stack-rooted here */
+    nm->as.map.root = root;
+    nm->as.map.count = m->as.map.count + (added ? 1 : 0);
+    return nm;
+}
+
+static Cljc *map_dissoc_one(Cljc *m, Cljc *k) {
+    bool removed = false;
+    Cljc *root = hamt_dissoc(m->as.map.root, 0, cljc_hash(k), k, &removed);
+    if (!removed) return m;
+    Cljc *nm = alloc(CLJC_MAP);
+    nm->as.map.root = root;
+    nm->as.map.count = m->as.map.count - 1;
+    return nm;
+}
+
+/* Flatten to a list of (k . v) cons pairs for iteration (print, eq, seq). */
+static void hamt_entries(Cljc *node, Cljc ***t) {
+    if (!node) return;
+    for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
+        Cljc *k = node->as.hnode.kids[i];
+        if (k == NULL && !node->as.hnode.collision) {
+            hamt_entries(node->as.hnode.kids[i + 1], t);
+        } else {
+            **t = mk_cons(mk_cons(k, node->as.hnode.kids[i + 1]), NIL);
+            *t = &(**t)->as.cons.tail;
+        }
+    }
+}
+
+static Cljc *map_entry_list(Cljc *m) {
+    Cljc *out = NIL, **t = &out;
+    hamt_entries(m->as.map.root, &t);
+    return out;
 }
 
 static Cljc *cell_alloc(void) {
@@ -622,19 +944,15 @@ static Cljc *read_form(const char **p) {
     }
     if (c == '{') {
         Cljc *list = read_list(p, '}');
-        size_t n = list_len(list);
-        if (n % 2 != 0) cljc_error("map literal must contain an even number of forms");
-        /* Store as alternating k/v in a CLJC_MAP; values are still unevaluated
-         * forms here — eval() builds the live map. */
-        Cljc *m = alloc(CLJC_MAP);
-        m->as.map.keys = xmalloc(sizeof(Cljc *) * (n / 2 ? n / 2 : 1));
-        m->as.map.vals = xmalloc(sizeof(Cljc *) * (n / 2 ? n / 2 : 1));
-        m->as.map.len = n / 2;
-        size_t i = 0;
+        if (list_len(list) % 2 != 0)
+            cljc_error("map literal must contain an even number of forms");
+        /* Keys here are unevaluated FORMS — eval() builds the live map.
+         * Duplicate literal keys are a reader error, as in Clojure. */
+        Cljc *m = mk_map();
         for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail->as.cons.tail) {
-            m->as.map.keys[i] = l->as.cons.head;
-            m->as.map.vals[i] = l->as.cons.tail->as.cons.head;
-            i++;
+            if (map_find(m, l->as.cons.head, NULL))
+                cljc_error("duplicate key in map literal");
+            m = map_assoc(m, l->as.cons.head, l->as.cons.tail->as.cons.head);
         }
         return m;
     }
@@ -730,13 +1048,14 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
             KW_OR = intern("or", 2);
         }
         Cljc *defaults = NULL;  /* the :or map, if present */
-        for (size_t i = 0; i < pattern->as.map.len; i++) {
-            Cljc *k = pattern->as.map.keys[i];
-            if (k->tag == CLJC_KEYWORD && k->as.kw == KW_OR) defaults = pattern->as.map.vals[i];
+        Cljc *pentries = map_entry_list(pattern);
+        for (Cljc *e = pentries; e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            Cljc *k = e->as.cons.head->as.cons.head;
+            if (k->tag == CLJC_KEYWORD && k->as.kw == KW_OR) defaults = e->as.cons.head->as.cons.tail;
         }
-        for (size_t i = 0; i < pattern->as.map.len; i++) {
-            Cljc *k = pattern->as.map.keys[i];
-            Cljc *spec = pattern->as.map.vals[i];
+        for (Cljc *e = pentries; e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            Cljc *k = e->as.cons.head->as.cons.head;
+            Cljc *spec = e->as.cons.head->as.cons.tail;
             if (k->tag == CLJC_KEYWORD) {
                 if (k->as.kw == KW_OR) continue;
                 if (k->as.kw == KW_AS) {
@@ -962,17 +1281,11 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
         return v;
     }
     if (form->tag == CLJC_MAP) {
-        Cljc *m = alloc(CLJC_MAP);
-        size_t n = form->as.map.len;
-        m->as.map.keys = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-        m->as.map.vals = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-        m->as.map.len = 0;
-        for (size_t i = 0; i < n; i++) {
-            Cljc *k = qq_expand(env, form->as.map.keys[i]);   /* stack-rooted while */
-            Cljc *val = qq_expand(env, form->as.map.vals[i]); /* the pair completes */
-            m->as.map.keys[i] = k;
-            m->as.map.vals[i] = val;
-            m->as.map.len = i + 1;
+        Cljc *m = mk_map();
+        for (Cljc *e = map_entry_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            Cljc *k = qq_expand(env, e->as.cons.head->as.cons.head);
+            Cljc *val = qq_expand(env, e->as.cons.head->as.cons.tail);
+            m = map_assoc(m, k, val);
         }
         return m;
     }
@@ -1006,26 +1319,18 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
             return v;
         }
         case CLJC_MAP: {
-            /* Map literals evaluate keys and values; later duplicates win. */
-            Cljc *m = alloc(CLJC_MAP);
-            size_t n = form->as.map.len;
-            m->as.map.keys = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-            m->as.map.vals = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-            m->as.map.len = 0;
-            for (size_t i = 0; i < n; i++) {
-                Cljc *k = eval(env, form->as.map.keys[i]);
-                Cljc *val = eval(env, form->as.map.vals[i]);
-                bool replaced = false;
-                for (size_t j = 0; j < m->as.map.len; j++)
-                    if (cljc_eq(m->as.map.keys[j], k)) { m->as.map.vals[j] = val; replaced = true; break; }
-                if (!replaced) {
-                    m->as.map.keys[m->as.map.len] = k;
-                    m->as.map.vals[m->as.map.len] = val;
-                    m->as.map.len++;
-                }
+            /* Map literal: evaluate each key/value form, assoc into a fresh
+             * map. Evaluation order follows hash order, not source order. */
+            Cljc *m = mk_map();
+            for (Cljc *e = map_entry_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+                Cljc *k = eval(env, e->as.cons.head->as.cons.head);
+                Cljc *val = eval(env, e->as.cons.head->as.cons.tail);
+                m = map_assoc(m, k, val);
             }
             return m;
         }
+        case CLJC_HNODE:
+            cljc_error("internal: evaluated a HAMT node");
         case CLJC_SYMBOL:
             return env_lookup(env, form->as.sym);
         case CLJC_LIST: {
@@ -1336,15 +1641,18 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         }
         case CLJC_MAP: {
             sb_putc(sb, '{');
-            for (size_t i = 0; i < v->as.map.len; i++) {
-                if (i) sb_puts(sb, ", ");
-                print_to(sb, v->as.map.keys[i], readably);
+            bool first = true;
+            for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+                if (!first) sb_puts(sb, ", ");
+                first = false;
+                print_to(sb, e->as.cons.head->as.cons.head, readably);
                 sb_putc(sb, ' ');
-                print_to(sb, v->as.map.vals[i], readably);
+                print_to(sb, e->as.cons.head->as.cons.tail, readably);
             }
             sb_putc(sb, '}');
             break;
         }
+        case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
         case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
         case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
         case CLJC_ATOM:
@@ -1471,16 +1779,6 @@ static bool seq_eq(Cljc *a, Cljc *b) {
     }
 }
 
-static bool map_find(Cljc *m, Cljc *key, Cljc **out) {
-    for (size_t i = 0; i < m->as.map.len; i++) {
-        if (cljc_eq(m->as.map.keys[i], key)) {
-            if (out) *out = m->as.map.vals[i];
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool cljc_eq(Cljc *a, Cljc *b) {
     if (a == b) return true;
     if (a == NULL || b == NULL) return false;
@@ -1506,11 +1804,11 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         case CLJC_KEYWORD: return a->as.kw == b->as.kw;
         case CLJC_STRING: return strcmp(a->as.str, b->as.str) == 0;
         case CLJC_MAP: {
-            if (a->as.map.len != b->as.map.len) return false;
-            for (size_t i = 0; i < a->as.map.len; i++) {
+            if (a->as.map.count != b->as.map.count) return false;
+            for (Cljc *e = map_entry_list(a); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
                 Cljc *bv;
-                if (!map_find(b, a->as.map.keys[i], &bv)) return false;
-                if (!cljc_eq(a->as.map.vals[i], bv)) return false;
+                if (!map_find(b, e->as.cons.head->as.cons.head, &bv)) return false;
+                if (!cljc_eq(e->as.cons.head->as.cons.tail, bv)) return false;
             }
             return true;
         }
@@ -1606,7 +1904,7 @@ static Cljc *prim_count(CljcEnv *env, Cljc *args) {
     if (v == NIL) return mk_int(0);
     if (v->tag == CLJC_LIST) return mk_int((int64_t)list_len(v));
     if (v->tag == CLJC_VECTOR) return mk_int((int64_t)v->as.vec.len);
-    if (v->tag == CLJC_MAP) return mk_int((int64_t)v->as.map.len);
+    if (v->tag == CLJC_MAP) return mk_int((int64_t)v->as.map.count);
     if (v->tag == CLJC_STRING) return mk_int((int64_t)strlen(v->as.str));
     cljc_error("count: not countable");
     return NIL;
@@ -1722,7 +2020,7 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc *args) {
     if (v == NIL) return TRUE;
     if (v->tag == CLJC_LIST) return FALSE;  /* a cons is never empty */
     if (v->tag == CLJC_VECTOR) return mk_bool(v->as.vec.len == 0);
-    if (v->tag == CLJC_MAP) return mk_bool(v->as.map.len == 0);
+    if (v->tag == CLJC_MAP) return mk_bool(v->as.map.count == 0);
     if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
     cljc_error("empty?: not a collection");
     return NIL;
@@ -1752,37 +2050,11 @@ static Cljc *prim_mod(CljcEnv *env, Cljc *args) {
     return mk_int(m);
 }
 
-/* ── Map primitives (v0 assoc-array engine) ── */
-
-static Cljc *mk_map(size_t cap) {
-    Cljc *m = alloc(CLJC_MAP);
-    m->as.map.keys = xmalloc(sizeof(Cljc *) * (cap ? cap : 1));
-    m->as.map.vals = xmalloc(sizeof(Cljc *) * (cap ? cap : 1));
-    m->as.map.len = 0;
-    return m;
-}
-
-static Cljc *map_assoc(Cljc *m, Cljc *k, Cljc *v) {
-    /* Copy-on-write: callers keep their original map unchanged. */
-    Cljc *nm = mk_map(m->as.map.len + 1);
-    bool replaced = false;
-    for (size_t i = 0; i < m->as.map.len; i++) {
-        nm->as.map.keys[i] = m->as.map.keys[i];
-        if (cljc_eq(m->as.map.keys[i], k)) { nm->as.map.vals[i] = v; replaced = true; }
-        else nm->as.map.vals[i] = m->as.map.vals[i];
-    }
-    nm->as.map.len = m->as.map.len;
-    if (!replaced) {
-        nm->as.map.keys[nm->as.map.len] = k;
-        nm->as.map.vals[nm->as.map.len] = v;
-        nm->as.map.len++;
-    }
-    return nm;
-}
+/* ── Map primitives (HAMT engine — see the HAMT section above) ── */
 
 static Cljc *prim_hash_map(CljcEnv *env, Cljc *args) {
     (void)env;
-    Cljc *m = mk_map(list_len(args) / 2);
+    Cljc *m = mk_map();
     for (Cljc *a = args; a && a->tag == CLJC_LIST; a = a->as.cons.tail->as.cons.tail) {
         if (a->as.cons.tail == NIL) cljc_error("hash-map needs an even number of arguments");
         m = map_assoc(m, a->as.cons.head, a->as.cons.tail->as.cons.head);
@@ -1809,7 +2081,7 @@ static Cljc *prim_get(CljcEnv *env, Cljc *args) {
 static Cljc *prim_assoc(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *coll = args->as.cons.head;
-    if (coll == NIL) coll = mk_map(0);
+    if (coll == NIL) coll = mk_map();
     Cljc *r = coll;
     for (Cljc *a = args->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail->as.cons.tail) {
         if (a->as.cons.tail == NIL) cljc_error("assoc needs key-value pairs");
@@ -1836,17 +2108,8 @@ static Cljc *prim_dissoc(CljcEnv *env, Cljc *args) {
     Cljc *m = args->as.cons.head;
     if (m == NIL) return NIL;
     if (m->tag != CLJC_MAP) cljc_error("dissoc: not a map");
-    for (Cljc *a = args->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
-        Cljc *k = a->as.cons.head;
-        Cljc *nm = mk_map(m->as.map.len);
-        for (size_t i = 0; i < m->as.map.len; i++) {
-            if (cljc_eq(m->as.map.keys[i], k)) continue;
-            nm->as.map.keys[nm->as.map.len] = m->as.map.keys[i];
-            nm->as.map.vals[nm->as.map.len] = m->as.map.vals[i];
-            nm->as.map.len++;
-        }
-        m = nm;
-    }
+    for (Cljc *a = args->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+        m = map_dissoc_one(m, a->as.cons.head);
     return m;
 }
 
@@ -1856,8 +2119,8 @@ static Cljc *prim_keys(CljcEnv *env, Cljc *args) {
     if (m == NIL) return NIL;
     if (m->tag != CLJC_MAP) cljc_error("keys: not a map");
     Cljc *out = NIL, **t = &out;
-    for (size_t i = 0; i < m->as.map.len; i++) {
-        *t = mk_cons(m->as.map.keys[i], NIL);
+    for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+        *t = mk_cons(e->as.cons.head->as.cons.head, NIL);
         t = &(*t)->as.cons.tail;
     }
     return out;
@@ -1869,8 +2132,8 @@ static Cljc *prim_vals(CljcEnv *env, Cljc *args) {
     if (m == NIL) return NIL;
     if (m->tag != CLJC_MAP) cljc_error("vals: not a map");
     Cljc *out = NIL, **t = &out;
-    for (size_t i = 0; i < m->as.map.len; i++) {
-        *t = mk_cons(m->as.map.vals[i], NIL);
+    for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+        *t = mk_cons(e->as.cons.head->as.cons.tail, NIL);
         t = &(*t)->as.cons.tail;
     }
     return out;
@@ -1896,8 +2159,8 @@ static Cljc *prim_merge(CljcEnv *env, Cljc *args) {
         if (m == NIL) continue;
         if (m->tag != CLJC_MAP) cljc_error("merge: not a map");
         if (r == NIL) { r = m; continue; }
-        for (size_t i = 0; i < m->as.map.len; i++)
-            r = map_assoc(r, m->as.map.keys[i], m->as.map.vals[i]);
+        for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+            r = map_assoc(r, e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail);
     }
     return r;
 }
@@ -1957,8 +2220,8 @@ static Cljc *to_seq(Cljc *v) {
     if (v->tag == CLJC_MAP) {
         /* Maps seq into [k v] entry vectors. */
         Cljc *out = NIL, **t = &out;
-        for (size_t i = 0; i < v->as.map.len; i++) {
-            Cljc *entry_items[2] = { v->as.map.keys[i], v->as.map.vals[i] };
+        for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            Cljc *entry_items[2] = { e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail };
             *t = mk_cons(mk_vector(entry_items, 2), NIL);
             t = &(*t)->as.cons.tail;
         }
@@ -2117,7 +2380,7 @@ static Cljc *prim_ex_info(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *msg = args->as.cons.head;
     Cljc *data = args->as.cons.tail->as.cons.head;
-    Cljc *m = mk_map(2);
+    Cljc *m = mk_map();
     m = map_assoc(m, mk_kw(kw_message()), msg);
     m = map_assoc(m, mk_kw(kw_data()), data);
     return m;

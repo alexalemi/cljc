@@ -451,4 +451,34 @@
 (assert= :changed (nth bv2 2500))
 (assert= true (= (vec (range 100)) (reduce conj [] (range 100))))
 (assert= [1 2 :x] (assoc [1 2] 2 :x))   ; assoc at len appends
+; ── sets ──
+(assert= true (set? #{1 2}))
+(assert= true (contains? #{:a :b} :a))
+(assert= false (contains? #{:a} :z))
+(assert= :a (#{:a :b} :a))
+(assert= nil (#{:a} :z))
+(assert= :dflt (get #{:a} :z :dflt))
+(assert= :a (get #{:a} :a))
+(assert= true (= #{1 2 3} #{3 2 1}))
+(assert= false (= #{1 2} #{1 2 3}))
+(assert= 3 (count (conj #{1 2} 3 3)))
+(assert= #{1 3} (disj #{1 2 3} 2))
+(assert= #{1 2 3} (set [1 2 2 3 3]))
+(assert= #{1 2 3} (set/union #{1 2} #{2 3}))
+(assert= #{2 3} (set/intersection #{1 2 3} #{2 3 4}))
+(assert= #{1 3} (set/difference #{1 2 3} #{2}))
+(assert= #{1 2} (into #{} [1 1 2 2]))
+(assert= (list 1 2 3) (sort (seq #{3 1 2})))
+(assert= #{[1 2] {:a 1}} (conj #{[1 2]} {:a 1}))        ; composite elements
+(assert= true (contains? #{[1 2]} (list 1 2)))           ; seq-equality keys
+(def bigset (reduce conj #{} (range 1000)))
+(assert= 1000 (count bigset))
+(assert= true (contains? bigset 999))
+(assert= 999 (count (disj bigset 500)))
+(gc)
+(assert= true (contains? bigset 500))                    ; original survives
+(assert= (list 0 2 4) (filter bigset [0 1.5 2 4 9999.5]))  ; set as predicate fn
+(def evens (set (range 0 10 2)))
+(assert= (list 0 2 4) (filter evens [0 1 2 3 4 5]))
+
 (println "tests complete")

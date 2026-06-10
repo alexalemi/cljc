@@ -40,6 +40,7 @@ typedef enum {
     CLJC_FN,        /* interpreted */
     CLJC_NATIVE,    /* C function */
     CLJC_ATOM,      /* mutable box: (atom x), @a, swap!, reset! */
+    CLJC_SET,       /* persistent set: a HAMT keyed by its elements (uses as.map) */
     CLJC_HNODE,     /* internal: HAMT tree node — never user-visible */
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
@@ -305,6 +306,7 @@ static void gc_mark(Cljc *v) {
                 v = v->as.vec.root;  /* NULL-safe */
                 break;
             case CLJC_MAP:
+            case CLJC_SET:
                 v = v->as.map.root;  /* NULL-safe: loop condition handles it */
                 break;
             case CLJC_HNODE:
@@ -479,8 +481,8 @@ static uint32_t cljc_hash(Cljc *v) {
                 h = h * 31 + cljc_hash(vec_nth(v, i));
             return h;
         }
-        case CLJC_MAP: {
-            uint32_t h = 0;  /* order-independent sum */
+        case CLJC_MAP: case CLJC_SET: {
+            uint32_t h = v->tag == CLJC_SET ? 0xa5e3u : 0;  /* order-independent sum */
             for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
                 h += cljc_hash(e->as.cons.head->as.cons.head) * 31
                    + cljc_hash(e->as.cons.head->as.cons.tail);
@@ -750,6 +752,45 @@ static void hamt_entries(Cljc *node, Cljc ***t) {
 static Cljc *map_entry_list(Cljc *m) {
     Cljc *out = NIL, **t = &out;
     hamt_entries(m->as.map.root, &t);
+    return out;
+}
+
+/* ── Sets: a HAMT keyed by its elements (each element is its own value) ── */
+
+static Cljc *mk_set(void) {
+    return alloc(CLJC_SET);  /* union zeroed: root NULL, count 0 */
+}
+
+static Cljc *set_conj(Cljc *s, Cljc *x) {
+    bool added = false;
+    Cljc *root = hamt_assoc(s->as.map.root, 0, cljc_hash(x), x, x, &added);
+    Cljc *ns = alloc(CLJC_SET);
+    ns->as.map.root = root;
+    ns->as.map.count = s->as.map.count + (added ? 1 : 0);
+    return ns;
+}
+
+static Cljc *set_disj(Cljc *s, Cljc *x) {
+    bool removed = false;
+    Cljc *root = hamt_dissoc(s->as.map.root, 0, cljc_hash(x), x, &removed);
+    if (!removed) return s;
+    Cljc *ns = alloc(CLJC_SET);
+    ns->as.map.root = root;
+    ns->as.map.count = s->as.map.count - 1;
+    return ns;
+}
+
+static bool set_contains(Cljc *s, Cljc *x, Cljc **out) {
+    if (!s->as.map.root) return false;
+    return hamt_find(s->as.map.root, 0, cljc_hash(x), x, out);
+}
+
+/* Set elements as a list (each HAMT entry's key). */
+static Cljc *set_element_list(Cljc *s) {
+    Cljc *out = NIL, **t = &out;
+    hamt_entries(s->as.map.root, &t);
+    for (Cljc *l = out; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+        l->as.cons.head = l->as.cons.head->as.cons.head;  /* (x . x) -> x */
     return out;
 }
 
@@ -1076,6 +1117,19 @@ static Cljc *read_form(const char **p) {
             v = vec_conj1(v, l->as.cons.head);
         return v;
     }
+    if (c == '#' && (*p)[1] == '{') {
+        (*p)++;  /* consume '#'; read_list consumes '{' */
+        Cljc *list = read_list(p, '}');
+        /* Elements are unevaluated forms; eval builds the live set.
+         * Duplicate literal elements are a reader error, as in Clojure. */
+        Cljc *s = mk_set();
+        for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+            if (set_contains(s, l->as.cons.head, NULL))
+                cljc_error("duplicate element in set literal");
+            s = set_conj(s, l->as.cons.head);
+        }
+        return s;
+    }
     if (c == '{') {
         Cljc *list = read_list(p, '}');
         if (list_len(list) % 2 != 0)
@@ -1301,6 +1355,14 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc *args) {
         if (map_find(fn, k, &out)) return out;
         return dflt;
     }
+    /* Sets as functions: (#{:a} :a) => :a, else nil/default. */
+    if (fn->tag == CLJC_SET) {
+        Cljc *x = args->as.cons.head;
+        Cljc *dflt = args->as.cons.tail != NIL ? args->as.cons.tail->as.cons.head : NIL;
+        Cljc *out;
+        if (set_contains(fn, x, &out)) return out;
+        return dflt;
+    }
     /* Vectors as functions: ([10 20 30] 1) => 20. */
     if (fn->tag == CLJC_VECTOR) {
         Cljc *k = args->as.cons.head;
@@ -1450,6 +1512,13 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                 m = map_assoc(m, k, val);
             }
             return m;
+        }
+        case CLJC_SET: {
+            /* Set literal: evaluate each element form. */
+            Cljc *s = mk_set();
+            for (Cljc *e = set_element_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+                s = set_conj(s, eval(env, e->as.cons.head));
+            return s;
         }
         case CLJC_HNODE:
             cljc_error("internal: evaluated a HAMT node");
@@ -1774,6 +1843,17 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '}');
             break;
         }
+        case CLJC_SET: {
+            sb_puts(sb, "#{");
+            bool sfirst = true;
+            for (Cljc *e = set_element_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+                if (!sfirst) sb_putc(sb, ' ');
+                sfirst = false;
+                print_to(sb, e->as.cons.head, readably);
+            }
+            sb_putc(sb, '}');
+            break;
+        }
         case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
         case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
         case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
@@ -1934,6 +2014,12 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
             }
             return true;
         }
+        case CLJC_SET: {
+            if (a->as.map.count != b->as.map.count) return false;
+            for (Cljc *e = set_element_list(a); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+                if (!set_contains(b, e->as.cons.head, NULL)) return false;
+            return true;
+        }
         default: return false;
     }
 }
@@ -2026,7 +2112,8 @@ static Cljc *prim_count(CljcEnv *env, Cljc *args) {
     if (v == NIL) return mk_int(0);
     if (v->tag == CLJC_LIST) return mk_int((int64_t)list_len(v));
     if (v->tag == CLJC_VECTOR) return mk_int((int64_t)vec_len(v));
-    if (v->tag == CLJC_MAP) return mk_int((int64_t)v->as.map.count);
+    if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
+        return mk_int((int64_t)v->as.map.count);
     if (v->tag == CLJC_STRING) return mk_int((int64_t)strlen(v->as.str));
     cljc_error("count: not countable");
     return NIL;
@@ -2058,6 +2145,8 @@ static Cljc *prim_conj(CljcEnv *env, Cljc *args) {
             r = mk_cons(x, r);                      /* lists grow at the front */
         } else if (r->tag == CLJC_VECTOR) {
             r = vec_conj1(r, x);                    /* vectors grow at the back */
+        } else if (r->tag == CLJC_SET) {
+            r = set_conj(r, x);
         } else cljc_error("conj: not a collection");
     }
     return r;
@@ -2109,6 +2198,7 @@ static Cljc *prim_apply(CljcEnv *env, Cljc *args) {
 
 TYPE_PRED(nil_p,     v == NIL)
 TYPE_PRED(map_p,     v != NIL && v->tag == CLJC_MAP)
+TYPE_PRED(set_p,     v != NIL && v->tag == CLJC_SET)
 TYPE_PRED(list_p,    v != NIL && v->tag == CLJC_LIST)
 TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
 TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE))
@@ -2128,7 +2218,8 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc *args) {
     if (v == NIL) return TRUE;
     if (v->tag == CLJC_LIST) return FALSE;  /* a cons is never empty */
     if (v->tag == CLJC_VECTOR) return mk_bool(vec_len(v) == 0);
-    if (v->tag == CLJC_MAP) return mk_bool(v->as.map.count == 0);
+    if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
+        return mk_bool(v->as.map.count == 0);
     if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
     cljc_error("empty?: not a collection");
     return NIL;
@@ -2179,6 +2270,9 @@ static Cljc *prim_get(CljcEnv *env, Cljc *args) {
     if (coll != NIL && coll->tag == CLJC_MAP) {
         Cljc *out;
         if (map_find(coll, k, &out)) return out;
+    } else if (coll != NIL && coll->tag == CLJC_SET) {
+        Cljc *out;
+        if (set_contains(coll, k, &out)) return out;
     } else if (coll != NIL && coll->tag == CLJC_VECTOR && k->tag == CLJC_INT) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
             return vec_nth(coll, (size_t)k->as.i);
@@ -2246,6 +2340,7 @@ static Cljc *prim_contains_p(CljcEnv *env, Cljc *args) {
     Cljc *k = args->as.cons.tail->as.cons.head;
     if (coll == NIL) return FALSE;
     if (coll->tag == CLJC_MAP) return mk_bool(map_find(coll, k, NULL));
+    if (coll->tag == CLJC_SET) return mk_bool(set_contains(coll, k, NULL));
     if (coll->tag == CLJC_VECTOR)  /* contains? checks INDEX presence on vectors */
         return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
     cljc_error("contains?: not associative");
@@ -2318,6 +2413,7 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
+    if (v->tag == CLJC_SET) return set_element_list(v);
     if (v->tag == CLJC_MAP) {
         /* Maps seq into [k v] entry vectors. */
         Cljc *out = NIL, **t = &out;
@@ -2456,6 +2552,32 @@ static Cljc *prim_seq(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *s = to_seq(args->as.cons.head);
     return s == NIL ? NIL : s;  /* (seq []) => nil, matching Clojure */
+}
+
+static Cljc *prim_set(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *s = mk_set();
+    for (Cljc *l = to_seq(args->as.cons.head); l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+        s = set_conj(s, l->as.cons.head);
+    return s;
+}
+
+static Cljc *prim_hash_set(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *s = mk_set();
+    for (Cljc *a = args; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+        s = set_conj(s, a->as.cons.head);
+    return s;
+}
+
+static Cljc *prim_disj(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *s = args->as.cons.head;
+    if (s == NIL) return NIL;
+    if (s->tag != CLJC_SET) cljc_error("disj: not a set");
+    for (Cljc *a = args->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+        s = set_disj(s, a->as.cons.head);
+    return s;
 }
 
 static Cljc *prim_gc(CljcEnv *env, Cljc *args) {
@@ -3017,6 +3139,9 @@ static const char *PRELUDE =
     "  `(let [~@(mapcat (fn [spec] (list (first spec) (cons 'fn (rest spec))))\n"
     "                   fnspecs)]\n"
     "     ~@body))\n"
+    "(defn set/union [& sets] (reduce (fn [a s] (reduce conj a (seq s))) #{} sets))\n"
+    "(defn set/intersection [s1 s2] (set (filter (fn [x] (contains? s2 x)) (seq s1))))\n"
+    "(defn set/difference [s1 s2] (set (remove (fn [x] (contains? s2 x)) (seq s1))))\n"
     "(defmacro assert [x]\n"
     "  `(when-not ~x\n"
     "     (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"
@@ -3086,6 +3211,10 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "contains?", prim_contains_p);
     cljc_define_native(e, "merge",     prim_merge);
     cljc_define_native(e, "map?",      prim_map_p);
+    cljc_define_native(e, "set",       prim_set);
+    cljc_define_native(e, "hash-set",  prim_hash_set);
+    cljc_define_native(e, "disj",      prim_disj);
+    cljc_define_native(e, "set?",      prim_set_p);
     cljc_define_native(e, "nil?",    prim_nil_p);
     cljc_define_native(e, "list?",   prim_list_p);
     cljc_define_native(e, "vector?", prim_vector_p);

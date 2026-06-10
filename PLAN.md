@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~3,250 lines, zero warnings, 262 assertions in `tests.clj`, ASan/UBSan clean
+~3,400 lines, zero warnings, 287 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -80,13 +80,18 @@ required by conservative stack scanning, same as Boehm GC).
    100k assoc+lookup ≈ 0.35s. Vectors: Clojure-style 32-way position
    tries + owned tail of ≤32 elems (amortized O(1) conj — 100k conjs in
    ~33ms), path-copying assoc, trie nodes reuse CLJC_HNODE; all access
-   behind vec_len/vec_nth/vec_conj1/vec_assoc_idx. STILL TODO: sets
-   (#{...} over the HAMT) — start the next session with these.
-6. **More surface**: sets (#{...}) — fold into the HAMT milestone; regex
+   behind vec_len/vec_nth/vec_conj1/vec_assoc_idx.
+6. ~~Sets~~ ✅ done 2026-06-10 — CLJC_SET reuses the map union member and
+   the whole HAMT engine (elements stored as their own values). #{...}
+   reader literal (duplicate elements error), set/hash-set/disj/set?,
+   sets callable as membership fns, conj/contains?/get/count/seq work,
+   prelude set/union set/intersection set/difference. '#' stays a symbol
+   char except when a form starts with "#{" (so t# macro symbols still read).
+7. **More surface**: regex
    (`re-find`/`re-matches`; needs a decision: POSIX ERE divergence vs tiny
    regex engine); `condp`, `for` :when/:let modifiers, `..`,
    `iterate` (eager n-limited?), `format`?
-7. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
+8. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
    bytecode VM. Not before semantics are broader.
 
 ## Known divergences from Clojure (deliberate, v0)

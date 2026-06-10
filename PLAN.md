@@ -53,19 +53,29 @@ required by conservative stack scanning, same as Boehm GC).
 ## Roadmap (agreed order)
 
 1. ~~try/catch + atoms~~ ✅ done 2026-06-10
-2. **Destructuring + multi-arity fn** — `(fn ([x] ...) ([x y] ...))`,
-   `(let [[a b] pair, {:keys [x]} m] ...)`. Destructuring can be a macro-time
-   rewrite once `let*` exists.
-3. **HAMT persistent collections** — replace assoc-array maps and
+2. ~~Destructuring + multi-arity fn~~ ✅ done 2026-06-10 — fns hold an
+   arities list dispatched by argc; destructure() is a recursive C binder
+   shared by let/fn-params/& rest (vector patterns with & and :as, map
+   patterns with {sym :key}, :keys, :or, :as). loop stays symbols-only.
+3. ~~Babashka surface batch 1~~ ✅ done 2026-06-10 — natives: compare sort
+   vec name keyword symbol quot subs slurp spit pr prn print +
+   str/{upper-case lower-case trim split join starts-with? ends-with?
+   includes? blank?} (split/join: plain-string separators, NOT regex).
+   Prelude: next mapcat remove keep butlast every? some take-while
+   drop-while interleave interpose partition distinct group-by frequencies
+   juxt sort-by update get-in assoc-in update-in select-keys if-let
+   when-let dotimes doseq while case for. case quotes its test constants;
+   for supports multiple bindings, no :when/:let yet.
+4. **HAMT persistent collections** — replace assoc-array maps and
    copying vectors; the public interface (get/assoc/conj/...) is already
    stable so this is engine-swap only. Also a real ISeq so `to_seq` stops
    copying.
-4. **More babashka surface**: `sort sort-by group-by frequencies juxt
-   interleave interpose partition every? some take-while drop-while
-   update update-in assoc-in get-in`, `clojure.string` equivalents,
-   `re-find`/`re-matches` (POSIX regex or tiny regex engine), `slurp/spit`,
-   `doseq dotimes for` (macros), `letfn`, `case`.
-5. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
+5. **More surface**: sets (#{...}), regex (`re-find`/`re-matches`; needs a
+   decision: POSIX ERE divergence vs tiny regex engine), `letfn`, `condp`,
+   `for` :when/:let modifiers, `doto`, `..`, `partition-all`, `keep-indexed`,
+   `map-indexed`, `reduce-kv`, `merge-with`, `zipmap`, `repeatedly`,
+   `iterate` (eager n-limited?), `format`?
+6. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
    bytecode VM. Not before semantics are broader.
 
 ## Known divergences from Clojure (deliberate, v0)

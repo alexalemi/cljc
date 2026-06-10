@@ -1896,30 +1896,14 @@ static Cljc *prim_list(CljcEnv *env, Cljc *args) { (void)env; return args; }
 
 static Cljc *prim_first(CljcEnv *env, Cljc *args) {
     (void)env;
-    Cljc *v = args->as.cons.head;
-    if (v == NIL) return NIL;
-    if (v->tag == CLJC_LIST) return v->as.cons.head;
-    if (v->tag == CLJC_VECTOR) return v->as.vec.len ? v->as.vec.items[0] : NIL;
-    cljc_error("first: not a sequence");
-    return NIL;
+    Cljc *s = to_seq(args->as.cons.head);  /* lists/vectors/maps uniformly */
+    return s == NIL ? NIL : s->as.cons.head;
 }
 
 static Cljc *prim_rest(CljcEnv *env, Cljc *args) {
     (void)env;
-    Cljc *v = args->as.cons.head;
-    if (v == NIL) return NIL;
-    if (v->tag == CLJC_LIST) return v->as.cons.tail;
-    if (v->tag == CLJC_VECTOR) {
-        /* Vectors seq into lists, matching Clojure's (rest [1 2 3]) => (2 3). */
-        Cljc *out = NIL, **t = &out;
-        for (size_t i = 1; i < v->as.vec.len; i++) {
-            *t = mk_cons(v->as.vec.items[i], NIL);
-            t = &(*t)->as.cons.tail;
-        }
-        return out;
-    }
-    cljc_error("rest: not a sequence");
-    return NIL;
+    Cljc *s = to_seq(args->as.cons.head);
+    return s == NIL ? NIL : s->as.cons.tail;
 }
 
 static Cljc *prim_second(CljcEnv *env, Cljc *args) {
@@ -2179,6 +2163,272 @@ static Cljc *prim_swap(CljcEnv *env, Cljc *args) {
     return nv;
 }
 
+/* ── compare / sort ── */
+
+static int cmp_values(Cljc *a, Cljc *b) {
+    if (a == b) return 0;
+    if (a == NIL) return -1;          /* nil sorts first */
+    if (b == NIL) return 1;
+    bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE;
+    bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE;
+    if (a_num && b_num) {
+        double d = as_num(a) - as_num(b);
+        return d < 0 ? -1 : d > 0 ? 1 : 0;
+    }
+    if (a->tag != b->tag) cljc_error("compare: incomparable types");
+    switch (a->tag) {
+        case CLJC_STRING:  return strcmp(a->as.str, b->as.str);
+        case CLJC_KEYWORD: return strcmp(a->as.kw, b->as.kw);
+        case CLJC_SYMBOL:  return strcmp(a->as.sym, b->as.sym);
+        case CLJC_BOOL:    return (int)a->as.b - (int)b->as.b;
+        case CLJC_VECTOR: case CLJC_LIST: {
+            Cljc *sa = to_seq(a), *sb = to_seq(b);
+            while (sa != NIL && sb != NIL) {
+                int c = cmp_values(sa->as.cons.head, sb->as.cons.head);
+                if (c) return c;
+                sa = sa->as.cons.tail; sb = sb->as.cons.tail;
+            }
+            return sa != NIL ? 1 : sb != NIL ? -1 : 0;  /* shorter sorts first */
+        }
+        default: cljc_error("compare: incomparable type");
+    }
+    return 0;
+}
+
+static Cljc *prim_compare(CljcEnv *env, Cljc *args) {
+    (void)env;
+    return mk_int(cmp_values(args->as.cons.head, args->as.cons.tail->as.cons.head));
+}
+
+/* qsort has no context parameter; the interpreter is single-threaded. */
+static CljcEnv *g_sort_env;
+static Cljc *g_sort_fn;
+
+static int sort_adapter(const void *pa, const void *pb) {
+    Cljc *a = *(Cljc *const *)pa, *b = *(Cljc *const *)pb;
+    if (!g_sort_fn) return cmp_values(a, b);
+    Cljc *r = apply(g_sort_env, g_sort_fn, mk_cons(a, mk_cons(b, NIL)));
+    if (r != NIL && r->tag == CLJC_INT) return (int)r->as.i;
+    /* Boolean comparator: (f a b) true => a first; tie-break with (f b a). */
+    if (is_truthy(r)) return -1;
+    Cljc *r2 = apply(g_sort_env, g_sort_fn, mk_cons(b, mk_cons(a, NIL)));
+    return is_truthy(r2) ? 1 : 0;
+}
+
+static Cljc *prim_sort(CljcEnv *env, Cljc *args) {
+    /* (sort coll) or (sort comparator coll) — returns a list. */
+    Cljc *fn = NULL, *coll;
+    if (args->as.cons.tail != NIL) {
+        fn = args->as.cons.head;
+        coll = args->as.cons.tail->as.cons.head;
+    } else coll = args->as.cons.head;
+    Cljc *s = to_seq(coll);
+    size_t n = list_len(s);
+    Cljc **arr = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    size_t i = 0;
+    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail) arr[i++] = l->as.cons.head;
+    g_sort_env = env; g_sort_fn = fn;
+    qsort(arr, n, sizeof(Cljc *), sort_adapter);  /* elements stay rooted via coll */
+    g_sort_fn = NULL;
+    Cljc *out = NIL;
+    for (size_t j = n; j > 0; j--) out = mk_cons(arr[j - 1], out);
+    free(arr);
+    return out;
+}
+
+/* ── coercions ── */
+
+static Cljc *prim_vec(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *s = to_seq(args->as.cons.head);
+    size_t n = list_len(s);
+    Cljc *v = alloc(CLJC_VECTOR);
+    v->as.vec.items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    v->as.vec.len = 0;
+    v->as.vec.cap = n;
+    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+        v->as.vec.items[v->as.vec.len] = l->as.cons.head;
+        v->as.vec.len++;
+    }
+    return v;
+}
+
+static const char *as_named(Cljc *v, const char *what) {
+    if (v != NIL) {
+        if (v->tag == CLJC_KEYWORD) return v->as.kw;
+        if (v->tag == CLJC_SYMBOL) return v->as.sym;
+        if (v->tag == CLJC_STRING) return v->as.str;
+    }
+    cljc_error("%s: expected a string, keyword, or symbol", what);
+    return NULL;
+}
+
+static Cljc *prim_name(CljcEnv *env, Cljc *args) {
+    (void)env;
+    const char *n = as_named(args->as.cons.head, "name");
+    return mk_str(n, strlen(n));
+}
+
+static Cljc *prim_keyword(CljcEnv *env, Cljc *args) {
+    (void)env;
+    const char *n = as_named(args->as.cons.head, "keyword");
+    return mk_kw(intern(n, strlen(n)));
+}
+
+static Cljc *prim_symbol(CljcEnv *env, Cljc *args) {
+    (void)env;
+    const char *n = as_named(args->as.cons.head, "symbol");
+    return mk_sym(intern(n, strlen(n)));
+}
+
+static Cljc *prim_quot(CljcEnv *env, Cljc *args) {
+    (void)env;
+    int64_t a = as_int(args->as.cons.head, "quot");
+    int64_t b = as_int(args->as.cons.tail->as.cons.head, "quot");
+    if (b == 0) cljc_error("quot: division by zero");
+    return mk_int(a / b);
+}
+
+/* ── strings ── */
+
+static char *as_str(Cljc *v, const char *what) {
+    if (v == NIL || v->tag != CLJC_STRING) cljc_error("%s: expected a string", what);
+    return v->as.str;
+}
+
+static Cljc *prim_subs(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *s = as_str(args->as.cons.head, "subs");
+    size_t len = strlen(s);
+    int64_t start = as_int(args->as.cons.tail->as.cons.head, "subs");
+    int64_t end = args->as.cons.tail->as.cons.tail != NIL
+        ? as_int(args->as.cons.tail->as.cons.tail->as.cons.head, "subs") : (int64_t)len;
+    if (start < 0 || end < start || (size_t)end > len)
+        cljc_error("subs: index out of bounds");
+    return mk_str(s + start, (size_t)(end - start));
+}
+
+#define STR_MAP_FN(NAME, XFORM) \
+    static Cljc *prim_##NAME(CljcEnv *env, Cljc *args) { \
+        (void)env; \
+        char *s = as_str(args->as.cons.head, #NAME); \
+        Cljc *r = mk_str(s, strlen(s)); \
+        for (char *c = r->as.str; *c; c++) *c = (char)XFORM((unsigned char)*c); \
+        return r; \
+    }
+
+STR_MAP_FN(upper_case, toupper)
+STR_MAP_FN(lower_case, tolower)
+
+static Cljc *prim_trim(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *s = as_str(args->as.cons.head, "trim");
+    while (*s && isspace((unsigned char)*s)) s++;
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) n--;
+    return mk_str(s, n);
+}
+
+static Cljc *prim_split(CljcEnv *env, Cljc *args) {
+    /* (str/split s sep) — sep is a plain string, not a regex (divergence). */
+    (void)env;
+    char *s = as_str(args->as.cons.head, "split");
+    char *sep = as_str(args->as.cons.tail->as.cons.head, "split");
+    size_t seplen = strlen(sep);
+    if (seplen == 0) cljc_error("split: empty separator");
+    Cljc *parts = NIL, **t = &parts;  /* build as list (stack-rooted), then vec */
+    const char *p = s;
+    for (;;) {
+        const char *hit = strstr(p, sep);
+        size_t n = hit ? (size_t)(hit - p) : strlen(p);
+        *t = mk_cons(mk_str(p, n), NIL);
+        t = &(*t)->as.cons.tail;
+        if (!hit) break;
+        p = hit + seplen;
+    }
+    Cljc *one = mk_cons(parts, NIL);
+    return prim_vec(env, one);
+}
+
+#define STR_PRED(NAME, EXPR) \
+    static Cljc *prim_##NAME(CljcEnv *env, Cljc *args) { \
+        (void)env; \
+        char *s = as_str(args->as.cons.head, #NAME); \
+        char *sub = as_str(args->as.cons.tail->as.cons.head, #NAME); \
+        size_t sl = strlen(s), bl = strlen(sub); \
+        (void)sl; (void)bl; \
+        return mk_bool(EXPR); \
+    }
+
+STR_PRED(starts_with, strncmp(s, sub, bl) == 0)
+STR_PRED(ends_with,   bl <= sl && strcmp(s + sl - bl, sub) == 0)
+STR_PRED(includes,    strstr(s, sub) != NULL)
+
+static Cljc *prim_blank_p(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *v = args->as.cons.head;
+    if (v == NIL) return TRUE;
+    char *s = as_str(v, "blank?");
+    for (; *s; s++) if (!isspace((unsigned char)*s)) return FALSE;
+    return TRUE;
+}
+
+/* ── file IO ── */
+
+static Cljc *prim_slurp(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *path = as_str(args->as.cons.head, "slurp");
+    FILE *f = fopen(path, "rb");
+    if (!f) cljc_error("slurp: cannot open %s", path);
+    SBuf sb = {0};
+    sb_grow(&sb, 4096);
+    size_t n;
+    char buf[4096];
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        sb_grow(&sb, n);
+        memcpy(sb.data + sb.len, buf, n);
+        sb.len += n;
+        sb.data[sb.len] = '\0';
+    }
+    fclose(f);
+    Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
+}
+
+static Cljc *prim_spit(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *path = as_str(args->as.cons.head, "spit");
+    Cljc *content = args->as.cons.tail->as.cons.head;
+    FILE *f = fopen(path, "wb");
+    if (!f) cljc_error("spit: cannot open %s", path);
+    SBuf sb = {0};
+    print_to(&sb, content, false);
+    if (sb.data) fwrite(sb.data, 1, sb.len, f);
+    free(sb.data);
+    fclose(f);
+    return NIL;
+}
+
+/* ── printing variants ── */
+
+static Cljc *print_args(Cljc *args, bool readably, bool newline) {
+    SBuf sb = {0};
+    bool first = true;
+    for (Cljc *a = args; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+        if (!first) sb_putc(&sb, ' ');
+        first = false;
+        print_to(&sb, a->as.cons.head, readably);
+    }
+    if (newline) sb_putc(&sb, '\n');
+    if (sb.data) { fwrite(sb.data, 1, sb.len, stdout); free(sb.data); }
+    return NIL;
+}
+
+static Cljc *prim_pr(CljcEnv *env, Cljc *args)    { (void)env; return print_args(args, true, false); }
+static Cljc *prim_prn(CljcEnv *env, Cljc *args)   { (void)env; return print_args(args, true, true); }
+static Cljc *prim_print(CljcEnv *env, Cljc *args) { (void)env; return print_args(args, false, false); }
+
 /* ───── Public C API ─────────────────────────────────────────────────── */
 
 CljcEnv *cljc_new_env(void);
@@ -2242,6 +2492,111 @@ static const char *PRELUDE =
     "                       (concat form (list x))\n"
     "                       (list form x))]\n"
     "        (recur threaded (rest forms))))))\n"
+    /* seq utilities */
+    "(defn next [coll] (seq (rest coll)))\n"
+    "(defn mapcat [f coll] (apply concat (map f coll)))\n"
+    "(defn remove [pred coll] (filter (complement pred) coll))\n"
+    "(defn keep [f coll] (filter some? (map f coll)))\n"
+    "(defn butlast [coll] (reverse (rest (reverse coll))))\n"
+    "(defn every? [pred coll]\n"
+    "  (loop [s (seq coll)]\n"
+    "    (cond (nil? s) true\n"
+    "          (pred (first s)) (recur (next s))\n"
+    "          :else false)))\n"
+    "(defn some [pred coll]\n"
+    "  (loop [s (seq coll)]\n"
+    "    (if s\n"
+    "      (let [r (pred (first s))]\n"
+    "        (if r r (recur (next s))))\n"
+    "      nil)))\n"
+    "(defn take-while [pred coll]\n"
+    "  (loop [s (seq coll) acc (list)]\n"
+    "    (if (and s (pred (first s)))\n"
+    "      (recur (next s) (cons (first s) acc))\n"
+    "      (reverse acc))))\n"
+    "(defn drop-while [pred coll]\n"
+    "  (loop [s (seq coll)]\n"
+    "    (if (and s (pred (first s))) (recur (next s)) s)))\n"
+    "(defn interleave [c1 c2]\n"
+    "  (loop [a (seq c1) b (seq c2) acc (list)]\n"
+    "    (if (and a b)\n"
+    "      (recur (next a) (next b) (cons (first b) (cons (first a) acc)))\n"
+    "      (reverse acc))))\n"
+    "(defn interpose [sep coll] (rest (mapcat (fn [x] (list sep x)) coll)))\n"
+    "(defn partition [n coll]\n"
+    "  (loop [s (seq coll) acc (list)]\n"
+    "    (let [chunk (take n s)]\n"
+    "      (if (< (count chunk) n)\n"
+    "        (reverse acc)\n"
+    "        (recur (seq (drop n s)) (cons chunk acc))))))\n"
+    "(defn distinct [coll]\n"
+    "  (reverse (loop [s (seq coll) acc (list)]\n"
+    "    (if s\n"
+    "      (let [x (first s)]\n"
+    "        (recur (next s) (if (some (fn [y] (= x y)) acc) acc (cons x acc))))\n"
+    "      acc))))\n"
+    "(defn group-by [f coll]\n"
+    "  (reduce (fn [m x] (let [k (f x)] (assoc m k (conj (get m k []) x)))) {} coll))\n"
+    "(defn frequencies [coll]\n"
+    "  (reduce (fn [m x] (assoc m x (inc (get m x 0)))) {} coll))\n"
+    "(defn juxt [& fs] (fn [& args] (mapv (fn [f] (apply f args)) fs)))\n"
+    "(defn sort-by\n"
+    "  ([f coll] (sort (fn [a b] (< (compare (f a) (f b)) 0)) coll)))\n"
+    /* associative utilities */
+    "(defn update [m k f & args] (assoc m k (apply f (get m k) args)))\n"
+    "(defn get-in\n"
+    "  ([m ks] (reduce get m ks))\n"
+    "  ([m ks d] (let [r (reduce (fn [acc k] (if (nil? acc) nil (get acc k))) m ks)]\n"
+    "              (if (nil? r) d r))))\n"
+    "(defn assoc-in [m ks v]\n"
+    "  (let [k (first ks) r (rest ks)]\n"
+    "    (if (empty? r)\n"
+    "      (assoc m k v)\n"
+    "      (assoc m k (assoc-in (get m k {}) r v)))))\n"
+    "(defn update-in [m ks f & args]\n"
+    "  (assoc-in m ks (apply f (get-in m ks) args)))\n"
+    "(defn select-keys [m ks]\n"
+    "  (reduce (fn [acc k] (if (contains? m k) (assoc acc k (get m k)) acc)) {} ks))\n"
+    /* string helpers */
+    "(defn str/join\n"
+    "  ([coll] (apply str coll))\n"
+    "  ([sep coll] (if (empty? coll) \"\" (reduce (fn [a b] (str a sep b)) coll))))\n"
+    /* control-flow macros */
+    "(defmacro if-let [bindings then & else]\n"
+    "  `(let [t# ~(nth bindings 1)]\n"
+    "     (if t# (let [~(nth bindings 0) t#] ~then) ~@else)))\n"
+    "(defmacro when-let [bindings & body]\n"
+    "  `(let [t# ~(nth bindings 1)]\n"
+    "     (when t# (let [~(nth bindings 0) t#] ~@body))))\n"
+    "(defmacro dotimes [bindings & body]\n"
+    "  `(loop [~(nth bindings 0) 0]\n"
+    "     (when (< ~(nth bindings 0) ~(nth bindings 1))\n"
+    "       ~@body\n"
+    "       (recur (inc ~(nth bindings 0))))))\n"
+    "(defmacro doseq [bindings & body]\n"
+    "  `(loop [s# (seq ~(nth bindings 1))]\n"
+    "     (when s#\n"
+    "       (let [~(nth bindings 0) (first s#)] ~@body)\n"
+    "       (recur (next s#)))))\n"
+    "(defmacro while [test & body]\n"
+    "  `(loop [] (when ~test ~@body (recur))))\n"
+    "(defmacro case [e & clauses]\n"
+    "  (let [g (gensym \"case\")]\n"
+    "    (list 'let [g e]\n"
+    "      (cons 'cond\n"
+    "        (loop [cs clauses acc (list)]\n"
+    "          (if (empty? cs)\n"
+    "            (reverse acc)\n"
+    "            (if (empty? (rest cs))\n"
+    "              (reverse (cons (first cs) (cons :else acc)))\n"
+    "              (recur (rest (rest cs))\n"
+    "                     (cons (first (rest cs))\n"
+    "                           (cons (list '= g (list 'quote (first cs))) acc))))))))))\n"
+    "(defmacro for [bindings body]\n"
+    "  (if (= 2 (count bindings))\n"
+    "    `(map (fn [~(nth bindings 0)] ~body) ~(nth bindings 1))\n"
+    "    `(mapcat (fn [~(nth bindings 0)] (for ~(vec (drop 2 bindings)) ~body))\n"
+    "             ~(nth bindings 1))))\n"
     ;
 
 CljcEnv *cljc_new_env(void) {
@@ -2331,6 +2686,27 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "deref",   prim_deref);
     cljc_define_native(e, "reset!",  prim_reset);
     cljc_define_native(e, "swap!",   prim_swap);
+    cljc_define_native(e, "compare", prim_compare);
+    cljc_define_native(e, "sort",    prim_sort);
+    cljc_define_native(e, "vec",     prim_vec);
+    cljc_define_native(e, "name",    prim_name);
+    cljc_define_native(e, "keyword", prim_keyword);
+    cljc_define_native(e, "symbol",  prim_symbol);
+    cljc_define_native(e, "quot",    prim_quot);
+    cljc_define_native(e, "subs",    prim_subs);
+    cljc_define_native(e, "slurp",   prim_slurp);
+    cljc_define_native(e, "spit",    prim_spit);
+    cljc_define_native(e, "pr",      prim_pr);
+    cljc_define_native(e, "prn",     prim_prn);
+    cljc_define_native(e, "print",   prim_print);
+    cljc_define_native(e, "str/upper-case",   prim_upper_case);
+    cljc_define_native(e, "str/lower-case",   prim_lower_case);
+    cljc_define_native(e, "str/trim",         prim_trim);
+    cljc_define_native(e, "str/split",        prim_split);
+    cljc_define_native(e, "str/starts-with?", prim_starts_with);
+    cljc_define_native(e, "str/ends-with?",   prim_ends_with);
+    cljc_define_native(e, "str/includes?",    prim_includes);
+    cljc_define_native(e, "str/blank?",       prim_blank_p);
     cljc_eval_string(e, PRELUDE);
     return e;
 }

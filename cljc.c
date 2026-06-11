@@ -5707,10 +5707,45 @@ static void hist_add(const char *line) {
     if (f) { fprintf(f, "%s\n", line); fclose(f); }
 }
 
-/* Render the buffer with syntax highlighting into out. */
-static void rl_highlight(const char *buf, SBuf *out) {
+/* Index of the bracket matching the one at `target`, or -1. */
+static long rl_match(const char *buf, long target) {
+    long stack[256];
+    int sp = 0;
+    bool in_str = false, in_com = false;
+    for (long i = 0; buf[i]; i++) {
+        char c = buf[i];
+        if (in_com) { if (c == '\n') in_com = false; continue; }
+        if (in_str) {
+            if (c == '\\' && buf[i+1]) i++;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true;
+        else if (c == ';') in_com = true;
+        else if (strchr("([{", c)) { if (sp < 256) stack[sp++] = i; }
+        else if (strchr(")]}", c)) {
+            if (sp > 0) {
+                long open = stack[--sp];
+                if (i == target) return open;
+                if (open == target) return i;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Render the buffer with syntax highlighting into out; the bracket pair
+ * (hl_a, hl_b) renders in reverse video. */
+static void rl_highlight(const char *buf, SBuf *out, long hl_a, long hl_b) {
     const char *p = buf;
     while (*p) {
+        long off = (long)(p - buf);
+        if ((off == hl_a || off == hl_b) && strchr("()[]{}", *p)) {
+            sb_puts(out, "\x1b[7;1m");      /* matched pair: reverse video */
+            sb_putc(out, *p++);
+            sb_puts(out, "\x1b[0m");
+            continue;
+        }
         if (*p == ';') {                                /* comment */
             sb_puts(out, "\x1b[2m");
             while (*p) sb_putc(out, *p++);
@@ -5743,10 +5778,18 @@ static void rl_highlight(const char *buf, SBuf *out) {
 }
 
 static void rl_refresh(const char *prompt, const char *buf, size_t pos) {
+    /* bracket match: closer just typed/behind cursor, or opener at cursor */
+    long hl_a = -1, hl_b = -1;
+    if (pos > 0 && strchr(")]}", buf[pos - 1])) hl_a = (long)pos - 1;
+    else if (strchr("([{", buf[pos] ? buf[pos] : ' ')) hl_a = (long)pos;
+    if (hl_a >= 0) {
+        hl_b = rl_match(buf, hl_a);
+        if (hl_b < 0) hl_a = -1;
+    }
     SBuf out = {0};
     sb_puts(&out, "\r\x1b[K");
     sb_puts(&out, prompt);
-    rl_highlight(buf, &out);
+    rl_highlight(buf, &out, hl_a, hl_b);
     /* cursor: return to col 0, advance past prompt + pos */
     char mv[32];
     snprintf(mv, sizeof mv, "\r\x1b[%zuC", strlen(prompt) + pos);

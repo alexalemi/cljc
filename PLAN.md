@@ -378,7 +378,7 @@ required by conservative stack scanning, same as Boehm GC).
     l/c, ctrl-d exit; persistent history (~/.cljc_history, 512 entries,
     up/down with in-progress-line save); tab completion against LIVE
     root bindings + special forms (longest-common-prefix extension,
-    candidate listing); live syntax highlighting per keypress (strings
+    candidate listing); live syntax highlighting per keypress incl. MATCHING-BRACKET reverse-video (closer behind cursor or opener at cursor, string/comment-aware pairing) (strings
     green, keywords cyan, numbers yellow, delimiters+comments dim);
     paren-balance multiline with ... continuation; *1 *2 *3 result
     history (ipython-style). Errors in the REPL get the full Elm

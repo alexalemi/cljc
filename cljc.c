@@ -5150,13 +5150,17 @@ CljcEnv *cljc_new_env(void) {
         "                      ~fields)\n"
         "              :cljc/type ~kw))))\n"
         "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\\n"
-        "(defmacro reify [& clauses]\\n"
+        "(defmacro reify [& clauses]\n"
         "  (let [t (keyword (str (gensym)))\n"
-        "        impls (filter list? clauses)]\\n"
-        "    `(do ~@(map (fn [[m params & body]]\\n"
-        "                  `(defmethod ~m ~t ~(vec params) ~@body))\\n"
-        "                impls)\\n"
-        "         {:cljc/type ~t})))\\n");
+        "        impls (loop [cs clauses acc (list)]\n"
+        "                (cond (empty? cs) (reverse acc)\n"
+        "                      (list? (first cs))\n"
+        "                      (recur (rest cs)\n"
+        "                             (cons (let [[m params & body] (first cs)]\n"
+        "                                     (concat (list (quote defmethod) m t (vec params)) body))\n"
+        "                                   acc))\n"
+        "                      :else (recur (rest cs) acc)))]\n"
+        "    (concat (list (quote do)) impls (list {:cljc/type t}))))\n");
     /* FFI glue generator — declare C signatures as data, compile, load:
      * (ffi/define [[:double cos [:double]] [:int getpid []]]
      *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */

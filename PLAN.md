@@ -319,7 +319,17 @@ required by conservative stack scanning, same as Boehm GC).
     files transitively, still one arity error from green — PARTIAL
     (next session: chase the 2-arg arity miss in its split path).
     clojure.data: upstream URL 404'd, untried.
-26. **Performance later, maybe**: args-as-array calling convention,
+26. KNOWN BUG to hunt (found 2026-06-11, reify was the reproducer):
+    macros whose expansions are built from LAZY seq compositions
+    (`~@(map ...)` chains, (cons 'do (concat lazy ...))) misbehave in
+    some shapes — symptoms ranged from arity errors to wrong dispatch
+    values; an eagerly-constructed expansion of the same shape works.
+    Suspect: interaction between chunked-lazy realization inside
+    qq_expand splicing / eval-of-lazy-as-form and macro-time
+    environments. reify now builds its expansion eagerly (loop/concat
+    of realized lists) as the workaround. Reproduce from git history:
+    the reify version at commit 0ac1817. Hunt with fresh context.
+27. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

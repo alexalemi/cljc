@@ -5777,11 +5777,13 @@ static void rl_highlight(const char *buf, SBuf *out, long hl_a, long hl_b) {
     }
 }
 
-static void rl_refresh(const char *prompt, const char *buf, size_t pos) {
+static void rl_refresh_opt(const char *prompt, const char *buf, size_t pos,
+                           bool show_match) {
     /* bracket match: closer just typed/behind cursor, or opener at cursor */
     long hl_a = -1, hl_b = -1;
-    if (pos > 0 && strchr(")]}", buf[pos - 1])) hl_a = (long)pos - 1;
-    else if (strchr("([{", buf[pos] ? buf[pos] : ' ')) hl_a = (long)pos;
+    if (show_match && pos > 0 && strchr(")]}", buf[pos - 1])) hl_a = (long)pos - 1;
+    else if (!show_match) { /* accepted line: no lingering highlight */ }
+    else if (show_match && strchr("([{", buf[pos] ? buf[pos] : ' ')) hl_a = (long)pos;
     if (hl_a >= 0) {
         hl_b = rl_match(buf, hl_a);
         if (hl_b < 0) hl_a = -1;
@@ -5797,6 +5799,10 @@ static void rl_refresh(const char *prompt, const char *buf, size_t pos) {
     fwrite(out.data, 1, out.len, stdout);
     fflush(stdout);
     free(out.data);
+}
+
+static void rl_refresh(const char *prompt, const char *buf, size_t pos) {
+    rl_refresh_opt(prompt, buf, pos, true);
 }
 
 /* Tab completion: the symbol fragment before the cursor, against root
@@ -5869,6 +5875,7 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
             return false;
         }
         if (c == '\r' || c == '\n') {
+            rl_refresh_opt(prompt, buf, len, false);  /* clear match highlight */
             tcsetattr(0, TCSAFLUSH, &orig);
             printf("\r\n");
             return true;

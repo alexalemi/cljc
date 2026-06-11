@@ -804,4 +804,12 @@
 (assert= :x (nth tv-gc 64))                         ; transient survives GC
 (assert= 65 (count (persistent! tv-gc)))
 
+; ── int coercion + *args* ──
+(assert= 97 (int \a))
+(assert= 65 (int "A"))
+(assert= 3 (int 3.7))
+(assert= 42 (int 42))
+(assert= [] *args*)                                  ; no args to the test run
+(assert= "abc" (str/join "" (map (fn [c] c) (seq "abc"))))
+
 (println "tests complete")

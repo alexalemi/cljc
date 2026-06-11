@@ -55,6 +55,19 @@ evaluation results come back as `value`, `println` output as `out`
 messages, errors as `err`. Definitions persist across evals. One client
 at a time, loopback only.
 
+## Standalone binaries
+
+```sh
+./cljc bundle.clj myscript.clj mybinary   # one ~130 KB executable, no deps
+```
+
+`bundle.clj` (30 lines of cljc) embeds your script next to the runtime and
+compiles the result — Janet-style deployment. Script arguments arrive as
+`*args*`. This is bundling, not compilation: the script still runs on the
+interpreter inside. (True function-to-C compilation is plausible future
+work — the FFI's generate→cc→dlopen→rebind pipeline is exactly a JIT's
+plumbing — but it isn't built.)
+
 ## Tooling
 
 - **Linting**: ships a `.clj-kondo/config.edn` tuned for the dialect — flat

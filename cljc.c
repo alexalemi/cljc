@@ -3520,6 +3520,17 @@ static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs) {
     return s;
 }
 
+static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *v = argv[0];
+    if (v != NIL && v->tag == CLJC_INT) return v;
+    if (v != NIL && v->tag == CLJC_DOUBLE) return mk_int((int64_t)v->as.d);
+    if (v != NIL && v->tag == CLJC_STRING && v->as.str[0])
+        return mk_int((int64_t)(unsigned char)v->as.str[0]);  /* (int \a) => 97 */
+    cljc_error("int: expected a number or character");
+    return NIL;
+}
+
 static Cljc *prim_hash(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     return mk_int((int64_t)cljc_hash(argv[0]));
@@ -4663,6 +4674,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "type",    prim_type);
     cljc_define_native(e, "sh",        prim_sh);
     cljc_define_native(e, "hash",      prim_hash);
+    cljc_define_native(e, "int",       prim_int);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
     cljc_define_native(e, "cljc/onto",          prim_onto);
@@ -5254,6 +5266,12 @@ int main(int argc, char **argv) {
 
     if (argc > 1 && strcmp(argv[1], "--nrepl") == 0)
         return nrepl_server(env, argc > 2 ? atoi(argv[2]) : 7888);
+    {   /* *args*: arguments after the script path, as a vector */
+        Cljc *as = mk_empty_vec();
+        for (int i = 2; i < argc; i++)
+            as = vec_conj1(as, mk_str(argv[i], strlen(argv[i])));
+        env_define_root(env, intern("*args*", 6), as);
+    }
     if (argc > 1) {
         FILE *f = fopen(argv[1], "r");
         if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }

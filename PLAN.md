@@ -251,7 +251,15 @@ required by conservative stack scanning, same as Boehm GC).
     (~12 interpreted ops/iter) — the remaining lever is a bytecode VM.
     Map transients (assoc!/dissoc! on HAMTs) not yet — same edit-id
     scheme applies when wanted.
-20. **Performance later, maybe**: args-as-array calling convention,
+20. ~~Static bundling~~ ✅ done 2026-06-11 — bundle.clj: a 30-line cljc
+    script that embeds a script's bytes in a generated C file with the
+    runtime and ccs a standalone ~130KB binary (Janet-style deploys).
+    Enablers: *args* (script argv as a vector), int coercion (char
+    byte / double truncation). NOT compilation — noted explicitly.
+    FUTURE TIER (plausible, unbuilt): per-function Clojure->C JIT via
+    the existing FFI pipeline (generate C → cc → dlopen → mutate root
+    binding) — would attack the eval-dispatch wall day5 ended at.
+21. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

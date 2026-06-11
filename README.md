@@ -37,9 +37,11 @@ make test       # 380+ assertions, run twice: normal + GC-stress mode
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`satisfies?` (dispatch on `type` keywords), `defrecord` (tagged maps), `binding`/`with-redefs` |
 | **Errors** | `throw` any value, `try`/`catch`/`finally` (finally runs on every exit path), `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable |
 | **Regex** | self-contained backtracking engine: `\d \w \s`, classes, groups, `(?:…)`, alternation, lazy quantifiers; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (with `$1` refs) `re-split`; guarded against catastrophic backtracking |
+| **Errors** (DX) | stack traces with line numbers — `error: division by zero / at (inner ...) line 3 / at (outer ...) line 4` |
+| **Transducers** | `map-xf`/`filter-xf`/`take-xf`/`mapcat-xf`/…, `transduce`, `eduction` — compose over infinite seqs with `reduced` early-exit |
 | **Library** | ~150 core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops (`str/split str/join str/trim …`), `format`, `slurp`/`spit`, `Math/*`, `sort`/`compare`, `read-string`/`eval` |
 | **Memory** | mark-and-sweep GC over pooled cells, conservative C-stack scanning (interpreter C code needs no root registration), structural sharing throughout |
-| **FFI** | s7/cload-style: `(ffi/define [[:double cos [:double]]] {:headers ["math.h"] :libs "-lm"})` declares C signatures as data, generates glue, compiles a .so at runtime, dlopens it — `cos` becomes a cljc fn. Modules cache by content hash; `ffi/defstruct` generates struct accessors; `libc.clj` ships the libc surface (`(load-file "libc.clj")` → `getpid`, `file-exists?`, `cwd`, `env`…); `json.clj` is a pure-cljc JSON parser/writer. Plus `(sh "cmd")` → `{:exit :out}` |
+| **FFI** | s7/cload-style: `(ffi/define [[:double cos [:double]]] {:headers ["math.h"] :libs "-lm"})` declares C signatures as data, generates glue, compiles a .so at runtime, dlopens it — `cos` becomes a cljc fn. Modules cache by content hash; `ffi/defstruct` generates struct accessors; `libc.clj` ships the libc surface (`(load-file "libc.clj")` → `getpid`, `file-exists?`, `cwd`, `env`…); `json.clj` (JSON), `fs.clj` (babashka.fs-flavored: `list-dir` via real readdir, `exists?`, `create-dir`…), `process.clj` (escaped `sh`/`shell`/`out`), `test.clj` are the battery shelf. Plus `(sh "cmd")` → `{:exit :out}` |
 | **Modes** | REPL, script file, piped stdin, embedded, **nREPL server** |
 
 ## Editor integration (nREPL)

@@ -928,4 +928,44 @@
 (assert= :b (lt-go2 lt-obj))
 (assert= 6 (eval (cons '+ (map inc [0 1 2]))))             ; lazy call form
 
+; ── transducers ──
+(assert= 30 (transduce (comp (map-xf inc) (filter-xf even?)) + 0 (range 10)))
+(assert= [0 1 2] (transduce (take-xf 3) conj (range)))      ; infinite + early exit
+(assert= (list 0 1 4 9) (sequence*2 (comp (map-xf (fn [x] (* x x))) (take-xf 4)) (range)))
+(assert= (list 1 2 3) (eduction (map-xf inc) (take-xf 3) (range)))
+(assert= [1 3] (transduce (keep-xf (fn [x] (when (odd? x) x))) conj [1 2 3 4]))
+(assert= [0 0 1 1] (transduce (comp (mapcat-xf (fn [x] [x x])) (take-xf 4)) conj (range)))
+(assert= [1 2 3] (transduce (distinct-xf) conj [1 1 2 3 2]))
+(assert= [] (conj))                                          ; (conj) => []
+(assert= [3 4] (reduce (fn [a x] (if (> x 4) (reduced a) (conj a x))) [3] [4 5 6]))
+(assert= :inf (reduce (fn [a x] (if (> x 100) (reduced :inf) a)) nil (range)))  ; lazy reduce
+
+; ── cheap tier ──
+(assert= (list 1 2 3 1) (dedupe [1 1 2 2 3 1]))
+(assert= (list (list 1 1) (list 2 4) (list 5)) (partition-by even? [1 1 2 4 5]))
+(assert= [(list 0 1 2) (list 3 4 5)] (split-with (fn [x] (< x 3)) (range 6)))
+(assert= 5 (count (tree-seq list? seq (list 1 (list 2 3)))))
+(assert= (list 1 2) (take 2 (lazy-cat [1] [2 3])))
+(assert= true (not-any? even? [1 3]))
+(assert= true (not-every? even? [2 3]))
+(assert= {:a [1 2]} (edn/read-string "{:a [1 2]}"))
+
+; ── fs.clj / process.clj batteries ──
+(load-file "fs.clj")
+(load-file "process.clj")
+(assert= true (fs/exists? "cljc.c"))
+(assert= true (fs/directory? "vendor"))
+(assert= false (fs/directory? "cljc.c"))
+(assert= true (contains? (set (fs/list-dir "vendor")) "clojure"))
+(assert= "c.clj" (fs/file-name "/a/b/c.clj"))
+(assert= "/a/b" (fs/parent "/a/b/c.clj"))
+(assert= "gz" (fs/extension "x.tar.gz"))
+(fs/create-dir "/tmp/cljc-fs-suite")
+(assert= true (fs/directory? "/tmp/cljc-fs-suite"))
+(fs/delete "/tmp/cljc-fs-suite")
+(assert= false (fs/exists? "/tmp/cljc-fs-suite"))
+(assert= "hello world's" (process/out "echo" "hello world's"))
+(assert= 0 (:exit (process/sh "true")))
+(assert= :threw (try (process/shell "false") (catch Exception e :threw)))
+
 (println "tests complete")

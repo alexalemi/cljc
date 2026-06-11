@@ -166,7 +166,11 @@ static Cljc *NIL, *TRUE, *FALSE;
  * cur_exc when (throw x) raised it, or NULL meaning "use err_msg" for
  * interpreter-raised errors. */
 
-typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; } ErrFrame;
+typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; int esp_save; } ErrFrame;
+#define EVAL_STACK_MAX 4096
+static Cljc *eval_stack[EVAL_STACK_MAX];
+static int eval_sp;
+static char err_trace[1536];
 static ErrFrame *err_top;
 static jmp_buf err_jmp;
 static char err_msg[256];
@@ -180,6 +184,8 @@ static void cljc_raise(void) {
     longjmp(err_jmp, 1);
 }
 
+static void trace_snapshot(void);
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn, format(printf, 1, 2)))
 #endif
@@ -188,6 +194,7 @@ static void cljc_error(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vsnprintf(err_msg, sizeof err_msg, fmt, ap);
     va_end(ap);
+    trace_snapshot();
     cljc_raise();
 }
 
@@ -197,6 +204,7 @@ __attribute__((noreturn))
 static void cljc_throw_value(Cljc *v) {
     cur_exc = v;
     snprintf(err_msg, sizeof err_msg, "uncaught exception");
+    trace_snapshot();
     cljc_raise();
 }
 
@@ -395,6 +403,34 @@ static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
         for (Binding *b = e->bindings; b; b = b->next)
             if (b->name == name) return b->value;
     return NULL;
+}
+
+static void trace_snapshot(void) {
+    err_trace[0] = '\0';
+    size_t off = 0;
+    int shown = 0;
+    for (int i = eval_sp - 1; i >= 0 && shown < 8; i--) {
+        Cljc *f = eval_stack[i];
+        if (f == NULL || f == NIL || f->tag != CLJC_LIST) continue;
+        const char *head = f->as.cons.head->tag == CLJC_SYMBOL
+            ? f->as.cons.head->as.sym : "...";
+        long long line = -1;
+        if (f->meta) {
+            Cljc *lv;
+            if (map_find(f->meta, mk_kw(intern("line", 4)), &lv) && lv->tag == CLJC_INT)
+                line = (long long)lv->as.i;
+        }
+        int n;
+        if (line >= 0)
+            n = snprintf(err_trace + off, sizeof err_trace - off,
+                         "  at (%s ...) line %lld\n", head, line);
+        else
+            n = snprintf(err_trace + off, sizeof err_trace - off,
+                         "  at (%s ...)\n", head);
+        if (n < 0 || off + (size_t)n >= sizeof err_trace - 1) break;
+        off += (size_t)n;
+        shown++;
+    }
 }
 
 static CljcEnv *env_root(CljcEnv *e) {
@@ -1369,9 +1405,12 @@ static void sb_printf(SBuf *sb, const char *fmt, ...) {
 
 /* ───── Reader ───────────────────────────────────────────────────────── */
 
+static int rd_line;                 /* 1-based; 0 = no tracking */
+
 static void skip_ws(const char **p) {
     while (**p) {
-        if (isspace((unsigned char)**p) || **p == ',') { (*p)++; }
+        if (**p == '\n') { if (rd_line) rd_line++; (*p)++; }
+        else if (isspace((unsigned char)**p) || **p == ',') { (*p)++; }
         else if (**p == ';') { while (**p && **p != '\n') (*p)++; }
         else break;
     }
@@ -1434,7 +1473,10 @@ static Cljc *read_string(const char **p) {
                 case '\0': cljc_error("unterminated string");
                 default:   cljc_error("unsupported escape: \\%c", **p);
             }
-        } else sb_putc(&sb, c);
+        } else {
+            if (c == '\n' && rd_line) rd_line++;
+            sb_putc(&sb, c);
+        }
         (*p)++;
     }
     if (**p != '"') cljc_error("unterminated string");
@@ -1446,11 +1488,20 @@ static Cljc *read_string(const char **p) {
 
 static Cljc *read_list(const char **p, char close) {
     (*p)++; /* consume open */
+    int line0 = rd_line;
     Cljc *head = NIL, **tail = &head;
     for (;;) {
         skip_ws(p);
         if (**p == '\0') cljc_error("unterminated list");
-        if (**p == close) { (*p)++; return head; }
+        if (**p == close) {
+            (*p)++;
+            if (line0 && head != NIL) {   /* location for error traces */
+                Cljc *m = mk_map();
+                m = map_assoc(m, mk_kw(intern("line", 4)), mk_int(line0));
+                head->meta = m;
+            }
+            return head;
+        }
         Cljc *item = read_form(p);
         /* unpack #?@ splice markers into this list */
         if (item != NULL && item != NIL && item->tag == CLJC_LIST &&
@@ -1991,7 +2042,23 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
     return form;
 }
 
+static Cljc *eval_inner(CljcEnv *env, Cljc *form);
+
+/* eval wrapper: maintains the form stack that error traces snapshot.
+ * longjmp unwinds restore eval_sp from ErrFrames / top-level handlers. */
 static Cljc *eval(CljcEnv *env, Cljc *form) {
+    if (form == NULL || form == NIL) return NIL;
+    if (form->tag != CLJC_LIST) return eval_inner(env, form);
+    if (eval_sp < EVAL_STACK_MAX) {
+        eval_stack[eval_sp++] = form;
+        Cljc *r = eval_inner(env, form);
+        eval_sp--;
+        return r;
+    }
+    return eval_inner(env, form);
+}
+
+static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL:
@@ -2153,6 +2220,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     ErrFrame frame;
                     frame.prev = err_top;
                     frame.vsp_save = vsp;
+                    frame.esp_save = eval_sp;
                     err_top = &frame;
                     if (setjmp(frame.jb) == 0) {
                         result = eval_body(env, body_v);
@@ -2160,6 +2228,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     } else {
                         err_top = frame.prev;
                         vsp = frame.vsp_save;
+                        eval_sp = frame.esp_save;
                         if (catch_v) {
                             /* Bind the exception value; run the handler under
                              * its own frame so finally still runs if it throws. */
@@ -2170,12 +2239,16 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                             env_define(scope, cc->as.cons.tail->as.cons.head->as.sym, exc);
                             ErrFrame hframe;
                             hframe.prev = err_top;
+                            hframe.vsp_save = vsp;
+                            hframe.esp_save = eval_sp;
                             err_top = &hframe;
                             if (setjmp(hframe.jb) == 0) {
                                 result = eval_body(scope, cc->as.cons.tail->as.cons.tail);
                                 err_top = hframe.prev;
                             } else {
                                 err_top = hframe.prev;
+                                vsp = hframe.vsp_save;
+                                eval_sp = hframe.esp_save;
                                 pending = true;     /* handler threw */
                             }
                         } else {
@@ -2253,6 +2326,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                         ErrFrame frame;
                         frame.prev = err_top;
                         frame.vsp_save = vsp;
+                        frame.esp_save = eval_sp;
                         err_top = &frame;
                         Cljc * volatile result = NIL;
                         volatile bool threw = false;
@@ -2262,6 +2336,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                         } else {
                             err_top = frame.prev;
                             vsp = frame.vsp_save;
+                            eval_sp = frame.esp_save;
                             threw = true;
                         }
                         for (size_t i = 0; i < n; i++) slots[i]->value = saved[i];
@@ -2613,6 +2688,7 @@ static void print_error(void) {
         fputs(err_msg, CERR);
     }
     fputc('\n', CERR);
+    if (err_trace[0]) fputs(err_trace, CERR);
     err_top = NULL;  /* hygiene: no handler frames survive a top-level unwind */
 }
 
@@ -2871,6 +2947,7 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    if (nargs == 0) return mk_empty_vec();   /* (conj) => [] */
     Cljc *r = argv[0];  /* nil works: conj onto nil yields a list */
     for (int i = 1; i < nargs; i++) {
         Cljc *x = argv[i];
@@ -3237,18 +3314,18 @@ static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *f = argv[0];
     Cljc *acc, *seq;
     if (nargs < 3) {
-        seq = to_seq(argv[1]);
+        seq = seq1(argv[1]);               /* lazy cursor: no realization */
         if (seq == NIL) return apply(env, f, NULL, 0);  /* (reduce f []) => (f) */
         acc = seq->as.cons.head;
-        seq = seq->as.cons.tail;
+        seq = seq1(seq->as.cons.tail);
     } else {
         acc = argv[1];
-        seq = to_seq(argv[2]);
+        seq = seq1(argv[2]);
     }
-    for (Cljc *l = seq; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+    for (Cljc *l = seq; l != NIL; l = seq1(l->as.cons.tail)) {
         Cljc *two[2] = {acc, l->as.cons.head};
         acc = apply(env, f, two, 2);
-        /* (reduced x) terminates early */
+        /* (reduced x) terminates early — works on infinite seqs now */
         if (acc != NIL && acc->tag == CLJC_LIST &&
             acc->as.cons.head->tag == CLJC_SYMBOL &&
             acc->as.cons.head->as.sym == intern("**reduced**", 11))
@@ -5144,6 +5221,73 @@ CljcEnv *cljc_new_env(void) {
         "                     (seq b))))\n"
         "  ([a b & more] (concat (concat a b) (apply concat more))))\n"
         "(defn cycle [c] (lazy-seq (concat (seq c) (cycle c))))\n"
+        "(defn map-xf [f]\n"
+        "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc)) ([acc x] (rf acc (f x))))))\n"
+        "(defn filter-xf [pred]\n"
+        "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc))\n"
+        "             ([acc x] (if (pred x) (rf acc x) acc)))))\n"
+        "(defn take-xf [n]\n"
+        "  (fn [rf]\n"
+        "    (let [left (volatile! n)]\n"
+        "      (fn ([] (rf)) ([acc] (rf acc))\n"
+        "        ([acc x]\n"
+        "         (let [k @left]\n"
+        "           (vreset! left (dec k))\n"
+        "           (cond (pos? (dec k)) (rf acc x)\n"
+        "                 (pos? k) (ensure-reduced (rf acc x))\n"
+        "                 :else (ensure-reduced acc))))))))\n"
+        "(defn drop-xf [n]\n"
+        "  (fn [rf]\n"
+        "    (let [left (volatile! n)]\n"
+        "      (fn ([] (rf)) ([acc] (rf acc))\n"
+        "        ([acc x] (if (pos? @left) (do (vswap! left dec) acc) (rf acc x)))))))\n"
+        "(defn keep-xf [f]\n"
+        "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc))\n"
+        "             ([acc x] (let [v (f x)] (if (nil? v) acc (rf acc v)))))))\n"
+        "(defn mapcat-xf [f]\n"
+        "  (fn [rf]\n"
+        "    (fn ([] (rf)) ([acc] (rf acc))\n"
+        "      ([acc x]\n"
+        "       (loop [acc acc s (seq (f x))]\n"
+        "         (if s\n"
+        "           (let [r (rf acc (first s))]\n"
+        "             (if (reduced? r) r (recur r (next s))))\n"
+        "           acc))))))\n"
+        "(defn distinct-xf []\n"
+        "  (fn [rf]\n"
+        "    (let [seen (volatile! #{})]\n"
+        "      (fn ([] (rf)) ([acc] (rf acc))\n"
+        "        ([acc x] (if (contains? @seen x) acc\n"
+        "                     (do (vswap! seen conj x) (rf acc x))))))))\n"
+        "(defn transduce\n"
+        "  ([xform f coll] (transduce xform f (f) coll))\n"
+        "  ([xform f init coll]\n"
+        "   (let [rf (xform f)] (rf (reduce rf init coll)))))\n"
+        "(defn sequence*2 [xform coll] (seq (transduce xform conj [] coll)))\n"
+        "(defn eduction [& args]\n"
+        "  (sequence*2 (apply comp (butlast args)) (last args)))\n"
+        /* cheap tier */
+        "(defn dedupe [coll]\n"
+        "  (lazy-seq (when-let [s (seq coll)]\n"
+        "              (cons (first s)\n"
+        "                    (dedupe (drop-while (fn [x] (= x (first s))) (rest s)))))))\n"
+        "(defn partition-by [f coll]\n"
+        "  (lazy-seq (when-let [s (seq coll)]\n"
+        "              (let [v (f (first s))\n"
+        "                    run (take-while (fn [x] (= v (f x))) s)]\n"
+        "                (cons run (partition-by f (drop (count run) s)))))))\n"
+        "(defn split-with [pred coll]\n"
+        "  [(take-while pred coll) (drop-while pred coll)])\n"
+        "(defn tree-seq [branch? children root]\n"
+        "  (lazy-seq (cons root (when (branch? root)\n"
+        "                         (mapcat (fn [c] (tree-seq branch? children c))\n"
+        "                                 (children root))))))\n"
+        "(defmacro lazy-cat [& colls] `(concat ~@(map (fn [c] `(lazy-seq ~c)) colls)))\n"
+        "(defn run! [f coll] (doseq [x coll] (f x)) nil)\n"
+        "(defn not-any? [pred coll] (not (some pred coll)))\n"
+        "(defn not-every? [pred coll] (not (every? pred coll)))\n"
+        "(defn edn/read-string [s] (read-string s))\n"
+        "(defn pprint [x] (prn x))\n"
         "(defn repeatedly\n"
         "  ([f] (lazy-seq (cons (f) (repeatedly f))))\n"
         "  ([n f] (take n (repeatedly f))))\n"
@@ -5318,7 +5462,7 @@ Cljc *cljc_eval_string(CljcEnv *env, const char *src) {
     char stack_anchor;
     cljc_set_stack_base(&stack_anchor);  /* ensure at least this frame is scanned */
     Cljc * volatile result = NIL;  /* survives the error longjmp */
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; return NIL; }
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; return NIL; }
     while (*src) {
         skip_ws(&src);
         if (!*src) break;
@@ -5357,9 +5501,11 @@ static int run_stream(CljcEnv *env, FILE *f) {
     if (setjmp(err_jmp) != 0) {
         print_error();
         vsp = 0;
+        eval_sp = 0;
         free(src);
         return 1;
     }
+    rd_line = 1;   /* track source lines for error traces */
     const char *p = src;
     while (*p) {
         skip_ws(&p);
@@ -5368,6 +5514,7 @@ static int run_stream(CljcEnv *env, FILE *f) {
         if (!form) break;
         eval(env, form);
     }
+    rd_line = 0;
     free(src);
     return 0;
 }
@@ -5404,7 +5551,7 @@ static int run_repl(CljcEnv *env) {
         }
         if (depth > 0 || in_str) continue;  /* keep reading lines */
 
-        if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; buflen = 0; continue; }
+        if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; buflen = 0; continue; }
         const char *p = buf;
         while (*p) {
             skip_ws(&p);

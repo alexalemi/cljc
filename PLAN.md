@@ -340,7 +340,23 @@ required by conservative stack scanning, same as Boehm GC).
     zip+medley+set+walk coexist, core next intact. KEY INSIGHT: the
     context must live on symbol CELLS, not an eval-time global —
     library code evaluates at call time, long after loading.
-28. **Performance later, maybe**: args-as-array calling convention,
+28. ~~DX + bb-gap batch~~ ✅ done 2026-06-11 — (a) ERROR TRACES:
+    reader stamps {:line} meta on list forms (rd_line counter, strings
+    counted too); eval wrapper maintains a form stack (ErrFrames and
+    top-level handlers restore eval_sp); raise snapshots the top 8
+    frames into err_trace, printed by print_error. (b) TRANSDUCERS:
+    map-xf/filter-xf/take-xf/drop-xf/keep-xf/mapcat-xf/distinct-xf +
+    transduce/sequence*2/eduction; reduce is now a LAZY CURSOR (was
+    realizing via to_seq — reduced over infinite seqs hung); (conj)=>[]
+    0-arity; mapcat-xf preserves the reduced wrapper (inner unwrap =
+    infinite loop, found by suite hang). NAMING DIVERGENCE: xf
+    constructors are separate names (map-xf), not 1-arity overloads of
+    map — our multi-arity map already uses arity 2 for two colls.
+    (c) cheap tier: dedupe partition-by split-with tree-seq lazy-cat
+    run! not-any? not-every? edn/read-string pprint. (d) fs.clj
+    (babashka.fs-flavored; list-dir via FFI opendir/readdir/dirent
+    defstruct!) + process.clj (shell-escaped sh/shell/out).
+29. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

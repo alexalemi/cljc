@@ -1188,4 +1188,22 @@
 (assert= {:a 1} (cjson/read-str "{\"a\": 1}" :key-fn keyword))
 (assert= "{\"a\":1}" (cjson/write-str {:a 1}))
 
+; batch 4: flatten over lazy, top-level #_, mapv multi-coll, aliases, re-matches backtracking
+(assert= '(1 2 3 1 2 3) (flatten (repeat 2 (concat [1 2] [3]))))
+(assert= '(1 2 3 4) (flatten [[1 [2 3]] 4]))
+#_(this form is discarded entirely at top level)
+(assert= [2 4 6] (mapv * (repeat 3 2) [1 2 3]))
+(assert= 12 (*' 3 4))
+(assert= 5 (+' 2 3))
+(assert= true (char? \a))
+(assert= false (char? "ab"))
+(assert= false (char? 7))
+(assert= "xy" (re-matches #"x|xy" "xy"))           ; backtracks into alternation
+(assert= ["steps" "steps"] (re-matches #"(step|steps)" "steps"))
+(assert= ["rotate left 6 steps" "left" "6" "steps"]
+         (re-matches #"rotate (left|right) (\d+) (step|steps)" "rotate left 6 steps"))
+(assert= nil (re-matches #"a+" "aab"))
+(assert= ["aab" "aa" "b"] (re-matches #"(a*)(b)" "aab"))
+(assert= "x" (re-find #"x|xy" "xy"))               ; re-find stays unanchored
+
 (println "tests complete")

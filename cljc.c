@@ -2215,6 +2215,20 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     SYM_CATCH = intern("catch", 5);
                     SYM_FINALLY = intern("finally", 7);
                 }
+                {
+                    /* A top-level #_form (or #?@ branch) arrives as the
+                     * reader's splice marker — evaluate to nil / last. */
+                    static const char *SYM_SPLICE;
+                    if (!SYM_SPLICE) SYM_SPLICE = intern("**reader-splice**", 17);
+                    if (s == SYM_SPLICE) {
+                        /* payload: list of forms to splice (nil for #_) */
+                        Cljc *items = rest != NIL ? rest->as.cons.head : NIL;
+                        Cljc *r = NIL;
+                        for (Cljc *c = items; c && c->tag == CLJC_LIST; c = c->as.cons.tail)
+                            r = eval(env, c->as.cons.head);
+                        return r;
+                    }
+                }
                 if (s == SYM_TRY) {
                     /* (try body... (catch ExClass e handler...) (finally fin...))
                      * The class symbol is accepted and ignored (untyped catch —
@@ -3861,6 +3875,26 @@ static Rx *rx_compile(const char *pattern, Rx **pool_out, int *ngroups_out) {
     return top.h;  /* may be NULL: empty pattern matches everywhere */
 }
 
+/* Compile with an end-of-string anchor INSIDE the program, so a failed
+ * full match backtracks into alternations/quantifiers — (step|steps)
+ * must retry the longer branch when "step" leaves input unconsumed.
+ * Wrapping textually as (...)$ would shift group numbers; instead the
+ * whole parse is treated as one alternation and EOL is chained after. */
+static Rx *rx_compile_full(const char *pattern, Rx **pool_out, int *ngroups_out) {
+    RxC c;
+    c.p = pattern;
+    c.pool = xmalloc(sizeof(Rx) * RX_MAX_NODES);
+    c.npool = 0;
+    c.ngroups = 1;
+    RxChain top = rx_parse_alt(&c);
+    if (*c.p) { free(c.pool); cljc_error("regex: unexpected )"); }
+    Rx *eol = rx_node(&c, RX_EOL);
+    if (top.t) top.t->next = eol;
+    *pool_out = c.pool;
+    *ngroups_out = c.ngroups;
+    return top.h ? top.h : eol;
+}
+
 /* Build the Clojure-style result: string when no groups, else
  * [full g1 g2 ...] with nil for unmatched groups. */
 static Cljc *rx_result(const char *mstart, int ngroups) {
@@ -3908,11 +3942,12 @@ static Cljc *prim_re_matches(CljcEnv *env, Cljc **argv, int nargs) {
     char *pat = as_str(argv[0], "re-matches");
     char *s = as_str(argv[1], "re-matches");
     Rx *pool; int ngroups;
-    Rx *prog = rx_compile(pat, &pool, &ngroups);
+    /* anchored compile: full-match failure backtracks into alternations */
+    Rx *prog = rx_compile_full(pat, &pool, &ngroups);
     rx_str_begin = s;
     rx_reset_caps();
     Cljc *r = NIL;
-    if (rx_m(prog, s) && *rx_match_end == '\0')  /* must consume everything */
+    if (rx_m(prog, s))
         r = rx_result(s, ngroups);
     free(pool);
     return r;
@@ -5199,7 +5234,9 @@ static const char *PRELUDE =
     "  (if (vector? to)\n"
     "    (persistent! (reduce conj! (transient to) (seq from)))\n"
     "    (reduce conj to from)))\n"
-    "(defn mapv [f coll] (apply vector (map f coll)))\n"
+    "(defn mapv\n"
+    "  ([f coll] (apply vector (map f coll)))\n"
+    "  ([f c1 c2] (apply vector (map f c1 c2))))\n"
     "(defn filterv [f coll] (apply vector (filter f coll)))\n"
     "(defn repeat [n x] (map (constantly x) (range n)))\n"
     "(defn nthrest [coll n] (drop n coll))\n"
@@ -5409,6 +5446,9 @@ static const char *PRELUDE =
     "     v#))\n"
     "(def == =)\n"                       /* = already numeric cross-type */
     "(defn distinct? [& xs] (= (count xs) (count (set xs))))\n"
+    /* arbitrary-precision variants: int64 here (overflow wraps, v0) */
+    "(def *' *) (def +' +) (def -' -) (def inc' inc) (def dec' dec)\n"
+    "(defn char? [x] (and (string? x) (= 1 (count x))))\n"
     /* deftype, tolerated: defines a Name. constructor returning a plain map
      * of fields; interface method bodies are ignored. Enough for files that
      * define a type they rarely use to still load. */
@@ -5539,8 +5579,8 @@ static const char *PRELUDE =
     "(defn not-empty [coll] (if (empty? coll) nil coll))\n"
     "(defn doall [x] x)\n"
     "(defn dorun [x] nil)\n"
-    "(defn flatten [coll]\n"
-    "  (mapcat (fn [x] (if (or (list? x) (vector? x)) (flatten x) (list x))) coll))\n"
+    "(defn flatten [coll]\n"  /* sequential?: lazy sub-seqs flatten too */
+    "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
     "(defmacro assert\n"
     "  ([x] `(when-not ~x\n"

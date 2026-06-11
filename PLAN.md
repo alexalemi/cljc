@@ -381,7 +381,7 @@ required by conservative stack scanning, same as Boehm GC).
     candidate listing); live syntax highlighting per keypress incl. MATCHING-BRACKET reverse-video (closer behind cursor or opener at cursor, string/comment-aware pairing) (strings
     green, keywords cyan, numbers yellow, delimiters+comments dim);
     paren-balance multiline with ... continuation; *1 *2 *3 result
-    history (ipython-style). Errors in the REPL get the full Elm
+    history (ipython-style); !cmd shell mode (output printed, {:exit :out} captured into *1, red exit-code notice on failure). Errors in the REPL get the full Elm
     treatment minus source excerpts. Also column-precise carets landed
     this session (form {:line :col} meta; token search anchored at
     col; fallback caret at the form's paren).

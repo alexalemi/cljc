@@ -5967,7 +5967,7 @@ static int run_repl(CljcEnv *env) {
         form[0] = 0;
         if (!rl_edit("cljc> ", line, sizeof line)) break;
         snprintf(form, sizeof form, "%s", line);
-        while (!balanced(form)) {
+        while (form[0] != '!' && !balanced(form)) {
             if (!rl_edit("  ... ", line, sizeof line)) break;
             size_t fl = strlen(form);
             snprintf(form + fl, sizeof form - fl, "\n%s", line);
@@ -5978,6 +5978,21 @@ static int run_repl(CljcEnv *env) {
             print_error();
             vsp = 0;
             eval_sp = 0;
+            continue;
+        }
+        if (form[0] == '!') {                  /* shell mode: !ls -la */
+            const char *cmd = form + 1;
+            while (*cmd == ' ') cmd++;
+            if (!*cmd) continue;
+            Cljc *carg[1] = {mk_str(cmd, strlen(cmd))};
+            Cljc *r = prim_sh(env, carg, 1);   /* {:exit n :out s} */
+            Cljc *out, *exitc;
+            if (map_find(r, mk_kw(intern("out", 3)), &out) && out->tag == CLJC_STRING)
+                fputs(out->as.str, stdout);
+            if (map_find(r, mk_kw(intern("exit", 4)), &exitc) &&
+                exitc->tag == CLJC_INT && exitc->as.i != 0)
+                printf("\x1b[31m[exit %lld]\x1b[0m\n", (long long)exitc->as.i);
+            env_define_root(env_root(env), intern("*1", 2), r);  /* capturable */
             continue;
         }
         const char *p = form;

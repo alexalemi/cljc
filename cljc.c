@@ -2735,19 +2735,30 @@ static const char *suggest(const char *token) {
     return best;
 }
 
+static bool term_utf8(void) {
+    const char *l = getenv("LC_ALL");
+    if (!l || !*l) l = getenv("LC_CTYPE");
+    if (!l || !*l) l = getenv("LANG");
+    return l && (strstr(l, "UTF-8") || strstr(l, "utf8") || strstr(l, "UTF8"));
+}
+
 /* Top-level (uncaught) error report, Elm-style: header, message, the
  * offending source line with a caret, a suggestion, then the trace. */
 static void print_error(void) {
     bool color = isatty(fileno(stderr));
+    bool u8 = term_utf8();
+    const char *DASH  = u8 ? "\u2500" : "-";   /* ─ */
+    const char *GUT   = u8 ? "\u2502" : "|";   /* │ */
+    const char *CARET = u8 ? "\u2594" : "^";   /* ▔ */
     const char *RED = color ? "\033[31;1m" : "";
     const char *CYN = color ? "\033[36m" : "";
     const char *YEL = color ? "\033[33m" : "";
     const char *DIM = color ? "\033[2m" : "";
     const char *OFF = color ? "\033[0m" : "";
 
-    fprintf(CERR, "%s-- ERROR ", RED);
+    fprintf(CERR, "%s%s%s ERROR ", RED, DASH, DASH);
     int pad = 58 - (int)(err_src_name ? strlen(err_src_name) : 0);
-    for (int i = 0; i < pad; i++) fputc('-', CERR);
+    for (int i = 0; i < pad; i++) fputs(DASH, CERR);
     fprintf(CERR, " %s%s\n\n", err_src_name ? err_src_name : "", OFF);
 
     if (cur_exc) {
@@ -2771,7 +2782,7 @@ static void print_error(void) {
         if (p) {
             const char *e = strchr(p, '\n');
             size_t len = e ? (size_t)(e - p) : strlen(p);
-            fprintf(CERR, "\n%s%4lld |%s ", CYN, err_line, OFF);
+            fprintf(CERR, "\n%s%4lld %s%s ", CYN, err_line, GUT, OFF);
             fwrite(p, 1, len, CERR);
             fputc('\n', CERR);
             const char *hit = NULL;
@@ -2789,11 +2800,11 @@ static void print_error(void) {
                 hitlen = 1;
             }
             if (hit) {
-                fprintf(CERR, "     %s| ", CYN);
+                fprintf(CERR, "     %s%s ", CYN, GUT);
                 for (const char *c = p; c < hit; c++)
                     fputc(*c == '\t' ? '\t' : ' ', CERR);
                 fprintf(CERR, "%s", RED);
-                for (size_t i = 0; i < hitlen; i++) fputc('^', CERR);
+                for (size_t i = 0; i < hitlen; i++) fputs(CARET, CERR);
                 fprintf(CERR, "%s\n", OFF);
             }
         }

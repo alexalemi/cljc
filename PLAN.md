@@ -384,7 +384,10 @@ required by conservative stack scanning, same as Boehm GC).
     history (ipython-style); !cmd shell mode ({:exit :out} into *1+Out, red exit notice); MISMATCH detection: pairs type-check — ( closed by ] renders both in red reverse, orphan closers (no opener) red alone. ABSOLUTE history: prompt is cljc[N]>, results print as dim [N], and *results* is a literal vector so (*results* 3) retrieves and (count *results*)/(last *results*) just work — shell results numbered too. Errors in the REPL get the full Elm
     treatment minus source excerpts. Also column-precise carets landed
     this session (form {:line :col} meta; token search anchored at
-    col; fallback caret at the form's paren).
+    col; fallback caret at the form's paren). UNICODE glyphs: when the
+    locale is UTF-8 (term_utf8 checks LC_ALL→LC_CTYPE→LANG), errors
+    render with ─ header rule, │ gutter, ▔ underline; plain -, |, ^
+    otherwise — pure cosmetics, zero behavior change.
 32. NEXT: CLERK CLONE — literate
     notebooks from .clj files; PRIOR ART to study first:
     ~/build/s7 (their s7 version), ~/projects/clerk-janet,

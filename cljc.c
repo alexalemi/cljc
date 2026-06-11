@@ -2075,6 +2075,19 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
             s = set_conj(s, qq_expand(env, e->as.cons.head));
         return s;
     }
+    /* Syntax-quote qualification (Clojure-faithful-ish): a bare template
+     * symbol whose home ns defines it expands to the qualified symbol, so
+     * `(move ~a) inside (ns p21 ...) yields p21/move — matching the case
+     * constants real Clojure code writes against syntax-quoted forms. */
+    if (form->tag == CLJC_SYMBOL && form->as.symc.home_ns &&
+        !strchr(form->as.symc.name, '/')) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s/%s",
+                 form->as.symc.home_ns, form->as.symc.name);
+        const char *qual = intern(buf, strlen(buf));
+        for (Binding *b = env_root(env)->bindings; b; b = b->next)
+            if (b->name == qual) return mk_sym(qual);
+    }
     /* Atoms are template literals. */
     return form;
 }
@@ -2354,6 +2367,17 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                     }
                                 }
                             }
+                        }
+                        /* Enter the namespace: subsequent reads stamp
+                         * home_ns and defs land under name/ — the same
+                         * model require-loaded libraries already use.
+                         * (run_stream alternates read/eval, so the rest
+                         * of the file is read with the ns active.) */
+                        {
+                            Cljc *nsn = rest != NIL && rest->tag == CLJC_LIST
+                                        ? rest->as.cons.head : NIL;
+                            if (nsn != NIL && nsn->tag == CLJC_SYMBOL)
+                                cur_reader_ns = nsn->as.symc.name;
                         }
                         return NIL;
                     }
@@ -3604,14 +3628,15 @@ static Cljc *prim_seq_p(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* Tiny backtracking matcher. Supported: literals . ^ $ [abc] [a-z] [^...]
  * \d \D \w \W \s \S \n \t \r, ( ) capture groups, (?: ) non-capturing,
- * | alternation, * + ? quantifiers with lazy variants (*? +? ??).
- * Not supported: {n,m}, backreferences, lookaround. Patterns are plain
+ * (?=X) (?!X) lookahead, | alternation, * + ? quantifiers with lazy
+ * variants (*? +? ??).
+ * Not supported: {n,m}, backreferences, lookbehind. Patterns are plain
  * strings; the #"..." reader literal passes backslashes through raw.
  * Parse-time desugaring: X+ => X X* (atom re-parsed), X? => ALT(X, empty);
  * only star is a real loop, guarded against empty-match cycles. */
 
 enum { RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL, RX_STAR, RX_LOOP,
-       RX_ALT, RX_JOIN, RX_GS, RX_GE };
+       RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA };
 
 typedef struct Rx Rx;
 struct Rx {
@@ -3673,6 +3698,19 @@ static RxChain rx_parse_atom(RxC *c) {
     if (c0 == '(') {
         c->p++;
         bool capture = true;
+        if (c->p[0] == '?' && (c->p[1] == '=' || c->p[1] == '!')) {
+            /* lookahead (?=X) / (?!X): zero-width assertion */
+            bool neg = c->p[1] == '!';
+            c->p += 2;
+            RxChain inner = rx_parse_alt(c);
+            if (*c->p != ')') cljc_error("regex: missing )");
+            c->p++;
+            Rx *la = rx_node(c, RX_LA);
+            la->neg = neg;
+            la->child = inner.h;   /* tail's next stays NULL: bare sub-match */
+            ch.h = ch.t = la;
+            return ch;
+        }
         if (c->p[0] == '?' && c->p[1] == ':') { capture = false; c->p += 2; }
         int idx = 0;
         if (capture) {
@@ -3842,6 +3880,14 @@ static bool rx_m(Rx *r, const char *s) {
             if (rx_m(r->next, s)) return true;
             rx_cap_e[r->group] = save;
             return false;
+        }
+        case RX_LA: {
+            /* zero-width lookahead: sub-match here, consume nothing */
+            const char *save_end = rx_match_end;
+            bool m = rx_m(r->child, s);
+            rx_match_end = save_end;
+            if (m == r->neg) return false;
+            return rx_m(r->next, s);
         }
         case RX_ALT:  return rx_m(r->child, s) || rx_m(r->alt, s);
         case RX_JOIN: return rx_m(r->owner->next, s);
@@ -6096,7 +6142,12 @@ CljcEnv *cljc_new_env(void) {
         "(defn map\n"
         "  ([f] (map-xf f))\n"
         "  ([f c] (cljc/map-impl f c))\n"
-        "  ([f c1 c2] (cljc/map-impl f c1 c2)))\n"
+        "  ([f c1 c2] (cljc/map-impl f c1 c2))\n"
+        "  ([f c1 c2 & more]\n"        /* n-coll: (apply map list rows) transpose */
+        "   (let [cs (cons c1 (cons c2 more))]\n"
+        "     (lazy-seq (when (every? seq cs)\n"
+        "                 (cons (apply f (map first cs))\n"
+        "                       (apply map f (map rest cs))))))))\n"
         "(def cljc/filter-impl filter)\n"
         "(defn filter ([pred] (filter-xf pred)) ([pred c] (cljc/filter-impl pred c)))\n"
         "(defn remove ([pred] (remove-xf pred)) ([pred c] (cljc/filter-impl (complement pred) c)))\n"

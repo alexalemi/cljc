@@ -645,6 +645,9 @@
 (assert= 6 (#(apply + %&) 1 2 3))
 (assert= (list 2 3) (filter #(> % 1) [0 1 2 3]))
 (assert= nil (ns my.ns (:require [clojure.string :as str])))
+; (ns ...) now ENTERS the namespace (defs land under my.ns/) — leave it
+; again so the rest of this suite stays in the flat globals
+(cljc/in-ns* nil)
 (assert= nil (require '[clojure.string :as str]))
 (defn docd "has a docstring" [x] (* x 2))
 (assert= 42 (docd 21))
@@ -1227,5 +1230,24 @@
 (assert= -1 (Character/digit \z 10))
 (assert= 2.0 (Math/sqrt 4))
 (assert= :threw (try (throw (AssertionError. "boom")) (catch Exception e :threw)))
+
+; variadic map (transpose idiom) + regex lookahead
+(assert= '((1 3 5) (2 4 6)) (apply map list [[1 2] [3 4] [5 6]]))
+(assert= '(9 18) (apply map - [[10 20] [1 2]]))
+(assert= '(111 222) (map + [1 2] [10 20] [100 200]))
+(assert= '("o" "2" "tw") (re-seq #"\d|o(?=ne)|tw(?=o)" "one2two"))
+(assert= "a" (re-find #"a(?!b)" "ab ac"))
+(assert= "foobar" (re-matches #"foo(?=bar)bar" "foobar"))
+(assert= nil (re-find #"a(?!b)" "ab"))
+
+; (ns x) enters x: defs land under x/, syntax-quote qualifies defined syms
+(ns cljc.nstest)
+(defn nstest-fn [v] v)
+(def nstest-form `(nstest-fn 1))
+(assert= 'cljc.nstest/nstest-fn (first nstest-form))
+(assert= :ok (case (first nstest-form) cljc.nstest/nstest-fn :ok :nope))
+(assert= 5 (nstest-fn 5))                  ; home-ns resolution
+(assert= 6 (+ 1 5))                        ; core fns still reachable
+(cljc/in-ns* nil)
 
 (println "tests complete")

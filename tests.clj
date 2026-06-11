@@ -1143,4 +1143,23 @@
 (assert= ["a" "b"] (string/split "a b" #" "))
 (assert= "HI" (clojure.string/upper-case "hi"))
 
+; regex-aware str/split (regex literals carry :regex meta; strings stay literal)
+(assert= ["a" "b"] (str/split "a\n\nb" #"\n\n"))
+(assert= ["x" "y" "z"] (str/split "x1y22z" #"\d+"))
+(assert= ["10" "5" "5"] (str/split "10R5L5" #"R|L"))
+(assert= ["a" "b"] (str/split "a.b" "."))          ; literal: dot not regex
+(assert= ["a" "b"] (str/split "a b" (re-pattern " ")))
+(assert= {:regex true} (meta #"x+"))
+(assert= "tagged" (with-meta "tagged" {:m 1}))     ; strings can carry meta now
+(assert= {:m 1} (meta (with-meta "s" {:m 1})))
+
+; def with meta on the name; ## literals; assert with message
+(def ^:dynamic cljc-dyn-probe 7)
+(assert= 7 cljc-dyn-probe)
+(assert= true (< 1e300 ##Inf))
+(assert= true (> -1e300 ##-Inf))
+(assert= false (= ##NaN ##NaN))
+(assert= :threw (try (assert false "context here") (catch Exception e :threw)))
+(assert= nil (assert true "fine"))
+
 (println "tests complete")

@@ -1601,6 +1601,13 @@ static Cljc *read_form(const char **p) {
         return mk_cons(mk_sym(intern("**reader-splice**", 17)),
                        mk_cons(NIL, NIL));   /* splices zero elements */
     }
+    if (c == '#' && (*p)[1] == '#') {  /* ##Inf ##-Inf ##NaN */
+        *p += 2;
+        if (!strncmp(*p, "Inf", 3))  { *p += 3; return mk_double(INFINITY); }
+        if (!strncmp(*p, "-Inf", 4)) { *p += 4; return mk_double(-INFINITY); }
+        if (!strncmp(*p, "NaN", 3))  { *p += 3; return mk_double(NAN); }
+        cljc_error("unknown ## literal (expected ##Inf, ##-Inf, ##NaN)");
+    }
     if (c == '#' && (*p)[1] == '?') {
         /* reader conditional: keep the :cljc or :default branch.
          * #?@(...) splices the branch into the enclosing list — returned
@@ -1695,6 +1702,9 @@ static Cljc *read_form(const char **p) {
         (*p)++;
         Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
         free(sb.data);
+        /* Tag as a regex: str/split etc. dispatch on this meta. The map is
+         * rebuilt per literal (cheap; a static would dodge the GC roots). */
+        r->meta = map_assoc(mk_map(), mk_kw(intern("regex", 5)), TRUE);
         return r;
     }
     if (c == '#' && (*p)[1] == '{') {
@@ -2429,7 +2439,15 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 if (s == SYM_DO) return eval_body(env, rest);
                 if (s == SYM_DEF) {
                     need_args(rest, 2, "def");
-                    const char *name = sym_name(rest->as.cons.head, "def");
+                    Cljc *namef = rest->as.cons.head;
+                    /* (def ^:dynamic x v): the reader wrapped the name as
+                     * (with-meta x m) — unwrap; def meta is not retained. */
+                    if (namef != NIL && namef->tag == CLJC_LIST &&
+                        namef->as.cons.head->tag == CLJC_SYMBOL &&
+                        !strcmp(namef->as.cons.head->as.sym, "with-meta") &&
+                        namef->as.cons.tail != NIL)
+                        namef = namef->as.cons.tail->as.cons.head;
+                    const char *name = sym_name(namef, "def");
                     Cljc *val = eval(env, rest->as.cons.tail->as.cons.head);
                     env_define_root(env_root(env), name, val);  /* def is always global */
                     return val;
@@ -3992,7 +4010,7 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
     if (v == NIL) cljc_error("with-meta: nil cannot carry metadata");
     switch (v->tag) {
         case CLJC_LIST: case CLJC_VECTOR: case CLJC_MAP: case CLJC_SET:
-        case CLJC_FN: case CLJC_SYMBOL: break;
+        case CLJC_FN: case CLJC_SYMBOL: case CLJC_STRING: break;
         default: cljc_error("with-meta: this type cannot carry metadata");
     }
     Cljc *c = alloc(v->tag);
@@ -4000,6 +4018,11 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
     if (v->tag == CLJC_VECTOR) {        /* tails are exclusively owned */
         c->as.vec.tail = tail_alloc(v->as.vec.taillen);
         memcpy(c->as.vec.tail, v->as.vec.tail, sizeof(Cljc *) * v->as.vec.taillen);
+    }
+    if (v->tag == CLJC_STRING) {        /* string buffers are owned: copy */
+        size_t n = strlen(v->as.str);
+        c->as.str = xmalloc(n + 1);
+        memcpy(c->as.str, v->as.str, n + 1);
     }
     c->meta = m == NIL ? NULL : m;
     return c;
@@ -4373,8 +4396,13 @@ static Cljc *prim_trim(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(s, n);
 }
 
+static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs);
+
 static Cljc *prim_split(CljcEnv *env, Cljc **argv, int nargs) {
-    /* (str/split s sep) — sep is a plain string, not a regex (divergence). */
+    /* (str/split s sep) — regex when sep is a #"..." literal or came
+     * through re-pattern (meta-tagged); plain strings split literally. */
+    if (argv[1] != NIL && argv[1]->tag == CLJC_STRING && argv[1]->meta)
+        return prim_re_split(env, argv, nargs);
     (void)env;
     char *s = as_str(argv[0], "split");
     char *sep = as_str(argv[1], "split");
@@ -4973,7 +5001,16 @@ static Cljc *prim_parse_double(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_read_string(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     const char *p = as_str(argv[0], "read-string");
+    /* Nested reads (load-file, require shims) must not disturb the host
+     * file's line tracking — else later top-level forms inherit bogus
+     * line meta and error carets point at the wrong line. */
+    int save_line = rd_line;
+    const char *save_start = rd_line_start;
+    rd_line = 1;
+    rd_line_start = p;
     Cljc *form = read_form(&p);
+    rd_line = save_line;
+    rd_line_start = save_start;
     return form ? form : NIL;
 }
 
@@ -5324,7 +5361,8 @@ static const char *PRELUDE =
     "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
     "(defn sequential? [x] (or (list? x) (vector? x) (seq? x)))\n"
     "(def class type)\n"
-    "(defn re-pattern [s] s)\n"           /* regexes are plain strings */
+    /* regexes are strings; the :regex meta makes str/split treat them so */
+    "(defn re-pattern [s] (with-meta s {:regex true}))\n"
     "(defn boolean? [x] (or (true? x) (false? x)))\n"
     "(defn nat-int? [x] (and (int? x) (>= x 0)))\n"
     "(defn isa? [c p] (= c p))\n"          /* no hierarchies (v0) */
@@ -5474,9 +5512,11 @@ static const char *PRELUDE =
     "(defn flatten [coll]\n"
     "  (mapcat (fn [x] (if (or (list? x) (vector? x)) (flatten x) (list x))) coll))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
-    "(defmacro assert [x]\n"
-    "  `(when-not ~x\n"
-    "     (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"
+    "(defmacro assert\n"
+    "  ([x] `(when-not ~x\n"
+    "          (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"
+    "  ([x msg] `(when-not ~x\n"
+    "              (throw (ex-info (str \"Assert failed: \" ~msg \"\\n\" (pr-str '~x)) {})))))\n"
     ;
 
 CljcEnv *cljc_new_env(void) {

@@ -211,6 +211,12 @@ required by conservative stack scanning, same as Boehm GC).
     libc.clj ships in-repo (load-file): process/env/fs/time surface +
     friendly wrappers (file-exists? cwd env mkdir-p now-epoch).
     Generator emits _GNU_SOURCE (get_current_dir_name needs it).
+    Structs: (ffi/defstruct timeval [[:int tv_sec] ...] {:headers [...]})
+    generates make-NAME (calloc), NAME-field getters, set-NAME-field!
+    setters — struct must be declared by the headers. json.clj battery:
+    pure-cljc parser/writer (parse-long/double, :keywords? opt, escape
+    round-trip; \uXXXX => "?" placeholder). Reader gained \b \f \0
+    string escapes (json.clj needed them — dogfooding works).
     Also: sh native (popen, {:exit :out}). Requires cc at runtime
     (the s7 trade). Future: :pointer type, struct support, a libc.clj
     batteries module, caching compiled modules by signature hash.

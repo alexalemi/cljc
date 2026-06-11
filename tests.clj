@@ -757,4 +757,25 @@
 (load-file "libc.clj")                              ; reload: cached, idempotent
 (assert= true (> (getpid) 0))
 
+; ── ffi/defstruct + json.clj ──
+(ffi/defstruct timeval [[:int tv_sec] [:int tv_usec]] {:headers ["sys/time.h"]})
+(ffi/define [[:int gettimeofday [:pointer :pointer]] [:void free [:pointer]]]
+            {:headers ["sys/time.h" "stdlib.h"]})
+(def tv (make-timeval))
+(gettimeofday tv 0)
+(assert= true (> (timeval-tv_sec tv) 1700000000))
+(set-timeval-tv_sec! tv 42)
+(assert= 42 (timeval-tv_sec tv))
+(free tv)
+(load-file "json.clj")
+(assert= {"a" [1 2.5 true nil]} (json/parse "{\"a\": [1, 2.5, true, null]}"))
+(assert= {:a {:b [1 -3]}} (json/parse "{\"a\": {\"b\": [1, -3]}}" {:keywords? true}))
+(assert= [1 2 3] (json/parse "[1,2,3]"))
+(assert= "x\ny" (json/parse "\"x\\ny\""))
+(assert= "{\"k\":[1,null,true]}" (json/write {"k" [1 nil true]}))
+(assert= {:r [1 {:d true}]} (json/parse (json/write {:r [1 {:d true}]}) {:keywords? true}))
+(assert= "\"a\\\"b\"" (json/write "a\"b"))
+(assert= :bad (try (json/parse "{bad}") (catch Exception e :bad)))
+(assert= "a\bb" (str "a" "\b" "b"))                  ; reader \b \f escapes
+
 (println "tests complete")

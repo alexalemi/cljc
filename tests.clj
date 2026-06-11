@@ -583,4 +583,16 @@
 (assert= [1 2 3] (doall [1 2 3]))
 (assert= nil (dorun [1 2 3]))
 
+; ── quality-pass regressions (regex/format/splice bugs) ──
+(assert= (list "" "" "") (re-seq #"x*" "ab"))        ; empty matches at 0,1,2
+(assert= (list "a" "a") (re-seq #"a" "aba"))
+(assert= "-a-b-" (re-replace "ab" #"x*" "-"))        ; trailing empty match
+(assert= :guarded (try (re-find #"(a+)+b" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaac")
+                       (catch Exception e :guarded)))  ; catastrophic backtracking
+(assert= 1001 (count (format "%s!" (str/join (repeat 100 "0123456789")))))
+(assert= #{3 9} (let [x 3] `#{~x 9}))                ; unquote in set templates
+(assert= 6 (apply + #{1 2 3}))                       ; apply splices sets
+(assert= 0 (apply + {}))                             ; and (empty) maps
+(assert= 14 (apply + 1 2 [4 7]))
+
 (println "tests complete")

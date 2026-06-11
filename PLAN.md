@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~4,090 lines, zero warnings, 372 assertions in `tests.clj`, ASan/UBSan clean
+~4,100 lines, zero warnings, 381 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -94,6 +94,12 @@ required by conservative stack scanning, same as Boehm GC).
    #"..." reader literal = raw string (only \" escape). re-find/
    re-matches/re-seq; patterns are plain strings (no regex value type).
    NOT supported: {n,m}, backrefs, lookaround (braces are literals).
+   Quality pass 2026-06-10: re-seq empty-match iteration fixed (was OOB
+   past NUL), re-replace substitutes the trailing empty match, a 2M-step
+   budget guards catastrophic backtracking ((a+)+b errors instead of
+   hanging), format %s no longer truncates at 512 bytes, quasiquote
+   descends into set templates, apply splices any seqable via to_seq.
+   Note: re-split does not split on empty-width matches (#"" or #"x*").
 8. ~~Scripting surface~~ ✅ done 2026-06-10 — format (printf subset:
    %s %d %x %o %f %e %g with flags/width/precision), str/replace
    (LITERAL match — regex variants are explicitly named), re-replace

@@ -1498,6 +1498,12 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
         }
         return m;
     }
+    if (form->tag == CLJC_SET) {
+        Cljc *s = mk_set();
+        for (Cljc *e = set_element_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+            s = set_conj(s, qq_expand(env, e->as.cons.head));
+        return s;
+    }
     /* Atoms are template literals. */
     return form;
 }
@@ -2191,16 +2197,8 @@ static Cljc *prim_apply(CljcEnv *env, Cljc *args) {
     Cljc *out = NIL, **t = &out;
     for (Cljc *a = args->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
         if (a->as.cons.tail == NIL) {
-            /* Splice the final collection. */
-            Cljc *last = a->as.cons.head;
-            if (last == NIL) break;
-            if (last->tag == CLJC_LIST) { *t = last; }
-            else if (last->tag == CLJC_VECTOR) {
-                for (size_t i = 0; i < vec_len(last); i++) {
-                    *t = mk_cons(vec_nth(last, i), NIL);
-                    t = &(*t)->as.cons.tail;
-                }
-            } else cljc_error("apply: last argument must be a collection");
+            /* Splice the final collection — any seqable. */
+            *t = to_seq(a->as.cons.head);
             break;
         }
         *t = mk_cons(a->as.cons.head, NIL);
@@ -2732,7 +2730,6 @@ static RxChain rx_parse_cat(RxC *c) {
     while (*c->p && *c->p != '|' && *c->p != ')') {
         const char *atom_src = c->p;
         RxChain atom = rx_parse_atom(c);
-        const char *after_atom = c->p;
         char q = *c->p;
         RxChain unit = atom;
         if (q == '*' || q == '+' || q == '?') {
@@ -2748,7 +2745,6 @@ static RxChain rx_parse_cat(RxC *c) {
                 c->p = atom_src;
                 RxChain atom2 = rx_parse_atom(c);
                 c->ngroups = save_groups;  /* copies share group numbers */
-                (void)after_atom;
                 c->p = save;
                 RxChain star = rx_star(c, atom2, lazy);
                 atom.t->next = star.h;
@@ -2791,8 +2787,12 @@ static RxChain rx_parse_alt(RxC *c) {
 static const char *rx_str_begin;
 static const char *rx_match_end;
 static const char *rx_cap_s[RX_MAX_GROUPS], *rx_cap_e[RX_MAX_GROUPS];
+static long rx_steps;          /* backtracking budget per match attempt */
+#define RX_MAX_STEPS 2000000L
 
 static bool rx_m(Rx *r, const char *s) {
+    if (++rx_steps > RX_MAX_STEPS)
+        cljc_error("regex: too much backtracking");
     if (!r) { rx_match_end = s; return true; }
     switch (r->type) {
         case RX_CHAR:  return *s == r->ch && rx_m(r->next, s + 1);
@@ -2865,6 +2865,7 @@ static Cljc *rx_result(const char *mstart, int ngroups) {
 static void rx_reset_caps(void) {
     memset(rx_cap_s, 0, sizeof rx_cap_s);
     memset(rx_cap_e, 0, sizeof rx_cap_e);
+    rx_steps = 0;
 }
 
 static Cljc *prim_re_find(CljcEnv *env, Cljc *args) {
@@ -2912,9 +2913,10 @@ static Cljc *prim_re_seq(CljcEnv *env, Cljc *args) {
     Cljc *out = NIL, **t = &out;
     const char *pos = s;
     for (;;) {
+        /* Find the next match at or after pos. */
         const char *start = pos;
         bool found = false;
-        for (; ; start++) {
+        for (;; start++) {
             rx_reset_caps();
             if (rx_m(prog, start)) { found = true; break; }
             if (!*start) break;
@@ -2922,10 +2924,12 @@ static Cljc *prim_re_seq(CljcEnv *env, Cljc *args) {
         if (!found) break;
         *t = mk_cons(rx_result(start, ngroups), NIL);
         t = &(*t)->as.cons.tail;
-        pos = rx_match_end > start ? rx_match_end : start + 1;  /* advance past empty */
-        if (start + (rx_match_end - start) > s + strlen(s)) break;
-        if (!*pos && rx_match_end == start) break;
-        if (*start == '\0') break;
+        if (rx_match_end > start) {
+            pos = rx_match_end;       /* continue after the match */
+        } else {
+            if (!*start) break;       /* empty match at end: done */
+            pos = start + 1;          /* empty match: advance one char */
+        }
     }
     free(pool);
     return out;
@@ -3330,10 +3334,14 @@ static Cljc *prim_format(CljcEnv *env, Cljc *args) {
             case 's': {
                 SBuf t = {0};
                 print_to(&t, v, false);
-                snprintf(cfmt, sizeof cfmt, "%%%ss", spec);
-                snprintf(tmp, sizeof tmp, cfmt, t.data ? t.data : "");
+                if (si == 0) {  /* no width/precision: append directly, any length */
+                    if (t.data) sb_puts(&out, t.data);
+                } else {
+                    snprintf(cfmt, sizeof cfmt, "%%%ss", spec);
+                    snprintf(tmp, sizeof tmp, cfmt, t.data ? t.data : "");
+                    sb_puts(&out, tmp);
+                }
                 free(t.data);
-                sb_puts(&out, tmp);
                 break;
             }
             case 'd': case 'x': case 'X': case 'o':
@@ -3419,6 +3427,14 @@ static Cljc *prim_re_replace(CljcEnv *env, Cljc *args) {
             sb_putc(&out, *p);
         }
         p++;
+    }
+    /* A trailing empty match at end-of-string still substitutes
+     * ((re-replace "ab" "x*" "-") => "-a-b-", as in Clojure). */
+    rx_reset_caps();
+    rx_cap_s[0] = p;
+    if (rx_m(prog, p) && rx_match_end == p) {
+        rx_cap_e[0] = p;
+        rx_subst(&out, repl);
     }
     free(pool);
     Cljc *res = mk_str(out.data, out.len);

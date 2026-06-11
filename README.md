@@ -37,7 +37,20 @@ make test       # 380+ assertions, run twice: normal + GC-stress mode
 | **Regex** | self-contained backtracking engine: `\d \w \s`, classes, groups, `(?:…)`, alternation, lazy quantifiers; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (with `$1` refs) `re-split`; guarded against catastrophic backtracking |
 | **Library** | ~150 core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops (`str/split str/join str/trim …`), `format`, `slurp`/`spit`, `Math/*`, `sort`/`compare`, `read-string`/`eval` |
 | **Memory** | mark-and-sweep GC over pooled cells, conservative C-stack scanning (interpreter C code needs no root registration), structural sharing throughout |
-| **Modes** | REPL, script file, piped stdin, embedded |
+| **Modes** | REPL, script file, piped stdin, embedded, **nREPL server** |
+
+## Editor integration (nREPL)
+
+```sh
+./cljc --nrepl        # serves nREPL on 127.0.0.1:7888, writes .nrepl-port
+./cljc --nrepl 7999   # custom port
+```
+
+Speaks bencode nREPL (`clone` `describe` `eval` `load-file` `close`
+`interrupt` `ls-sessions`), so Conjure, CIDER, and Calva can connect:
+evaluation results come back as `value`, `println` output as `out`
+messages, errors as `err`. Definitions persist across evals. One client
+at a time, loopback only.
 
 ## Embedding
 

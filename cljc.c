@@ -26,6 +26,12 @@
 #include <unistd.h>  /* isatty — REPL vs script-mode detection */
 #endif
 
+/* Interpreter output streams — swappable so the nREPL server can capture
+ * println/error output into protocol messages. NULL means stdout/stderr. */
+static FILE *cljc_out, *cljc_err;
+#define COUT (cljc_out ? cljc_out : stdout)
+#define CERR (cljc_err ? cljc_err : stderr)
+
 /* ───── Value representation ─────────────────────────────────────────── */
 
 typedef enum {
@@ -2026,21 +2032,21 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
 static void print(Cljc *v) {
     SBuf sb = {0};
     print_to(&sb, v, true);
-    if (sb.data) { fwrite(sb.data, 1, sb.len, stdout); free(sb.data); }
+    if (sb.data) { fwrite(sb.data, 1, sb.len, COUT); free(sb.data); }
 }
 
 /* Top-level (uncaught) error report. Resets the in-flight exception. */
 static void print_error(void) {
-    fputs("error: ", stderr);
+    fputs("error: ", CERR);
     if (cur_exc) {
         SBuf sb = {0};
         print_to(&sb, cur_exc, true);
-        if (sb.data) { fwrite(sb.data, 1, sb.len, stderr); free(sb.data); }
+        if (sb.data) { fwrite(sb.data, 1, sb.len, CERR); free(sb.data); }
         cur_exc = NULL;
     } else {
-        fputs(err_msg, stderr);
+        fputs(err_msg, CERR);
     }
-    fputc('\n', stderr);
+    fputc('\n', CERR);
     err_top = NULL;  /* hygiene: no handler frames survive a top-level unwind */
 }
 
@@ -2224,7 +2230,7 @@ static Cljc *prim_println(CljcEnv *env, Cljc *args) {
         print_to(&sb, a->as.cons.head, false);
     }
     sb_putc(&sb, '\n');
-    fwrite(sb.data, 1, sb.len, stdout);
+    fwrite(sb.data, 1, sb.len, COUT);
     free(sb.data);
     return NIL;
 }
@@ -3440,7 +3446,7 @@ static Cljc *print_args(Cljc *args, bool readably, bool newline) {
         print_to(&sb, a->as.cons.head, readably);
     }
     if (newline) sb_putc(&sb, '\n');
-    if (sb.data) { fwrite(sb.data, 1, sb.len, stdout); free(sb.data); }
+    if (sb.data) { fwrite(sb.data, 1, sb.len, COUT); free(sb.data); }
     return NIL;
 }
 
@@ -4257,10 +4263,203 @@ static int run_repl(CljcEnv *env) {
     return 0;
 }
 
+
+/* ───── nREPL server ─────────────────────────────────────────────────── */
+
+/* Minimal nREPL-over-bencode so editors (Conjure, CIDER, Calva) can talk
+ * to cljc: ./cljc --nrepl [port]. Single client at a time, blocking IO.
+ * Ops: clone, describe, eval, load-file, close, ls-sessions, interrupt. */
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+/* ── bencode writing ── */
+static void bw_str(FILE *f, const char *s, size_t n) { fprintf(f, "%zu:", n); fwrite(s, 1, n, f); }
+static void bw_cstr(FILE *f, const char *s) { bw_str(f, s, strlen(s)); }
+static void bw_kv(FILE *f, const char *k, const char *v) { bw_cstr(f, k); bw_cstr(f, v); }
+
+/* ── bencode reading: pull out the string fields we care about ── */
+typedef struct { char *op, *code, *id, *session, *file; } NreplMsg;
+
+static char *br_string(FILE *f, int first) {
+    size_t n = (size_t)(first - '0');
+    int c;
+    while ((c = fgetc(f)) != ':' && c != EOF) n = n * 10 + (size_t)(c - '0');
+    char *s = malloc(n + 1);
+    if (!s || fread(s, 1, n, f) != n) { free(s); return NULL; }
+    s[n] = '\0';
+    return s;
+}
+
+static bool br_skip(FILE *f, int c);  /* skip any bencode value */
+
+static bool br_skip_body(FILE *f) {  /* skip until matching 'e' (list/dict) */
+    for (;;) {
+        int c = fgetc(f);
+        if (c == EOF) return false;
+        if (c == 'e') return true;
+        if (!br_skip(f, c)) return false;
+    }
+}
+
+static bool br_skip(FILE *f, int c) {
+    if (c == 'i') { while ((c = fgetc(f)) != 'e') if (c == EOF) return false; return true; }
+    if (c == 'l' || c == 'd') return br_skip_body(f);
+    if (c >= '0' && c <= '9') { char *s = br_string(f, c); free(s); return s != NULL; }
+    return false;
+}
+
+/* Read one top-level dict message; returns false on EOF/garbage. */
+static bool nrepl_read(FILE *f, NreplMsg *m) {
+    memset(m, 0, sizeof *m);
+    int c = fgetc(f);
+    if (c != 'd') return false;
+    for (;;) {
+        c = fgetc(f);
+        if (c == 'e') return true;
+        if (c < '0' || c > '9') return false;
+        char *key = br_string(f, c);
+        if (!key) return false;
+        c = fgetc(f);
+        if (c >= '0' && c <= '9') {
+            char *val = br_string(f, c);
+            if (!val) { free(key); return false; }
+            if      (!strcmp(key, "op"))      m->op = val;
+            else if (!strcmp(key, "code"))    m->code = val;
+            else if (!strcmp(key, "id"))      m->id = val;
+            else if (!strcmp(key, "session")) m->session = val;
+            else if (!strcmp(key, "file"))    m->file = val;
+            else free(val);
+        } else if (!br_skip(f, c)) { free(key); return false; }
+        free(key);
+    }
+}
+
+static void nrepl_free(NreplMsg *m) {
+    free(m->op); free(m->code); free(m->id); free(m->session); free(m->file);
+}
+
+/* ── responses: every reply echoes id + session ── */
+static void resp_head(FILE *f, NreplMsg *m) {
+    fputc('d', f);
+    if (m->id) bw_kv(f, "id", m->id);
+    bw_kv(f, "session", m->session ? m->session : "none");
+}
+
+static void resp_status(FILE *f, NreplMsg *m, const char *status) {
+    resp_head(f, m);
+    bw_cstr(f, "status");
+    fputc('l', f); bw_cstr(f, status); fputc('e', f);
+    fputc('e', f);
+    fflush(f);
+}
+
+static void resp_field(FILE *f, NreplMsg *m, const char *key, const char *val, size_t n) {
+    resp_head(f, m);
+    bw_cstr(f, key); bw_str(f, val, n);
+    fputc('e', f);
+    fflush(f);
+}
+
+static void nrepl_eval(FILE *out, NreplMsg *m, CljcEnv *env, const char *code) {
+    /* Capture interpreter stdout/stderr into protocol messages. */
+    char *obuf = NULL, *ebuf = NULL;
+    size_t olen = 0, elen = 0;
+    FILE *oms = open_memstream(&obuf, &olen);
+    FILE *ems = open_memstream(&ebuf, &elen);
+    cljc_out = oms; cljc_err = ems;
+    Cljc *result = cljc_eval_string(env, code);
+    cljc_out = NULL; cljc_err = NULL;
+    fclose(oms); fclose(ems);
+    if (olen) resp_field(out, m, "out", obuf, olen);
+    if (elen) resp_field(out, m, "err", ebuf, elen);
+    free(obuf); free(ebuf);
+    SBuf sb = {0};
+    print_to(&sb, result, true);
+    resp_field(out, m, "value", sb.data ? sb.data : "nil", sb.len);
+    free(sb.data);
+    resp_status(out, m, "done");
+}
+
+static void nrepl_serve_client(int fd, CljcEnv *env) {
+    FILE *in = fdopen(fd, "r");
+    FILE *out = fdopen(dup(fd), "w");
+    if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return; }
+    static int session_counter = 0;
+    NreplMsg m;
+    while (nrepl_read(in, &m)) {
+        const char *op = m.op ? m.op : "";
+        if (!strcmp(op, "clone")) {
+            char sid[32];
+            snprintf(sid, sizeof sid, "cljc-session-%d", ++session_counter);
+            resp_head(out, &m);
+            bw_kv(out, "new-session", sid);
+            bw_cstr(out, "status");
+            fputc('l', out); bw_cstr(out, "done"); fputc('e', out);
+            fputc('e', out);
+            fflush(out);
+        } else if (!strcmp(op, "describe")) {
+            resp_head(out, &m);
+            bw_cstr(out, "ops");
+            fputc('d', out);
+            const char *ops[] = {"clone","describe","eval","load-file","close",
+                                 "ls-sessions","interrupt", NULL};
+            for (int i = 0; ops[i]; i++) { bw_cstr(out, ops[i]); fputs("de", out); }
+            fputc('e', out);
+            bw_cstr(out, "versions");
+            fputc('d', out);
+            bw_cstr(out, "cljc"); fputc('d', out);
+            bw_kv(out, "version-string", "0.1");
+            fputc('e', out);
+            fputc('e', out);
+            bw_cstr(out, "status");
+            fputc('l', out); bw_cstr(out, "done"); fputc('e', out);
+            fputc('e', out);
+            fflush(out);
+        } else if (!strcmp(op, "eval") && m.code) {
+            nrepl_eval(out, &m, env, m.code);
+        } else if (!strcmp(op, "load-file") && m.file) {
+            nrepl_eval(out, &m, env, m.file);
+        } else if (!strcmp(op, "close") || !strcmp(op, "ls-sessions")
+                   || !strcmp(op, "interrupt")) {
+            resp_status(out, &m, "done");
+        } else {
+            resp_status(out, &m, "done");  /* unknown op: ack so clients move on */
+        }
+        nrepl_free(&m);
+    }
+    fclose(in);
+    fclose(out);
+}
+
+static int nrepl_server(CljcEnv *env, int port) {
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) { perror("socket"); return 1; }
+    int one = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(srv, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("bind"); return 1; }
+    if (listen(srv, 1) < 0) { perror("listen"); return 1; }
+    FILE *pf = fopen(".nrepl-port", "w");   /* editors auto-discover this */
+    if (pf) { fprintf(pf, "%d", port); fclose(pf); }
+    fprintf(stderr, "cljc nREPL server on 127.0.0.1:%d\n", port);
+    for (;;) {
+        int fd = accept(srv, NULL, NULL);
+        if (fd < 0) continue;
+        nrepl_serve_client(fd, env);   /* one client at a time */
+    }
+}
+
 int main(int argc, char **argv) {
     cljc_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
     CljcEnv *env = cljc_new_env();
 
+    if (argc > 1 && strcmp(argv[1], "--nrepl") == 0)
+        return nrepl_server(env, argc > 2 ? atoi(argv[2]) : 7888);
     if (argc > 1) {
         FILE *f = fopen(argv[1], "r");
         if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }

@@ -139,7 +139,14 @@ required by conservative stack scanning, same as Boehm GC).
     CONS LISTS — every native call allocates its arg list (~12 conses
     per day5 iteration); fixing it means a calling-convention overhaul
     touching all ~150 natives.
-12. **Performance later, maybe**: args-as-array calling convention,
+12. ~~nREPL server~~ ✅ done 2026-06-10 — ./cljc --nrepl [port]: bencode
+    protocol in C (~200 lines), ops clone/describe/eval/load-file/close/
+    interrupt/ls-sessions, stdout/stderr captured per-eval via swappable
+    COUT/CERR globals + open_memstream, .nrepl-port written for editor
+    discovery. Single client, loopback, serial. Verified end-to-end with
+    a Python bencode client (sessions, out/err routing, state
+    persistence). Untested against real Conjure/CIDER yet — try it!
+13. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

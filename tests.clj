@@ -662,4 +662,33 @@
 (assert= 6 (loop [{:keys [n total]} {:n 3 :total 0}]
              (if (zero? n) total (recur {:n (dec n) :total (+ total n)}))))
 
+; ── lazy sequences ──
+(assert= (list 0 1 2 3 4) (take 5 (range)))            ; infinite range
+(assert= (list 1 2 4) (take 3 (iterate #(* % 2) 1)))
+(assert= (list :x :x :x) (take 3 (repeat :x)))
+(assert= (list 1 2 1 2 1 2) (take 6 (cycle [1 2])))
+(assert= (list 0 1 4 9 16) (take 5 (map #(* % %) (range))))
+(assert= (list 0 2 4) (take 3 (filter even? (range))))
+(assert= 1024 (first (filter #(> % 1000) (iterate #(* 2 %) 1))))
+(assert= 4950 (reduce + (take 100 (range))))
+(assert= (list 1 2 0 1) (take 4 (concat [1 2] (range))))
+(assert= (list 5 7 9) (map + [1 2 3] [4 5 6]))         ; 2-coll map
+(assert= true (= (take 3 (range)) (list 0 1 2)))       ; eq across lazy/list
+(assert= true (seq? (map inc [1])))
+(assert= false (seq? [1]))
+(assert= 3 (count (take 3 (range))))
+(assert= nil (seq (take 0 (range))))
+; call-by-need: side effects fire only on realization
+(def lz-side (atom 0))
+(def lz (map (fn [x] (swap! lz-side inc) x) [1 2 3]))
+(assert= 0 @lz-side)
+(assert= 1 (first lz))
+(assert= 1 @lz-side)
+; threading macros still work (their expansions are lazy concats now)
+(assert= (list 2 4) (->> (range 5) (map inc) (filter even?)))
+(assert= (list 2 3 4) (take-while #(< % 5) (iterate inc 2)))
+(assert= (list 7 7) (take 2 (repeatedly (constantly 7))))
+(gc)
+(assert= (list 2 3) (take 2 (rest lz)))                ; half-realized chain survives GC
+
 (println "tests complete")

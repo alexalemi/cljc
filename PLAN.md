@@ -155,7 +155,13 @@ required by conservative stack scanning, same as Boehm GC).
     comment macro, loop destructuring (gensym rewrite + inner let, the
     same rewrite Clojure does). Remaining compat tiers: lazy seqs
     (Tier 2, big), vars/multimethods/protocols (Tier 3, usage-driven).
-14. **NEXT UP — Lazy sequences (Tier 2 compat, full-session milestone)**
+14. ~~Lazy sequences~~ ✅ done 2026-06-10 — as designed below, plus two
+    discoveries: (1) lazy concat is required or cycle self-realizes into
+    a stack overflow; (2) eval must treat CLJC_LAZY in form position as
+    a call form (macros like ->> build expansions WITH concat — their
+    expansions are now lazy seqs). Cost: 1M seq pipeline 321ms -> 2.9s
+    (interpreted thunk-per-element); chunked seqs are the known remedy.
+    Original design:
     Design (agreed, ready to execute):
     a. New tag CLJC_LAZY: union { Cljc *thunk; Cljc *cached; bool done; }
        — thunk is a zero-arg fn; forcing calls it once, caches the

@@ -48,6 +48,7 @@ typedef enum {
     CLJC_FN,        /* interpreted */
     CLJC_NATIVE,    /* C function */
     CLJC_ATOM,      /* mutable box: (atom x), @a, swap!, reset! */
+    CLJC_LAZY,      /* lazy seq: thunk forced once, result cached */
     CLJC_SET,       /* persistent set: a HAMT keyed by its elements (uses as.map) */
     CLJC_HNODE,     /* internal: HAMT tree node — never user-visible */
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
@@ -86,6 +87,7 @@ struct Cljc {
         struct { Cljc *arities; CljcEnv *env; bool is_macro; } fn;
         CljcNativeFn native;
         struct { Cljc *value; } atom;
+        struct { Cljc *thunk; Cljc *cached; bool done; } lazy;
         /* recur sentinel: up to 3 values inline (covers real loops);
          * wider recurs spill to a heap array stored in iv[0]. */
         struct { Cljc *iv[3]; uint8_t n; bool spill; } recur;
@@ -117,6 +119,7 @@ static bool cljc_eq(Cljc *a, Cljc *b);
 static bool map_find(Cljc *m, Cljc *key, Cljc **out);
 static double as_num(Cljc *v);
 static Cljc *to_seq(Cljc *v);
+static Cljc *seq1(Cljc *v);
 static Cljc *cell_alloc(bool zero);
 static CljcEnv *env_alloc(void);
 static Cljc **chunk32_alloc(void);
@@ -392,6 +395,10 @@ static void gc_mark(Cljc *v) {
             case CLJC_ATOM:
                 v = v->as.atom.value;
                 break;
+            case CLJC_LAZY:
+                gc_mark(v->as.lazy.thunk);
+                v = v->as.lazy.cached;
+                break;
             default:
                 return;
         }
@@ -544,6 +551,8 @@ static uint32_t cljc_hash(Cljc *v) {
         case CLJC_STRING:  return fnv1a(v->as.str, strlen(v->as.str));
         case CLJC_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
         case CLJC_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
+        case CLJC_LAZY:
+            return cljc_hash(to_seq(v));
         case CLJC_LIST: {
             uint32_t h = 1;
             for (Cljc *l = v; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
@@ -1719,6 +1728,10 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
         case CLJC_ATOM:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
             return form;
+        case CLJC_LAZY:
+            /* Lazy seqs ARE seqs: in form position (e.g. a macro expansion
+             * built with lazy concat) they evaluate as call forms. */
+            return eval(env, to_seq(form));
         case CLJC_FREE:
             cljc_error("internal: evaluated a freed value (GC bug)");
         case CLJC_VECTOR: {
@@ -2050,6 +2063,17 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                         }
                     }
                 }
+                {
+                    static const char *SYM_LAZY_SEQ;
+                    if (!SYM_LAZY_SEQ) SYM_LAZY_SEQ = intern("lazy-seq", 8);
+                    if (s == SYM_LAZY_SEQ) {
+                        /* (lazy-seq body...) => lazy cell over (fn [] body...) */
+                        Cljc *thunk = make_fn(env, mk_cons(mk_empty_vec(), rest), false);
+                        Cljc *l = alloc(CLJC_LAZY);  /* union zeroed: done=false */
+                        l->as.lazy.thunk = thunk;
+                        return l;
+                    }
+                }
                 if (s == SYM_FN)
                     /* (fn [x y] body...) or (fn ([x] ...) ([x y] ...)) */
                     return make_fn(env, rest, false);
@@ -2156,6 +2180,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             print_to(sb, v->as.atom.value, readably);
             sb_putc(sb, ']');
             break;
+        case CLJC_LAZY:   print_to(sb, to_seq(v), readably); break;  /* realizes! */
         case CLJC_RECUR:  sb_puts(sb, "#<recur>"); break;
         case CLJC_FREE:   sb_puts(sb, "#<freed!>"); break;  /* seeing this is a GC bug */
     }
@@ -2278,9 +2303,11 @@ static bool seq_eq(Cljc *a, Cljc *b) {
 static bool cljc_eq(Cljc *a, Cljc *b) {
     if (a == b) return true;
     if (a == NULL || b == NULL) return false;
-    bool a_seq = a->tag == CLJC_LIST || a->tag == CLJC_VECTOR;
-    bool b_seq = b->tag == CLJC_LIST || b->tag == CLJC_VECTOR;
-    if (a_seq && b_seq) return seq_eq(a, b);
+    bool a_seq = a->tag == CLJC_LIST || a->tag == CLJC_VECTOR || a->tag == CLJC_LAZY;
+    bool b_seq = b->tag == CLJC_LIST || b->tag == CLJC_VECTOR || b->tag == CLJC_LAZY;
+    if (a_seq && b_seq)
+        return seq_eq(a->tag == CLJC_LAZY ? to_seq(a) : a,
+                      b->tag == CLJC_LAZY ? to_seq(b) : b);
     if (a->tag != b->tag) {
         /* Numeric cross-equality: int vs double. */
         if ((a->tag == CLJC_INT && b->tag == CLJC_DOUBLE) ||
@@ -2404,7 +2431,8 @@ static Cljc *prim_count(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *v = args->as.cons.head;
     if (v == NIL) return mk_int(0);
-    if (v->tag == CLJC_LIST) return mk_int((int64_t)list_len(v));
+    if (v->tag == CLJC_LIST || v->tag == CLJC_LAZY)
+        return mk_int((int64_t)list_len(to_seq(v)));
     if (v->tag == CLJC_VECTOR) return mk_int((int64_t)vec_len(v));
     if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
         return mk_int((int64_t)v->as.map.count);
@@ -2503,6 +2531,7 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc *args) {
     Cljc *v = args->as.cons.head;
     if (v == NIL) return TRUE;
     if (v->tag == CLJC_LIST) return FALSE;  /* a cons is never empty */
+    if (v->tag == CLJC_LAZY) return mk_bool(seq1(v) == NIL);
     if (v->tag == CLJC_VECTOR) return mk_bool(vec_len(v) == 0);
     if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
         return mk_bool(v->as.map.count == 0);
@@ -2659,14 +2688,14 @@ static Cljc *prim_list(CljcEnv *env, Cljc *args) { (void)env; return args; }
 
 static Cljc *prim_first(CljcEnv *env, Cljc *args) {
     (void)env;
-    Cljc *s = to_seq(args->as.cons.head);  /* lists/vectors/maps uniformly */
+    Cljc *s = seq1(args->as.cons.head);  /* forces ONE cell at most */
     return s == NIL ? NIL : s->as.cons.head;
 }
 
 static Cljc *prim_rest(CljcEnv *env, Cljc *args) {
     (void)env;
-    Cljc *s = to_seq(args->as.cons.head);
-    return s == NIL ? NIL : s->as.cons.tail;
+    Cljc *s = seq1(args->as.cons.head);
+    return s == NIL ? NIL : s->as.cons.tail;  /* tail may be lazy */
 }
 
 static Cljc *prim_second(CljcEnv *env, Cljc *args) {
@@ -2678,18 +2707,53 @@ static Cljc *prim_second(CljcEnv *env, Cljc *args) {
 static Cljc *prim_cons(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *h = args->as.cons.head;
-    /* to_seq keeps lists proper: (cons 1 [2 3]) => (1 2 3), (cons 1 2) errors.
-     * Improper dotted pairs aren't a Clojure concept. */
-    Cljc *t = to_seq(args->as.cons.tail->as.cons.head);
+    Cljc *t = args->as.cons.tail->as.cons.head;
+    /* Lazy tails stay lazy — the backbone of lazy-seq pipelines. */
+    if (!(t != NIL && (t->tag == CLJC_LAZY || t->tag == CLJC_LIST)))
+        t = to_seq(t);  /* (cons 1 [2 3]) => (1 2 3); (cons 1 2) errors */
     return mk_cons(h, t);
 }
 
 /* ── Seq library ── */
 
-/* Normalize any seqable to a list cursor (lists pass through, vectors copy).
- * The HAMT/lazy-seq milestone replaces this with a real ISeq protocol. */
+/* Force a lazy cell once; thunk dropped after so its closure can be GC'd. */
+static Cljc *lazy_force(Cljc *l) {
+    if (!l->as.lazy.done) {
+        l->as.lazy.cached = apply(gc_root_envs[0], l->as.lazy.thunk, NIL);
+        l->as.lazy.done = true;
+        l->as.lazy.thunk = NIL;
+    }
+    return l->as.lazy.cached;
+}
+
+/* Single-step seq: force AT MOST the head cell. Returns NIL or a cons whose
+ * tail may itself be lazy. This is what keeps pipelines lazy. */
+static Cljc *seq1(Cljc *v) {
+    for (;;) {
+        if (v == NULL || v == NIL) return NIL;
+        if (v->tag == CLJC_LIST) return v;
+        if (v->tag == CLJC_LAZY) { v = lazy_force(v); continue; }
+        return to_seq(v);  /* finite collections materialize */
+    }
+}
+
+/* Normalize any seqable to a FULLY REALIZED plain list (eager consumers).
+ * Plain lists pass through untouched unless a lazy tail hides inside. */
 static Cljc *to_seq(Cljc *v) {
     if (v == NIL) return NIL;
+    if (v->tag == CLJC_LAZY || v->tag == CLJC_LIST) {
+        if (v->tag == CLJC_LIST) {  /* fast path: no lazy tails => as-is */
+            Cljc *l = v;
+            while (l->tag == CLJC_LIST) l = l->as.cons.tail;
+            if (l == NIL) return v;
+        }
+        Cljc *out = NIL, **t = &out;
+        for (Cljc *s = seq1(v); s != NIL; s = seq1(s->as.cons.tail)) {
+            *t = mk_cons(s->as.cons.head, NIL);
+            t = &(*t)->as.cons.tail;
+        }
+        return out;
+    }
     if (v->tag == CLJC_LIST) return v;
     if (v->tag == CLJC_VECTOR) {
         Cljc *out = NIL, **t = &out;
@@ -2845,8 +2909,14 @@ static Cljc *prim_gensym(CljcEnv *env, Cljc *args) {
 
 static Cljc *prim_seq(CljcEnv *env, Cljc *args) {
     (void)env;
-    Cljc *s = to_seq(args->as.cons.head);
+    Cljc *s = seq1(args->as.cons.head);
     return s == NIL ? NIL : s;  /* (seq []) => nil, matching Clojure */
+}
+
+static Cljc *prim_seq_p(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *v = args->as.cons.head;
+    return mk_bool(v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_LAZY));
 }
 
 /* ───── Regex engine ─────────────────────────────────────────────────── */
@@ -4207,6 +4277,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "reverse", prim_reverse);
     cljc_define_native(e, "last",    prim_last);
     cljc_define_native(e, "seq",     prim_seq);
+    cljc_define_native(e, "seq?",    prim_seq_p);
     cljc_define_native(e, "hash-map",  prim_hash_map);
     cljc_define_native(e, "get",       prim_get);
     cljc_define_native(e, "assoc",     prim_assoc);
@@ -4289,6 +4360,49 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "str/includes?",    prim_includes);
     cljc_define_native(e, "str/blank?",       prim_blank_p);
     cljc_eval_string(e, PRELUDE);
+    /* Lazy core: shadows the eager natives so pipelines compose lazily.
+     * Eager consumers (reduce, count, into, vec, sort...) realize via
+     * to_seq, so finite pipelines behave identically. */
+    cljc_eval_string(e,
+        "(def range* range)\n"
+        "(defn range\n"
+        "  ([] (iterate inc 0))\n"
+        "  ([n] (range* n)) ([a b] (range* a b)) ([a b s] (range* a b s)))\n"
+        "(defn iterate [f x] (lazy-seq (cons x (iterate f (f x)))))\n"
+        "(defn map\n"
+        "  ([f c] (lazy-seq (when-let [s (seq c)]\n"
+        "                     (cons (f (first s)) (map f (rest s))))))\n"
+        "  ([f c1 c2] (lazy-seq (let [s1 (seq c1) s2 (seq c2)]\n"
+        "                         (when (and s1 s2)\n"
+        "                           (cons (f (first s1) (first s2))\n"
+        "                                 (map f (rest s1) (rest s2))))))))\n"
+        "(defn filter [pred c]\n"
+        "  (lazy-seq (when-let [s (seq c)]\n"
+        "              (if (pred (first s))\n"
+        "                (cons (first s) (filter pred (rest s)))\n"
+        "                (filter pred (rest s))))))\n"
+        "(defn take [n c]\n"
+        "  (lazy-seq (when (> n 0)\n"
+        "              (when-let [s (seq c)]\n"
+        "                (cons (first s) (take (dec n) (rest s)))))))\n"
+        "(defn take-while [pred c]\n"
+        "  (lazy-seq (when-let [s (seq c)]\n"
+        "              (when (pred (first s))\n"
+        "                (cons (first s) (take-while pred (rest s)))))))\n"
+        "(defn repeat\n"
+        "  ([x] (lazy-seq (cons x (repeat x))))\n"
+        "  ([n x] (take n (repeat x))))\n"
+        "(defn concat\n"
+        "  ([] (list))\n"
+        "  ([a] (lazy-seq (seq a)))\n"
+        "  ([a b] (lazy-seq (if-let [s (seq a)]\n"
+        "                     (cons (first s) (concat (rest s) b))\n"
+        "                     (seq b))))\n"
+        "  ([a b & more] (concat (concat a b) (apply concat more))))\n"
+        "(defn cycle [c] (lazy-seq (concat (seq c) (cycle c))))\n"
+        "(defn repeatedly\n"
+        "  ([f] (lazy-seq (cons (f) (repeatedly f))))\n"
+        "  ([n f] (take n (repeatedly f))))\n");
     return e;
 }
 

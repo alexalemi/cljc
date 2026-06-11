@@ -29,6 +29,7 @@ make test       # 380+ assertions, run twice: normal + GC-stress mode
 
 | Area | Coverage |
 |---|---|
+| **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need |
 | **Data** | nil, bools, int64, doubles, strings (with escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, amortized O(1) `conj`), **persistent maps** (HAMT), **persistent sets**, atoms |
 | **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote` |
 | **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets); `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` (with `:when`/`:let`) `doseq` `dotimes` `doto` `letfn` … all written in cljc itself (the prelude) |
@@ -98,7 +99,7 @@ treat as orders of magnitude):
 | startup (hello world) | **2 ms** | 10 ms | 440 ms |
 | fib(27), interpreted recursion | 88 ms | **56 ms** | 563 ms |
 | 5M-iteration loop/recur | 578 ms | **239 ms** | 563 ms |
-| seq pipeline (1M: filter→map→reduce) | 321 ms | **58 ms** | 488 ms |
+| seq pipeline (1M: filter→map→reduce) | 2.9 s¹ | **58 ms** | 488 ms |
 | build+read 100k-entry map | 231 ms | **107 ms** | 699 ms |
 | build 1M-element vector | 223 ms | **107 ms** | 542 ms |
 | sort 200k | **126 ms** | 185 ms | 641 ms |
@@ -115,6 +116,10 @@ in `benchmarks/aoc/`, identical sources and answers on all three runtimes:
 | day 5: jump tape (25M vector assocs) | 17.0 s | 8.2 s | **2.9 s** |
 | day 6: redistribution (vectors as hash keys) | 186 ms | **101 ms** | 640 ms |
 
+¹ was 321 ms when map/filter were eager natives; real lazy sequences cost a
+thunk+closure per element in an interpreter. Chunked seqs (Clojure's own fix)
+are the planned remedy.
+
 Honest reading: babashka wins most compute because its `clojure.core` is
 AOT-compiled native code — SCI only interprets your glue, while cljc interprets
 *everything*. That cljc stays within ~1.5–4× of bb with a 4,000-line tree-walker
@@ -125,8 +130,8 @@ and zero dependencies matter; use bb/JVM where throughput does.
 
 ## Deliberate divergences from Clojure
 
-- `()` ≡ `nil`; no Ratio type (`(/ 7 2)` ⇒ `3.5`); no lazy seqs (eager,
-  `range` is bounded); no namespaces or vars (`Math/sqrt` is just a symbol)
+- `()` ≡ `nil`; no Ratio type (`(/ 7 2)` ⇒ `3.5`); no namespaces or vars
+  (`Math/sqrt` is just a symbol)
 - `catch` is untyped — the class in `(catch Exception e …)` is ignored
 - Map/set iteration order is hash order, not insertion order
 - Patterns are plain strings (`#"…"` is raw-string sugar); `{n,m}` braces are

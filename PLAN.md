@@ -294,7 +294,14 @@ required by conservative stack scanning, same as Boehm GC).
     resolved on lookup miss by prefix-strip, cached in the symbol
     cell), instance? as always-false macro, volatile!/vreset!/vswap!
     as atom shims, coll?/map-entry?/list*/find/key/val/nnext family.
-24. **Performance later, maybe**: args-as-array calling convention,
+24. Survey round 3 finding (2026-06-11): clojure.zip is BLOCKED
+    structurally — zippers carry their branch?/children/make-node fns
+    in ^{:zip/...} metadata, so the metadata-discard divergence is
+    load-bearing there. Unlock if wanted: real with-meta/meta via a
+    cell->meta side table (with-meta copies the cell, records meta;
+    sweep drops dead entries). ~a session. Other untried candidates:
+    clojure.data (diff), camel-snake-kebab, hiccup core, tools.cli.
+25. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

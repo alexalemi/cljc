@@ -97,6 +97,7 @@ unmodified upstream sources vendored in `vendor/`:
 | **clojure.set** | ✅ complete — `union`/`join`/`project`/`index`/`map-invert`/… |
 | **clojure.walk** | ✅ complete — `postwalk`/`keywordize-keys`/`prewalk-replace`/… |
 | **medley** | ✅ substantially — `assoc-some`, `deep-merge`, `index-by`, `distinct-by`, `interleave-all`, lazy + `reduced`-based fns |
+| clojure.zip | ❌ zippers live in *metadata* — needs real meta support (mapped, unbuilt) |
 | data.json | ❌ Java interop throughout (our `json.clj` covers the need) |
 | Clerk | ❌ JVM-bound (doesn't run on babashka either) |
 

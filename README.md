@@ -101,6 +101,11 @@ unmodified upstream sources vendored in `vendor/`:
 | data.json | ❌ Java interop throughout (our `json.clj` covers the need) |
 | Clerk | ❌ JVM-bound (doesn't run on babashka either) |
 
+**Caveat — flat-global collisions**: libraries land in one namespace, so
+`clojure.zip` (which defines `next`, `remove`, `replace`) shadows core seq
+fns for everything loaded after it. Libraries verified work *individually*;
+zip should be loaded alone or last. Real require-isolation is the mapped fix.
+
 The line: pure-data single-file libraries are reachable; Java interop,
 `deftype`, and multi-file namespace graphs are not — babashka's line, drawn
 tighter.

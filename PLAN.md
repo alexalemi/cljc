@@ -329,7 +329,15 @@ required by conservative stack scanning, same as Boehm GC).
     environments. reify now builds its expansion eagerly (loop/concat
     of realized lists) as the workaround. Reproduce from git history:
     the reify version at commit 0ac1817. Hunt with fresh context.
-27. **Performance later, maybe**: args-as-array calling convention,
+27. FOUND 2026-06-11 (user's "which work?" audit): FLAT-GLOBAL
+    COLLISIONS — clojure.zip defines next/remove/replace, shadowing
+    core seq fns for everything loaded after; libraries verify
+    individually but compose load-order-dependently. The honest fix is
+    require ISOLATION (namespaces-lite): load each lib's defs under
+    prefixed names with internal references resolved within the lib —
+    an architectural milestone (touches def/lookup), mapped not built.
+    Interim rule documented: zip loads alone or last.
+28. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

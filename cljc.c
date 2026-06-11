@@ -5659,53 +5659,296 @@ static int run_stream(CljcEnv *env, FILE *f, const char *name) {
     return 0;
 }
 
-/* Interactive REPL. Accumulates lines until parens balance, so multi-line
- * forms work. A separate function so its locals are below the GC stack base
- * recorded in main. */
-static int run_repl(CljcEnv *env) {
-    char buf[65536];
-    size_t buflen = 0;
-    fputs("cljc v0 — Ctrl-D to quit\n", stdout);
+
+
+/* ───── Interactive REPL: line editor ────────────────────────────────── */
+
+/* linenoise-style: raw termios, editing keys, persistent history, tab
+ * completion against live root bindings, live syntax highlighting,
+ * paren-balance multiline, *1 *2 *3 result history. Zero dependencies. */
+
+#include <termios.h>
+
+#define RL_MAX 8192
+#define HIST_MAX 512
+static char *rl_hist[HIST_MAX];
+static int rl_hist_n;
+
+static void hist_load(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/.cljc_history", home);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[RL_MAX];
+    while (fgets(line, sizeof line, f) && rl_hist_n < HIST_MAX) {
+        size_t n = strlen(line);
+        while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+        if (n) rl_hist[rl_hist_n++] = strdup(line);
+    }
+    fclose(f);
+}
+
+static void hist_add(const char *line) {
+    if (!*line) return;
+    if (rl_hist_n && !strcmp(rl_hist[rl_hist_n-1], line)) return;
+    if (rl_hist_n == HIST_MAX) {
+        free(rl_hist[0]);
+        memmove(rl_hist, rl_hist + 1, sizeof(char *) * (HIST_MAX - 1));
+        rl_hist_n--;
+    }
+    rl_hist[rl_hist_n++] = strdup(line);
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/.cljc_history", home);
+    FILE *f = fopen(path, "a");
+    if (f) { fprintf(f, "%s\n", line); fclose(f); }
+}
+
+/* Render the buffer with syntax highlighting into out. */
+static void rl_highlight(const char *buf, SBuf *out) {
+    const char *p = buf;
+    while (*p) {
+        if (*p == ';') {                                /* comment */
+            sb_puts(out, "\x1b[2m");
+            while (*p) sb_putc(out, *p++);
+            sb_puts(out, "\x1b[0m");
+        } else if (*p == '"') {                          /* string */
+            sb_puts(out, "\x1b[32m");
+            sb_putc(out, *p++);
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1]) { sb_putc(out, *p++); }
+                sb_putc(out, *p++);
+            }
+            if (*p) sb_putc(out, *p++);
+            sb_puts(out, "\x1b[0m");
+        } else if (*p == ':' && is_sym_char((unsigned char)p[1])) {  /* keyword */
+            sb_puts(out, "\x1b[36m");
+            while (is_sym_char((unsigned char)*p)) sb_putc(out, *p++);
+            sb_puts(out, "\x1b[0m");
+        } else if (isdigit((unsigned char)*p) ||
+                   ((*p == '-' || *p == '+') && isdigit((unsigned char)p[1]))) {
+            sb_puts(out, "\x1b[33m");                    /* number */
+            sb_putc(out, *p++);
+            while (is_sym_char((unsigned char)*p)) sb_putc(out, *p++);
+            sb_puts(out, "\x1b[0m");
+        } else if (strchr("()[]{}", *p)) {               /* delimiters */
+            sb_puts(out, "\x1b[2m");
+            sb_putc(out, *p++);
+            sb_puts(out, "\x1b[0m");
+        } else sb_putc(out, *p++);
+    }
+}
+
+static void rl_refresh(const char *prompt, const char *buf, size_t pos) {
+    SBuf out = {0};
+    sb_puts(&out, "\r\x1b[K");
+    sb_puts(&out, prompt);
+    rl_highlight(buf, &out);
+    /* cursor: return to col 0, advance past prompt + pos */
+    char mv[32];
+    snprintf(mv, sizeof mv, "\r\x1b[%zuC", strlen(prompt) + pos);
+    sb_puts(&out, mv);
+    fwrite(out.data, 1, out.len, stdout);
+    fflush(stdout);
+    free(out.data);
+}
+
+/* Tab completion: the symbol fragment before the cursor, against root
+ * bindings + special forms. Inserts the unique completion or lists. */
+static const char *rl_specials[] = {"defn", "defmacro", "let", "loop", "recur",
+    "lazy-seq", "binding", "when", "cond", "quote", NULL};
+
+static void rl_complete(char *buf, size_t *len, size_t *pos, const char *prompt) {
+    size_t start = *pos;
+    while (start > 0 && is_sym_char((unsigned char)buf[start-1])) start--;
+    size_t fraglen = *pos - start;
+    if (!fraglen) return;
+    const char *matches[64];
+    int nm = 0;
+    for (Binding *b = gc_root_envs[0]->bindings; b && nm < 64; b = b->next) {
+        if (strstr(b->name, "**") || !strncmp(b->name, "cljc/", 5)) continue;
+        if (!strncmp(b->name, buf + start, fraglen)) matches[nm++] = b->name;
+    }
+    for (int i = 0; rl_specials[i] && nm < 64; i++)
+        if (!strncmp(rl_specials[i], buf + start, fraglen)) matches[nm++] = rl_specials[i];
+    if (nm == 0) return;
+    /* longest common prefix of all matches */
+    size_t common = strlen(matches[0]);
+    for (int i = 1; i < nm; i++) {
+        size_t j = 0;
+        while (j < common && matches[i][j] == matches[0][j]) j++;
+        common = j;
+    }
+    if (common > fraglen) {       /* extend the fragment */
+        size_t add = common - fraglen;
+        if (*len + add < RL_MAX - 1) {
+            memmove(buf + *pos + add, buf + *pos, *len - *pos + 1);
+            memcpy(buf + *pos, matches[0] + fraglen, add);
+            *len += add;
+            *pos += add;
+        }
+    } else if (nm > 1) {          /* show candidates */
+        printf("\r\n");
+        for (int i = 0; i < nm && i < 24; i++)
+            printf("%s%s", i ? "  " : "", matches[i]);
+        if (nm > 24) printf("  ...(%d total)", nm);
+        printf("\r\n");
+    }
+    rl_refresh(prompt, buf, *pos);
+}
+
+/* Read one edited line; returns false on EOF (ctrl-d on empty). */
+static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
+    struct termios orig, raw;
+    if (tcgetattr(0, &orig) == -1) {            /* not a tty after all */
+        if (!fgets(buf, (int)bufcap, stdin)) return false;
+        buf[strcspn(buf, "\n")] = 0;
+        return true;
+    }
+    raw = orig;
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSAFLUSH, &raw);
+    size_t len = 0, pos = 0;
+    int hidx = rl_hist_n;
+    char saved[RL_MAX] = "";
+    buf[0] = 0;
+    rl_refresh(prompt, buf, pos);
     for (;;) {
-        fputs(buflen ? "  ... " : "cljc> ", stdout); fflush(stdout);
-        if (!fgets(buf + buflen, (int)(sizeof buf - buflen), stdin)) { putchar('\n'); break; }
-        buflen = strlen(buf);
-        if (buflen >= sizeof buf - 2) {  /* full buffer would loop forever */
-            fprintf(stderr, "error: input too long\n");
-            buflen = 0;
+        int c = getchar();
+        if (c == EOF || (c == 4 && len == 0)) {           /* ctrl-d */
+            tcsetattr(0, TCSAFLUSH, &orig);
+            printf("\r\n");
+            return false;
+        }
+        if (c == '\r' || c == '\n') {
+            tcsetattr(0, TCSAFLUSH, &orig);
+            printf("\r\n");
+            return true;
+        }
+        if (c == 3) { len = pos = 0; buf[0] = 0; }        /* ctrl-c: clear */
+        else if (c == 127 || c == 8) {                    /* backspace */
+            if (pos > 0) {
+                memmove(buf + pos - 1, buf + pos, len - pos + 1);
+                pos--; len--;
+            }
+        } else if (c == 1) pos = 0;                       /* ctrl-a */
+        else if (c == 5) pos = len;                       /* ctrl-e */
+        else if (c == 11) { buf[pos] = 0; len = pos; }    /* ctrl-k */
+        else if (c == 21) {                               /* ctrl-u */
+            memmove(buf, buf + pos, len - pos + 1);
+            len -= pos; pos = 0;
+        } else if (c == 23) {                             /* ctrl-w */
+            size_t s = pos;
+            while (s > 0 && buf[s-1] == ' ') s--;
+            while (s > 0 && buf[s-1] != ' ') s--;
+            memmove(buf + s, buf + pos, len - pos + 1);
+            len -= pos - s; pos = s;
+        } else if (c == 12) { printf("\x1b[2J\x1b[H"); }  /* ctrl-l */
+        else if (c == '\t') {
+            rl_complete(buf, &len, &pos, prompt);
+            continue;
+        } else if (c == 27) {                             /* escape sequences */
+            int c1 = getchar(), c2 = getchar();
+            if (c1 == '[') {
+                if (c2 == 'D' && pos > 0) pos--;          /* left */
+                else if (c2 == 'C' && pos < len) pos++;   /* right */
+                else if (c2 == 'H') pos = 0;
+                else if (c2 == 'F') pos = len;
+                else if (c2 == 'A') {                     /* up: history */
+                    if (hidx > 0) {
+                        if (hidx == rl_hist_n) snprintf(saved, sizeof saved, "%s", buf);
+                        hidx--;
+                        snprintf(buf, bufcap, "%s", rl_hist[hidx]);
+                        len = pos = strlen(buf);
+                    }
+                } else if (c2 == 'B') {                   /* down */
+                    if (hidx < rl_hist_n) {
+                        hidx++;
+                        snprintf(buf, bufcap, "%s",
+                                 hidx == rl_hist_n ? saved : rl_hist[hidx]);
+                        len = pos = strlen(buf);
+                    }
+                } else if (c2 == '3') { (void)getchar();  /* delete key */
+                    if (pos < len) {
+                        memmove(buf + pos, buf + pos + 1, len - pos);
+                        len--;
+                    }
+                }
+            }
+        } else if (c >= 32 && c < 127 && len < bufcap - 1) {
+            memmove(buf + pos + 1, buf + pos, len - pos + 1);
+            buf[pos] = (char)c;
+            pos++; len++;
+        }
+        rl_refresh(prompt, buf, pos);
+    }
+}
+
+static bool balanced(const char *s) {
+    int depth = 0;
+    bool in_str = false, in_com = false;
+    for (const char *c = s; *c; c++) {
+        if (in_com) { if (*c == '\n') in_com = false; continue; }
+        if (in_str) {
+            if (*c == '\\' && c[1]) c++;
+            else if (*c == '"') in_str = false;
             continue;
         }
-        /* Balance check: count delimiters outside strings/comments. */
-        int depth = 0; bool in_str = false, in_comment = false;
-        for (const char *c = buf; *c; c++) {
-            if (in_comment) { if (*c == '\n') in_comment = false; continue; }
-            if (in_str) {
-                if (*c == '\\' && c[1]) c++;
-                else if (*c == '"') in_str = false;
-                continue;
-            }
-            if (*c == '"') in_str = true;
-            else if (*c == ';') in_comment = true;
-            else if (*c == '(' || *c == '[' || *c == '{') depth++;
-            else if (*c == ')' || *c == ']' || *c == '}') depth--;
-        }
-        if (depth > 0 || in_str) continue;  /* keep reading lines */
+        if (*c == '"') in_str = true;
+        else if (*c == ';') in_com = true;
+        else if (strchr("([{", *c)) depth++;
+        else if (strchr(")]}", *c)) depth--;
+    }
+    return depth <= 0 && !in_str;
+}
 
-        if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; buflen = 0; continue; }
-        const char *p = buf;
+static int run_repl(CljcEnv *env) {
+    hist_load();
+    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 hold results, ctrl-d exits\n",
+           CLJC_VERSION);
+    char form[RL_MAX * 4];
+    char line[RL_MAX];
+    for (;;) {
+        form[0] = 0;
+        if (!rl_edit("cljc> ", line, sizeof line)) break;
+        snprintf(form, sizeof form, "%s", line);
+        while (!balanced(form)) {
+            if (!rl_edit("  ... ", line, sizeof line)) break;
+            size_t fl = strlen(form);
+            snprintf(form + fl, sizeof form - fl, "\n%s", line);
+        }
+        if (!form[0]) continue;
+        hist_add(form);
+        if (setjmp(err_jmp) != 0) {
+            print_error();
+            vsp = 0;
+            eval_sp = 0;
+            continue;
+        }
+        const char *p = form;
         while (*p) {
             skip_ws(&p);
             if (!*p) break;
-            Cljc *form = read_form(&p);
-            if (!form) break;
-            Cljc *result = eval(env, form);
-            print(result); putchar('\n');
+            Cljc *f = read_form(&p);
+            if (!f) break;
+            Cljc *result = eval(env, f);
+            /* ipython-style result history */
+            Cljc *star2 = env_lookup_maybe(env, "*1");
+            Cljc *star3 = env_lookup_maybe(env, "*2");
+            if (star3) env_define_root(env_root(env), intern("*3", 2), star3);
+            if (star2) env_define_root(env_root(env), intern("*2", 2), star2);
+            env_define_root(env_root(env), intern("*1", 2), result);
+            print(result);
+            putchar('\n');
         }
-        buflen = 0;
     }
     return 0;
 }
-
 
 /* ───── nREPL server ─────────────────────────────────────────────────── */
 

@@ -373,10 +373,19 @@ required by conservative stack scanning, same as Boehm GC).
     and the dimmed trace. ANSI color only on ttys. load-file'd code
     gets traces but not source excerpts (its text isn't retained) —
     noted for later.
-31. NEXT QUEUE (user-requested, in order): (a) enhanced REPL —
-    readline-style editing, history, completion (bindings table),
-    syntax highlighting, multiline; consider linenoise-style inline
-    editor vs optional -lreadline. (b) CLERK CLONE — literate
+31. ~~Enhanced REPL~~ ✅ done 2026-06-11 — linenoise-style editor, zero
+    deps: raw termios; insert/backspace/delete, arrows, ctrl-a/e/k/u/w/
+    l/c, ctrl-d exit; persistent history (~/.cljc_history, 512 entries,
+    up/down with in-progress-line save); tab completion against LIVE
+    root bindings + special forms (longest-common-prefix extension,
+    candidate listing); live syntax highlighting per keypress (strings
+    green, keywords cyan, numbers yellow, delimiters+comments dim);
+    paren-balance multiline with ... continuation; *1 *2 *3 result
+    history (ipython-style). Errors in the REPL get the full Elm
+    treatment minus source excerpts. Also column-precise carets landed
+    this session (form {:line :col} meta; token search anchored at
+    col; fallback caret at the form's paren).
+32. NEXT: CLERK CLONE — literate
     notebooks from .clj files; PRIOR ART to study first:
     ~/build/s7 (their s7 version), ~/projects/clerk-janet,
     ~/projects/clerk-racket, and the plaque skill (their Python one).

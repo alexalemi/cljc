@@ -20,7 +20,7 @@ in ~4,000 lines of C99 with no dependencies.
 
 ```sh
 make            # builds ./cljc (cc, -lm -ldl, nothing else)
-./cljc          # interactive REPL (multi-line aware)
+./cljc          # REPL: editing, history, tab-completion, highlighting, *1 *2 *3
 ./cljc file.clj # run a script
 make test       # 600+ assertions, run twice: normal + GC-stress mode
 

@@ -176,6 +176,10 @@ typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; in
 static Cljc *eval_stack[EVAL_STACK_MAX];
 static int eval_sp;
 static char err_trace[1536];
+static const char *err_src_text;   /* retained main-script source */
+static const char *err_src_name;   /* its display name */
+static long long err_line = -1;    /* innermost located frame at raise */
+static const char *err_token;      /* offending symbol, when known */
 static ErrFrame *err_top;
 static jmp_buf err_jmp;
 static char err_msg[256];
@@ -196,6 +200,7 @@ __attribute__((noreturn, format(printf, 1, 2)))
 #endif
 static void cljc_error(const char *fmt, ...) {
     cur_exc = NULL;  /* message-style error */
+    /* err_token persists only when the caller set it just before */
     va_list ap; va_start(ap, fmt);
     vsnprintf(err_msg, sizeof err_msg, fmt, ap);
     va_end(ap);
@@ -412,6 +417,7 @@ static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
 
 static void trace_snapshot(void) {
     err_trace[0] = '\0';
+    err_line = -1;
     size_t off = 0;
     int shown = 0;
     for (int i = eval_sp - 1; i >= 0 && shown < 8; i--) {
@@ -426,6 +432,7 @@ static void trace_snapshot(void) {
                 line = (long long)lv->as.i;
         }
         int n;
+        if (line >= 0 && err_line < 0) err_line = line;
         if (line >= 0)
             n = snprintf(err_trace + off, sizeof err_trace - off,
                          "  at (%s ...) line %lld\n", head, line);
@@ -2148,7 +2155,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     }
                 }
             }
-            cljc_error("unable to resolve symbol: %s", name);
+            err_token = name;
+            cljc_error("I don't know what `%s` refers to.", name);
         }
         case CLJC_LIST: {
             /* Macro expansions built with lazy concat/map can carry LAZY
@@ -2681,19 +2689,100 @@ static void print(Cljc *v) {
     if (sb.data) { fwrite(sb.data, 1, sb.len, COUT); free(sb.data); }
 }
 
-/* Top-level (uncaught) error report. Resets the in-flight exception. */
+/* Levenshtein distance, capped — for "did you mean" suggestions. */
+static int lev(const char *a, const char *b, int cap) {
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la - lb > cap || lb - la > cap) return cap + 1;
+    int prev[64], cur[64];
+    if (lb >= 63) return cap + 1;
+    for (int j = 0; j <= lb; j++) prev[j] = j;
+    for (int i = 1; i <= la; i++) {
+        cur[0] = i;
+        int rowmin = cur[0];
+        for (int j = 1; j <= lb; j++) {
+            int c = prev[j - 1] + (a[i - 1] != b[j - 1]);
+            int d = (prev[j] < cur[j - 1] ? prev[j] : cur[j - 1]) + 1;
+            cur[j] = c < d ? c : d;
+            if (cur[j] < rowmin) rowmin = cur[j];
+        }
+        if (rowmin > cap) return cap + 1;
+        memcpy(prev, cur, sizeof(int) * (size_t)(lb + 1));
+    }
+    return prev[lb];
+}
+
+static const char *suggest(const char *token) {
+    if (!gc_n_root_envs) return NULL;
+    const char *best = NULL;
+    int bestd = 3;  /* accept distance <= 2 */
+    for (Binding *b = gc_root_envs[0]->bindings; b; b = b->next) {
+        if (strstr(b->name, "**") || !strncmp(b->name, "cljc/", 5)) continue;
+        int d = lev(token, b->name, 2);
+        if (d < bestd) { bestd = d; best = b->name; }
+    }
+    return best;
+}
+
+/* Top-level (uncaught) error report, Elm-style: header, message, the
+ * offending source line with a caret, a suggestion, then the trace. */
 static void print_error(void) {
-    fputs("error: ", CERR);
+    bool color = isatty(fileno(stderr));
+    const char *RED = color ? "\033[31;1m" : "";
+    const char *CYN = color ? "\033[36m" : "";
+    const char *YEL = color ? "\033[33m" : "";
+    const char *DIM = color ? "\033[2m" : "";
+    const char *OFF = color ? "\033[0m" : "";
+
+    fprintf(CERR, "%s-- ERROR ", RED);
+    int pad = 58 - (int)(err_src_name ? strlen(err_src_name) : 0);
+    for (int i = 0; i < pad; i++) fputc('-', CERR);
+    fprintf(CERR, " %s%s\n\n", err_src_name ? err_src_name : "", OFF);
+
     if (cur_exc) {
         SBuf sb = {0};
         print_to(&sb, cur_exc, true);
+        fputs("Uncaught exception: ", CERR);
         if (sb.data) { fwrite(sb.data, 1, sb.len, CERR); free(sb.data); }
+        fputc('\n', CERR);
         cur_exc = NULL;
     } else {
-        fputs(err_msg, CERR);
+        fprintf(CERR, "%s\n", err_msg);
     }
-    fputc('\n', CERR);
-    if (err_trace[0]) fputs(err_trace, CERR);
+
+    /* the offending source line, caret under the token when findable */
+    if (err_line > 0 && err_src_text) {
+        const char *p = err_src_text;
+        for (long long l = 1; l < err_line && p; l++) {
+            p = strchr(p, '\n');
+            if (p) p++;
+        }
+        if (p) {
+            const char *e = strchr(p, '\n');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            fprintf(CERR, "\n%s%4lld |%s ", CYN, err_line, OFF);
+            fwrite(p, 1, len, CERR);
+            fputc('\n', CERR);
+            if (err_token) {
+                const char *hit = strstr(p, err_token);
+                if (hit && (e == NULL || hit < e)) {
+                    fprintf(CERR, "     %s| ", CYN);
+                    for (const char *c = p; c < hit; c++)
+                        fputc(*c == '\t' ? '\t' : ' ', CERR);
+                    fprintf(CERR, "%s", RED);
+                    for (size_t i = 0; i < strlen(err_token); i++) fputc('^', CERR);
+                    fprintf(CERR, "%s\n", OFF);
+                }
+            }
+        }
+    }
+
+    if (err_token) {
+        const char *s = suggest(err_token);
+        if (s) fprintf(CERR, "\n%sDid you mean %s`%s`%s?%s\n", YEL, OFF, s, YEL, OFF);
+        err_token = NULL;
+    }
+
+    if (err_trace[0]) fprintf(CERR, "\n%s%s%s", DIM, err_trace, OFF);
     err_top = NULL;  /* hygiene: no handler frames survive a top-level unwind */
 }
 
@@ -5508,7 +5597,7 @@ void cljc_print(Cljc *v) { print(v); }
 
 /* Script mode: read entire stream, eval every form, print nothing but what
  * the script prints itself (babashka-style). Errors abort with status 1. */
-static int run_stream(CljcEnv *env, FILE *f) {
+static int run_stream(CljcEnv *env, FILE *f, const char *name) {
     /* Slurp — scripts are small; streams (stdin) can't be sized up front. */
     size_t cap = 1 << 16, len = 0;
     /* volatile: src must survive the longjmp from cljc_error intact. */
@@ -5533,6 +5622,7 @@ static int run_stream(CljcEnv *env, FILE *f) {
         return 1;
     }
     rd_line = 1;   /* track source lines for error traces */
+    err_src_text = src;            /* retained for error display */
     const char *p = src;
     while (*p) {
         skip_ws(&p);
@@ -5542,7 +5632,7 @@ static int run_stream(CljcEnv *env, FILE *f) {
         eval(env, form);
     }
     rd_line = 0;
-    free(src);
+    /* src intentionally retained: error rendering may need it later */
     return 0;
 }
 
@@ -5803,11 +5893,12 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         FILE *f = fopen(argv[1], "r");
         if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
-        int rc = run_stream(env, f);
+        err_src_name = argv[1];
+        int rc = run_stream(env, f, argv[1]);
         fclose(f);
         return rc;
     }
-    if (!isatty(0)) return run_stream(env, stdin);
+    if (!isatty(0)) { err_src_name = "<stdin>"; return run_stream(env, stdin, "<stdin>"); }
     return run_repl(env);
 }
 #endif

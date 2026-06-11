@@ -363,7 +363,25 @@ required by conservative stack scanning, same as Boehm GC).
     load-file searches *load-path* after the literal path; --version
     flag; install.sh (defaults to ~/.local, tests before installing).
     Verified end-to-end from a scratch prefix + unrelated cwd.
-30. **Performance later, maybe**: args-as-array calling convention,
+30. ~~Elm-style errors~~ ✅ done 2026-06-11 — print_error renders:
+    red header bar with the source file, plain-language message
+    (unresolved symbols: "I don't know what `x` refers to."), the
+    offending source line (retained script text + err_line from the
+    innermost located frame) with a caret under the token (found by
+    substring search in the line), "Did you mean `y`?" via capped
+    levenshtein over live root bindings (so user defs suggest too),
+    and the dimmed trace. ANSI color only on ttys. load-file'd code
+    gets traces but not source excerpts (its text isn't retained) —
+    noted for later.
+31. NEXT QUEUE (user-requested, in order): (a) enhanced REPL —
+    readline-style editing, history, completion (bindings table),
+    syntax highlighting, multiline; consider linenoise-style inline
+    editor vs optional -lreadline. (b) CLERK CLONE — literate
+    notebooks from .clj files; PRIOR ART to study first:
+    ~/build/s7 (their s7 version), ~/projects/clerk-janet,
+    ~/projects/clerk-racket, and the plaque skill (their Python one).
+    (c) numerics/dates/fork-pmap menu from the bb-gap analysis.
+32. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

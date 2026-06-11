@@ -45,7 +45,7 @@ roots. `cljc --version` tells you what you have.
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`satisfies?` (dispatch on `type` keywords), `defrecord` (tagged maps), `binding`/`with-redefs` |
 | **Errors** | `throw` any value, `try`/`catch`/`finally` (finally runs on every exit path), `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable |
 | **Regex** | self-contained backtracking engine: `\d \w \s`, classes, groups, `(?:…)`, alternation, lazy quantifiers; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (with `$1` refs) `re-split`; guarded against catastrophic backtracking |
-| **Errors** (DX) | stack traces with line numbers — `error: division by zero / at (inner ...) line 3 / at (outer ...) line 4` |
+| **Errors** (DX) | Elm-style: header + message + offending source line with caret + `Did you mean \`count\`?` suggestions (levenshtein over live bindings) + dimmed trace, colorized on ttys |
 | **Transducers** | `map-xf`/`filter-xf`/`take-xf`/`mapcat-xf`/…, `transduce`, `eduction` — compose over infinite seqs with `reduced` early-exit |
 | **Library** | ~150 core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops (`str/split str/join str/trim …`), `format`, `slurp`/`spit`, `Math/*`, `sort`/`compare`, `read-string`/`eval` |
 | **Memory** | mark-and-sweep GC over pooled cells, conservative C-stack scanning (interpreter C code needs no root registration), structural sharing throughout |

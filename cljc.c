@@ -4500,6 +4500,8 @@ static const char *PRELUDE =
     "        :else       `(mapcat (fn [~k] (for ~more ~body)) ~v)))))\n"
     /* batch 5-lite */
     "(defmacro comment [& _] nil)\n"
+    "(defmacro declare [& names]\n"
+    "  `(do ~@(map (fn [n] `(def ~n nil)) names)))\n"
     "(defn boolean [x] (if x true false))\n"
     "(defn true? [x] (= x true))\n"
     "(defn false? [x] (= x false))\n"

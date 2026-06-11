@@ -5,6 +5,10 @@
 ;; (0 is NULL). Compiled glue is cached in /tmp by content hash, so the
 ;; first load compiles once and later loads just dlopen.
 
+(declare getpid getppid getenv setenv unsetenv system
+         mkdir rmdir unlink rename chdir access get_current_dir_name
+         sleep usleep time)
+
 (ffi/define
   [;; process & environment
    [:int getpid []]

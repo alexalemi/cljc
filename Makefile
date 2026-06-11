@@ -23,3 +23,7 @@ clean:
 	rm -f cljc
 
 .PHONY: run test clean example
+
+lint:
+	clj-kondo --lint json.clj libc.clj test.clj examples 2>/dev/null || true
+	@echo "(name files .cljc if they use #?(:cljc ...) reader conditionals)"

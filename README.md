@@ -55,6 +55,21 @@ evaluation results come back as `value`, `println` output as `out`
 messages, errors as `err`. Definitions persist across evals. One client
 at a time, loopback only.
 
+## Tooling
+
+- **Linting**: ships a `.clj-kondo/config.edn` tuned for the dialect — flat
+  pseudo-namespaces, slash-`defn`s, throw-anything. `clj-kondo --lint your.clj`
+  works out of the box in this repo; name files `.cljc` if they use
+  `#?(:cljc …)` reader conditionals (kondo gates those on the extension —
+  and the dialect wearing the `.cljc` extension is only right). Real mistakes (unresolved symbols, unused
+  bindings) still surface. For runtime-defined vars (`ffi/define`), add a
+  `(declare …)` like `libc.clj` does.
+- **Tests**: `(load-file "test.clj")` gives a `clojure.test`-compatible
+  runner — `deftest`, `is` (with `thrown?`), `testing`, `run-tests`.
+- **Editor/LSP**: `./cljc --nrepl` for eval (Conjure/CIDER/Calva);
+  clojure-lsp's static features (navigation, completion) work on cljc files
+  since it reads the same clj-kondo analysis — point it at this repo's config.
+
 ## Embedding
 
 The model is stb-style: define `CLJC_NO_MAIN` and `#include "cljc.c"` into one

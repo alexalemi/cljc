@@ -1,0 +1,19 @@
+;; clj-kondo config for the cljc dialect (github.com/alexalemi/cljc)
+;;
+;; cljc differs from Clojure in ways a static analyzer must be told about:
+;; - no namespaces: str/trim, json/parse, Math/sqrt are flat globals
+;; - defn can define slash-names directly (:syntax off; cljc itself
+;;   reports real syntax errors at load)
+;; - (throw x) accepts any value, not just Throwables
+;; - reader conditionals work in .clj files (#?(:cljc ...))
+;; - ffi/define and ffi/defstruct create vars at runtime — (declare ...)
+;;   them for the linter, as libc.clj does
+{:linters
+ {:unresolved-namespace {:exclude [str json ffi set cljc Math]}
+  :syntax {:level :off}
+  :type-mismatch {:level :off}          ; (throw 42) is legal cljc
+  :reader-conditionals {:level :off}
+  :unresolved-symbol
+  {:exclude [re-replace re-split ffi-load* sh gc load-file
+             transient persistent! conj! assoc!
+             deftest is testing run-tests thrown?]}}}

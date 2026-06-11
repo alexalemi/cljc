@@ -812,4 +812,26 @@
 (assert= [] *args*)                                  ; no args to the test run
 (assert= "abc" (str/join "" (map (fn [c] c) (seq "abc"))))
 
+; ── JIT: numeric functions compiled to native C ──
+(load-file "jit.clj")
+(jit/defn jit-fib [n] (if (< n 2) n (+ (jit-fib (- n 1)) (jit-fib (- n 2)))))
+(def jit-interp-answer (jit-fib 20))
+(jit/compile! 'jit-fib)
+(assert= jit-interp-answer (jit-fib 20))            ; identical semantics
+(assert= 6765 (jit-fib 20))
+(jit/defn jit-sum [n] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc i)) acc)))
+(jit/compile! 'jit-sum)
+(assert= 4999950000 (jit-sum 100000))
+(jit/defn jit-gcd [a b] (if (zero? b) a (jit-gcd b (mod a b))))
+(jit/compile! 'jit-gcd)
+(assert= 6 (jit-gcd 48 18))
+(jit/defn jit-lets [x] (let [a (* x 2) b (+ a 1)] (- b x)))
+(jit/compile! 'jit-lets)
+(assert= 11 (jit-lets 10))
+(assert= :arity (try (jit-fib 1 2) (catch Exception e :arity)))
+(assert= :not-int (try (jit-fib 2.5) (catch Exception e :not-int)))
+(jit/defn jit-no [s] (str s "!"))                   ; outside the subset
+(assert= :unsupported (try (jit/compile! 'jit-no) (catch Exception e :unsupported)))
+(assert= "still works!" (jit-no "still works"))     ; interpreted version intact
+
 (println "tests complete")

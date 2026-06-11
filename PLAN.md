@@ -259,7 +259,19 @@ required by conservative stack scanning, same as Boehm GC).
     FUTURE TIER (plausible, unbuilt): per-function Clojure->C JIT via
     the existing FFI pipeline (generate C → cc → dlopen → mutate root
     binding) — would attack the eval-dispatch wall day5 ended at.
-21. **Performance later, maybe**: args-as-array calling convention,
+21. ~~Per-function JIT (tier 2)~~ ✅ done 2026-06-11 — jit.clj: a
+    ~150-line compiler IN CLJC for the numeric subset (if/let/loop/
+    recur/self-recursion/int ops), emitting unboxed long long C;
+    fn-level recur compiles to the enclosing for(;;); self-calls are
+    direct C calls. Wrapper unboxes via the FFI vtable, arity- and
+    type-checked. jit/defn records source; jit/compile! generates,
+    builds through cljc/ffi-build (content-cached => warm compile is
+    a dlopen), and rebinds the root name — callers switch live.
+    fib(32) 1.24s -> 6ms; 100M-iter loop 26ms. Subset limits: ints
+    only, no calls to other fns, no collections. Next tier if wanted:
+    boxed Cljc* codegen through the api vtable for general functions
+    (smaller win, broader coverage), or whole-program AOT.
+22. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

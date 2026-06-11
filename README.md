@@ -55,6 +55,23 @@ evaluation results come back as `value`, `println` output as `out`
 messages, errors as `err`. Definitions persist across evals. One client
 at a time, loopback only.
 
+## JIT: compile hot functions to native C
+
+```clojure
+(load-file "jit.clj")
+(jit/defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(jit/compile! 'fib)    ; generate C → cc → dlopen → swap the binding, live
+(fib 32)               ; 1.24 s interpreted → 6 ms native (faster than bb/JVM)
+```
+
+`jit.clj` (~150 lines of cljc) compiles a numeric subset — `if`, `let`,
+`loop`/`recur`, self-recursion, integer arithmetic/comparisons — to unboxed
+`long long` C through the same generate→`cc`→`dlopen`→rebind pipeline as the
+FFI. Compiled modules are content-cached, so warm compiles are a `dlopen`.
+Outside the subset, `jit/compile!` errors cleanly and the interpreted
+version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
+630 ms — it's real machine code.
+
 ## Standalone binaries
 
 ```sh

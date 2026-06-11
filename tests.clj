@@ -782,4 +782,26 @@
 (assert= :bad (try (json/parse "{bad}") (catch Exception e :bad)))
 (assert= "a\bb" (str "a" "\b" "b"))                  ; reader \b \f escapes
 
+; ── transient vectors ──
+(def tv-base (vec (range 100)))
+(def tv-done (persistent! (reduce conj! (transient tv-base) (range 100 200))))
+(assert= 200 (count tv-done))
+(assert= 150 (nth tv-done 150))
+(assert= 100 (count tv-base))                       ; original untouched
+(def tv-t (transient tv-base))
+(assoc! tv-t 50 :edited)
+(def tv-done2 (persistent! tv-t))
+(assert= :edited (nth tv-done2 50))
+(assert= 50 (nth tv-base 50))                       ; structural sharing intact
+(assert= :dead (try (conj! tv-t 1) (catch Exception e :dead)))
+(assert= :dead (try (assoc! tv-t 0 1) (catch Exception e :dead)))
+(assert= [0 1 2] (persistent! (conj! (conj! (conj! (transient []) 0) 1) 2)))
+(assert= 1002 (count (into [1 2] (range 1000))))    ; into fast path
+(assert= 5000 (count (persistent! (reduce conj! (transient []) (range 5000)))))
+(def tv-gc (transient (vec (range 64))))
+(conj! tv-gc :x)
+(gc)
+(assert= :x (nth tv-gc 64))                         ; transient survives GC
+(assert= 65 (count (persistent! tv-gc)))
+
 (println "tests complete")

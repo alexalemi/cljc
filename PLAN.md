@@ -239,7 +239,19 @@ required by conservative stack scanning, same as Boehm GC).
     path-copy memcpy (~15GB/25M iters). NEXT PERF LEVER IF NEEDED:
     transients (mutate-in-place vectors/maps behind transient!/
     persistent!, Clojure's own answer for hot assoc loops).
-19. **Performance later, maybe**: args-as-array calling convention,
+19. ~~Transient vectors~~ ✅ done 2026-06-11 — CLJC_TVEC shares the
+    persistent trie; node ownership by monotonic edit id (never reused,
+    so pool-recycled cells can't forge ownership); a node is copied at
+    most once per transient then mutated in place; tail is a private
+    32-cap chunk mutated directly (conj!/assoc! in the tail allocate
+    NOTHING). persistent! invalidates the transient and trims the tail.
+    transient/persistent!/conj!/assoc! + nth/count on transients; into
+    uses the fast path for vectors. Day5: 12.5s -> 9.46s (-24%); 1M
+    build 206 -> 81ms (2.5x). Honest residual: day5 is now EVAL-bound
+    (~12 interpreted ops/iter) — the remaining lever is a bytecode VM.
+    Map transients (assoc!/dissoc! on HAMTs) not yet — same edit-id
+    scheme applies when wanted.
+20. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

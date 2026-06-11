@@ -30,7 +30,7 @@ make test       # 380+ assertions, run twice: normal + GC-stress mode
 | Area | Coverage |
 |---|---|
 | **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need |
-| **Data** | nil, bools, int64, doubles, strings (with escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, amortized O(1) `conj`), **persistent maps** (HAMT), **persistent sets**, atoms |
+| **Data** | nil, bools, int64, doubles, strings (with escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, amortized O(1) `conj`, transients: `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT), **persistent sets**, atoms |
 | **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote` |
 | **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets); `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` (with `:when`/`:let`) `doseq` `dotimes` `doto` `letfn` … all written in cljc itself (the prelude) |
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`) in `let`/`fn` params |

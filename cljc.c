@@ -49,6 +49,7 @@ typedef enum {
     CLJC_NATIVE,    /* C function */
     CLJC_ATOM,      /* mutable box: (atom x), @a, swap!, reset! */
     CLJC_LAZY,      /* lazy seq: thunk forced once, result cached */
+    CLJC_TVEC,      /* transient vector: in-place edits, finalized by persistent! */
     CLJC_SET,       /* persistent set: a HAMT keyed by its elements (uses as.map) */
     CLJC_HNODE,     /* internal: HAMT tree node — never user-visible */
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
@@ -77,12 +78,17 @@ struct Cljc {
         /* Persistent vector: 32-way position trie + tail of the last ≤32
          * elements. tail is owned by THIS cell (copied per derived vector);
          * tree nodes are shared CLJC_HNODE cells. root NULL → all in tail. */
-        struct { Cljc *root; Cljc **tail; uint32_t count; uint8_t shift; uint8_t taillen; } vec;
+        /* vec doubles as the transient view (CLJC_TVEC): edit_id marks tree
+         * nodes this transient owns (may mutate); alive flips off at
+         * persistent!. Transient tails are full 32-cap chunk buffers. */
+        struct { Cljc *root; Cljc **tail; uint32_t count; uint32_t edit_id;
+                 uint8_t shift; uint8_t taillen; bool alive; } vec;
         /* HAMT persistent map: root tree node (NULL when empty) + entry count */
         struct { Cljc *root; size_t count; } map;
         /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
          * subnode. Collision nodes hold same-hash entries linearly. */
-        struct { Cljc **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids; bool collision; } hnode;
+        struct { Cljc **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
+                 bool collision; uint32_t edit_id; } hnode;
         /* arities: list of (params-list . body-list) pairs; dispatch by argc */
         struct { Cljc *arities; CljcEnv *env; bool is_macro; } fn;
         CljcNativeFn native;
@@ -137,6 +143,7 @@ static void tail_free(Cljc **p, uint8_t n);
 static size_t vec_len(Cljc *v);
 static Cljc *vec_nth(Cljc *v, size_t i);
 static char *as_str(Cljc *v, const char *what);
+static int64_t as_int(Cljc *v, const char *what);
 static Cljc *NIL, *TRUE, *FALSE;
 
 /* ───── Error handling ───────────────────────────────────────────────── */
@@ -385,6 +392,7 @@ static void gc_mark(Cljc *v) {
                 v = v->as.cons.tail;      /* iterate tails: lists can be huge */
                 break;
             case CLJC_VECTOR:
+            case CLJC_TVEC:
                 for (size_t i = 0; i < v->as.vec.taillen; i++) gc_mark(v->as.vec.tail[i]);
                 v = v->as.vec.root;  /* NULL-safe */
                 break;
@@ -488,6 +496,7 @@ static void gc_collect(void) {
                 switch (c->tag) {
                     case CLJC_STRING: free(c->as.str); break;
                     case CLJC_VECTOR: tail_free(c->as.vec.tail, c->as.vec.taillen); break;
+                    case CLJC_TVEC:   chunk32_free(c->as.vec.tail); break;
                     case CLJC_HNODE:
                         if (c->as.hnode.nkids == 32) chunk32_free(c->as.hnode.kids);
                         else free(c->as.hnode.kids);
@@ -1056,6 +1065,128 @@ static Cljc *vec_assoc_idx(Cljc *v, size_t i, Cljc *x) {
     Cljc *newroot = vec_doassoc(v->as.vec.shift, v->as.vec.root, i, x);
     return vec_cell(newroot, v->as.vec.shift, cnt,
                     v->as.vec.tail, v->as.vec.taillen, NULL);
+}
+
+/* ── transient vectors: in-place edits behind transient/persistent! ──
+ * Node ownership by monotonically increasing edit id (never reused, so a
+ * pool-recycled cell can't inherit ownership of someone else's nodes). A
+ * node is copied at most once per transient, then mutated freely. */
+
+static uint32_t tvec_next_edit = 1;
+
+static Cljc *tvec_ensure_owned(Cljc *node, uint32_t id) {
+    if (node->as.hnode.edit_id == id) return node;
+    Cljc *copy = vec_node32();
+    memcpy(copy->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 32);
+    copy->as.hnode.edit_id = id;
+    return copy;
+}
+
+static Cljc *as_tvec(Cljc *v, const char *what) {
+    if (v == NIL || v->tag != CLJC_TVEC) cljc_error("%s: not a transient", what);
+    if (!v->as.vec.alive) cljc_error("%s: transient used after persistent!", what);
+    return v;
+}
+
+static Cljc *prim_transient(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *v = argv[0];
+    if (v == NIL || v->tag != CLJC_VECTOR)
+        cljc_error("transient: only vectors are supported (yet)");
+    Cljc *t = alloc(CLJC_TVEC);
+    t->as.vec.tail = chunk32_alloc();   /* private, mutable, full capacity */
+    memset(t->as.vec.tail, 0, sizeof(Cljc *) * 32);
+    memcpy(t->as.vec.tail, v->as.vec.tail, sizeof(Cljc *) * v->as.vec.taillen);
+    t->as.vec.root = v->as.vec.root;    /* shared until first owned copy */
+    t->as.vec.count = v->as.vec.count;
+    t->as.vec.shift = v->as.vec.shift;
+    t->as.vec.taillen = v->as.vec.taillen;
+    t->as.vec.edit_id = tvec_next_edit++;
+    t->as.vec.alive = true;
+    if (tvec_next_edit == 0) cljc_error("transient: edit ids exhausted");
+    return t;
+}
+
+static Cljc *prim_persistent_bang(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *t = as_tvec(argv[0], "persistent!");
+    t->as.vec.alive = false;            /* invalidate further edits */
+    return vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
+                    t->as.vec.tail, t->as.vec.taillen, NULL);
+}
+
+static Cljc *tvec_pushtail(int level, Cljc *parent, Cljc *tailnode,
+                           uint32_t cnt, uint32_t id) {
+    Cljc *p = tvec_ensure_owned(parent, id);
+    size_t subidx = ((cnt - 1) >> level) & 31;
+    if (level == 5) {
+        p->as.hnode.kids[subidx] = tailnode;
+    } else {
+        Cljc *child = p->as.hnode.kids[subidx];
+        p->as.hnode.kids[subidx] = child
+            ? tvec_pushtail(level - 5, child, tailnode, cnt, id)
+            : vec_newpath(level - 5, tailnode);
+    }
+    return p;
+}
+
+static Cljc *prim_conj_bang(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *t = as_tvec(argv[0], "conj!");
+    Cljc *x = argv[1];
+    uint32_t cnt = t->as.vec.count;
+    if (cnt - vec_tailoff(t) < 32) {            /* in-place: zero alloc */
+        t->as.vec.tail[t->as.vec.taillen++] = x;
+        t->as.vec.count = cnt + 1;
+        return t;
+    }
+    Cljc *leaf = vec_node32();                  /* tail becomes an owned leaf */
+    memcpy(leaf->as.hnode.kids, t->as.vec.tail, sizeof(Cljc *) * 32);
+    leaf->as.hnode.edit_id = t->as.vec.edit_id;
+    if (t->as.vec.root == NULL) {
+        t->as.vec.root = leaf;
+        t->as.vec.shift = 0;
+    } else if ((cnt >> 5) > (1u << t->as.vec.shift)) {
+        Cljc *path = vec_newpath(t->as.vec.shift, leaf);
+        Cljc *newroot = vec_node32();
+        newroot->as.hnode.edit_id = t->as.vec.edit_id;
+        newroot->as.hnode.kids[0] = t->as.vec.root;
+        newroot->as.hnode.kids[1] = path;
+        t->as.vec.root = newroot;
+        t->as.vec.shift = (uint8_t)(t->as.vec.shift + 5);
+    } else {
+        t->as.vec.root = tvec_pushtail(t->as.vec.shift, t->as.vec.root,
+                                       leaf, cnt, t->as.vec.edit_id);
+    }
+    t->as.vec.tail[0] = x;                      /* reuse the tail buffer */
+    t->as.vec.taillen = 1;
+    t->as.vec.count = cnt + 1;
+    return t;
+}
+
+static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *t = as_tvec(argv[0], "assoc!");
+    size_t i = (size_t)as_int(argv[1], "assoc!");
+    Cljc *x = argv[2];
+    uint32_t cnt = t->as.vec.count;
+    if (i == cnt) { Cljc *cargs[2] = {t, x}; return prim_conj_bang(env, cargs, 2); }
+    if (i > cnt) cljc_error("assoc!: index out of bounds");
+    size_t off = vec_tailoff(t);
+    if (i >= off) {                              /* in-place: zero alloc */
+        t->as.vec.tail[i - off] = x;
+        return t;
+    }
+    uint32_t id = t->as.vec.edit_id;
+    Cljc *node = t->as.vec.root = tvec_ensure_owned(t->as.vec.root, id);
+    for (int level = t->as.vec.shift; level > 0; level -= 5) {
+        size_t sub = (i >> level) & 31;
+        Cljc *child = tvec_ensure_owned(node->as.hnode.kids[sub], id);
+        node->as.hnode.kids[sub] = child;        /* owned: safe to mutate */
+        node = child;
+    }
+    node->as.hnode.kids[i & 31] = x;
+    return t;
 }
 
 /* Build a vector from a C array (small n — entry pairs, literals). */
@@ -1743,7 +1874,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL:
         case CLJC_STRING: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
-        case CLJC_ATOM:
+        case CLJC_ATOM: case CLJC_TVEC:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
             return form;
         case CLJC_LAZY:
@@ -2248,6 +2379,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '}');
             break;
         }
+        case CLJC_TVEC:  sb_puts(sb, "#<transient-vector>"); break;
         case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
         case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
         case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
@@ -2510,7 +2642,8 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
     if (v == NIL) return mk_int(0);
     if (v->tag == CLJC_LIST || v->tag == CLJC_LAZY)
         return mk_int((int64_t)list_len(to_seq(v)));
-    if (v->tag == CLJC_VECTOR) return mk_int((int64_t)vec_len(v));
+    if (v->tag == CLJC_VECTOR || v->tag == CLJC_TVEC)
+        return mk_int((int64_t)vec_len(v));
     if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
         return mk_int((int64_t)v->as.map.count);
     if (v->tag == CLJC_STRING) return mk_int((int64_t)strlen(v->as.str));
@@ -2524,7 +2657,7 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
     int64_t n = as_int(argv[1], "nth");
     Cljc *not_found = nargs > 2
         ? argv[2] : NULL;
-    if (coll && coll->tag == CLJC_VECTOR) {
+    if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
     } else if (coll && coll->tag == CLJC_LIST) {
         for (Cljc *l = coll; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
@@ -4225,7 +4358,10 @@ static const char *PRELUDE =
     "    identity\n"
     "    (reduce (fn [f g] (fn [& args] (f (apply g args)))) fs)))\n"
     "(defn partial [f & pre] (fn [& args] (apply f (concat pre args))))\n"
-    "(defn into [to from] (reduce conj to from))\n"
+    "(defn into [to from]\n"
+    "  (if (vector? to)\n"
+    "    (persistent! (reduce conj! (transient to) (seq from)))\n"
+    "    (reduce conj to from)))\n"
     "(defn mapv [f coll] (apply vector (map f coll)))\n"
     "(defn filterv [f coll] (apply vector (filter f coll)))\n"
     "(defn repeat [n x] (map (constantly x) (range n)))\n"
@@ -4592,6 +4728,10 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "compare", prim_compare);
     cljc_define_native(e, "sort",    prim_sort);
     cljc_define_native(e, "vec",     prim_vec);
+    cljc_define_native(e, "transient",   prim_transient);
+    cljc_define_native(e, "persistent!", prim_persistent_bang);
+    cljc_define_native(e, "conj!",       prim_conj_bang);
+    cljc_define_native(e, "assoc!",      prim_assoc_bang);
     cljc_define_native(e, "name",    prim_name);
     cljc_define_native(e, "keyword", prim_keyword);
     cljc_define_native(e, "symbol",  prim_symbol);

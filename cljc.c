@@ -22,9 +22,11 @@
 #include <setjmp.h>
 #include <math.h>
 #include <time.h>
-#ifndef CLJC_NO_MAIN
-#include <unistd.h>  /* isatty — REPL vs script-mode detection */
-#endif
+#include <unistd.h>      /* isatty, close — REPL detection, tcp primitives */
+#include <sys/stat.h>    /* stat — file mtimes (clerk file watching) */
+#include <sys/socket.h>  /* tcp primitives (clerk notebook server) */
+#include <netinet/in.h>
+#include <poll.h>
 
 #define CLJC_VERSION "0.1.0"
 #ifndef CLJC_SHAREDIR
@@ -4392,6 +4394,18 @@ STR_PRED(starts_with, strncmp(s, sub, bl) == 0)
 STR_PRED(ends_with,   bl <= sl && strcmp(s + sl - bl, sub) == 0)
 STR_PRED(includes,    strstr(s, sub) != NULL)
 
+/* (str/index-of s sub [from]) → first index at/after from, or nil. */
+static Cljc *prim_index_of(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    char *s = as_str(argv[0], "str/index-of");
+    char *sub = as_str(argv[1], "str/index-of");
+    size_t sl = strlen(s);
+    size_t from = nargs > 2 ? (size_t)as_int(argv[2], "str/index-of") : 0;
+    if (from > sl) return NIL;
+    char *hit = strstr(s + from, sub);
+    return hit ? mk_int((int64_t)(hit - s)) : NIL;
+}
+
 static Cljc *prim_blank_p(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     Cljc *v = argv[0];
@@ -4436,6 +4450,129 @@ static Cljc *prim_spit(CljcEnv *env, Cljc **argv, int nargs) {
     free(sb.data);
     fclose(f);
     return NIL;
+}
+
+/* (cljc/mtime* path) → file mtime in milliseconds, or nil if missing.
+ * Millisecond resolution so the clerk file watcher sees rapid saves. */
+static Cljc *prim_mtime(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    char *path = as_str(argv[0], "cljc/mtime*");
+    struct stat st;
+    if (stat(path, &st) != 0) return NIL;
+    return mk_int((int64_t)st.st_mtim.tv_sec * 1000
+                  + st.st_mtim.tv_nsec / 1000000);
+}
+
+/* ── TCP primitives ──
+ * Generic loopback TCP for clj-land servers (the clerk notebook uses them;
+ * the nREPL server predates them and keeps its own loop). File descriptors
+ * travel as plain ints, mirroring the FFI's pointers-as-ints convention. */
+
+static Cljc *prim_tcp_listen(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    int port = (int)as_int(argv[0], "tcp/listen");
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) cljc_error("tcp/listen: cannot create socket");
+    int one = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(srv, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        close(srv);
+        cljc_error("tcp/listen: cannot bind 127.0.0.1:%d (port in use?)", port);
+    }
+    if (listen(srv, 16) < 0) { close(srv); cljc_error("tcp/listen: listen failed"); }
+    return mk_int(srv);
+}
+
+/* (tcp/accept srv timeout-ms) → client fd, or nil on timeout.
+ * The timeout makes a single-threaded serve loop possible: each expiry is
+ * a tick the caller can spend polling file mtimes. */
+static Cljc *prim_tcp_accept(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    int srv = (int)as_int(argv[0], "tcp/accept");
+    int timeout = nargs > 1 ? (int)as_int(argv[1], "tcp/accept") : -1;
+    struct pollfd p = { .fd = srv, .events = POLLIN };
+    if (poll(&p, 1, timeout) <= 0) return NIL;
+    int fd = accept(srv, NULL, NULL);
+    return fd < 0 ? NIL : mk_int(fd);
+}
+
+/* (tcp/recv fd) → string from one read (≤64K), or nil on EOF/error. */
+static Cljc *prim_tcp_recv(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    int fd = (int)as_int(argv[0], "tcp/recv");
+    char buf[65536];
+    ssize_t n = recv(fd, buf, sizeof buf, 0);
+    if (n <= 0) return NIL;
+    return mk_str(buf, (size_t)n);
+}
+
+/* (tcp/send fd s) → true if fully sent, false on a dead peer.
+ * MSG_NOSIGNAL: a browser closing an SSE stream must not SIGPIPE-kill us. */
+static Cljc *prim_tcp_send(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    int fd = (int)as_int(argv[0], "tcp/send");
+    Cljc *v = argv[1];
+    SBuf sb = {0};
+    print_to(&sb, v, false);
+    const char *p = sb.data ? sb.data : "";
+    size_t left = sb.len;
+    while (left > 0) {
+        ssize_t n = send(fd, p, left, MSG_NOSIGNAL);
+        if (n <= 0) { free(sb.data); return FALSE; }
+        p += n;
+        left -= (size_t)n;
+    }
+    free(sb.data);
+    return TRUE;
+}
+
+static Cljc *prim_tcp_close(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    close((int)as_int(argv[0], "tcp/close"));
+    return NIL;
+}
+
+/* ── with-out-str ──
+ * (cljc/with-out-str* thunk) → everything the thunk printed, as a string.
+ * Swaps the interpreter output stream for a memstream around the call; an
+ * ErrFrame restores the stream before re-raising if the thunk throws. */
+static Cljc *prim_with_out_str(CljcEnv *env, Cljc **argv, int nargs) {
+    Cljc *f = argv[0];
+    /* volatile: the memstream machinery updates buf on every write, and we
+     * read it back after a longjmp into this frame. */
+    char *volatile buf = NULL;
+    size_t blen = 0;
+    FILE *ms = open_memstream((char **)&buf, &blen);
+    if (!ms) cljc_error("with-out-str: out of memory");
+    FILE *saved = cljc_out;
+    cljc_out = ms;
+    ErrFrame frame;
+    frame.prev = err_top;
+    frame.vsp_save = vsp;
+    frame.esp_save = eval_sp;
+    err_top = &frame;
+    if (setjmp(frame.jb) == 0) {
+        apply(env, f, vstack + vsp, 0);
+        err_top = frame.prev;
+    } else {                       /* thunk threw: restore stream, re-raise */
+        err_top = frame.prev;
+        vsp = frame.vsp_save;
+        eval_sp = frame.esp_save;
+        cljc_out = saved;
+        fclose(ms);
+        free((char *)buf);
+        cljc_raise();
+    }
+    cljc_out = saved;
+    fclose(ms);                    /* flush: buf/blen now final */
+    Cljc *r = mk_str(buf ? (char *)buf : "", blen);
+    free((char *)buf);
+    return r;
 }
 
 /* ── printing variants ── */
@@ -5031,6 +5168,8 @@ static const char *PRELUDE =
     "(def volatile! atom)\n"
     "(def vreset! reset!)\n"
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
+    "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
+    "(defn sequential? [x] (or (list? x) (vector? x) (seq? x)))\n"
     "(def *load-path*\n"
     "  (vec (concat [\".\" \"vendor\"]\n"
     "               (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
@@ -5314,6 +5453,13 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "subs",    prim_subs);
     cljc_define_native(e, "slurp",   prim_slurp);
     cljc_define_native(e, "spit",    prim_spit);
+    cljc_define_native(e, "cljc/mtime*", prim_mtime);
+    cljc_define_native(e, "tcp/listen", prim_tcp_listen);
+    cljc_define_native(e, "tcp/accept", prim_tcp_accept);
+    cljc_define_native(e, "tcp/recv",   prim_tcp_recv);
+    cljc_define_native(e, "tcp/send",   prim_tcp_send);
+    cljc_define_native(e, "tcp/close",  prim_tcp_close);
+    cljc_define_native(e, "cljc/with-out-str*", prim_with_out_str);
     cljc_define_native(e, "pr",      prim_pr);
     cljc_define_native(e, "prn",     prim_prn);
     cljc_define_native(e, "print",   prim_print);
@@ -5324,6 +5470,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "str/starts-with?", prim_starts_with);
     cljc_define_native(e, "str/ends-with?",   prim_ends_with);
     cljc_define_native(e, "str/includes?",    prim_includes);
+    cljc_define_native(e, "str/index-of",     prim_index_of);
     cljc_define_native(e, "str/blank?",       prim_blank_p);
     cljc_eval_string(e, PRELUDE);
     /* Lazy core: shadows the eager natives so pipelines compose lazily.
@@ -6256,31 +6403,172 @@ static int nrepl_server(CljcEnv *env, int port) {
     }
 }
 
+/* ───── subcommands ──────────────────────────────────────────────────── */
+
+static void usage(FILE *f) {
+    fputs(
+        "cljc " CLJC_VERSION " — a small Clojure in C\n"
+        "\n"
+        "usage: cljc [subcommand] [args]\n"
+        "\n"
+        "  cljc                       interactive REPL (piped stdin: run it)\n"
+        "  cljc <file.clj> [args]     run a script (args land in *args*)\n"
+        "\n"
+        "subcommands:\n"
+        "  run <file> [args]          run a script (explicit form)\n"
+        "  eval <expr...>             evaluate, print the last value (alias -e)\n"
+        "  repl                       interactive REPL\n"
+        "  nrepl [port]               nREPL server for editors (default 7888)\n"
+        "  notebook <file> [port]     live literate notebook (default 7878)\n"
+        "  notebook <file> -o <html>  static notebook build\n"
+        "  test [files...]            load files, run deftests, exit 1 on failure\n"
+        "  lint [files...]            reader syntax check, full error rendering\n"
+        "  bundle <file> <out>        script + runtime → one native binary\n"
+        "  version                    print version\n"
+        "  help                       this text\n",
+        f);
+}
+
+static void set_args(CljcEnv *env, int argc, char **argv, int from) {
+    Cljc *as = mk_empty_vec();
+    for (int i = from; i < argc; i++)
+        as = vec_conj1(as, mk_str(argv[i], strlen(argv[i])));
+    env_define_root(env, intern("*args*", 6), as);
+}
+
+/* Run an internal clj program string. Errors render and exit 1; with
+ * truthy_exit, a falsy final value also exits 1 (e.g. run-tests). */
+static int run_subprogram(CljcEnv *env, const char *src, bool truthy_exit) {
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; return 1; }
+    const char *p = src;
+    Cljc *volatile last = TRUE;
+    while (*p) {
+        skip_ws(&p);
+        if (!*p) break;
+        Cljc *form = read_form(&p);
+        if (!form) break;
+        last = eval(env, form);
+    }
+    return (truthy_exit && (last == NIL || last == FALSE)) ? 1 : 0;
+}
+
+/* `cljc lint`: reader-level syntax check, Elm-style errors with carets. */
+static int lint_file(CljcEnv *env, const char *path) {
+    (void)env;
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "lint: cannot open %s\n", path); return 1; }
+    size_t cap = 1 << 16, len = 0, n;
+    char *src = malloc(cap);
+    if (!src) { fclose(f); return 1; }
+    while ((n = fread(src + len, 1, cap - len - 1, f)) > 0) {
+        len += n;
+        if (len + 1 >= cap) { cap *= 2; src = realloc(src, cap); if (!src) { fclose(f); return 1; } }
+    }
+    src[len] = '\0';
+    fclose(f);
+    err_src_name = path;
+    err_src_text = src;             /* retained: error rendering may use it */
+    rd_line = 1;
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; rd_line = 0; return 1; }
+    const char *p = src;
+    while (*p) {
+        skip_ws(&p);
+        if (!*p) break;
+        if (!read_form(&p)) break;
+    }
+    rd_line = 0;
+    return 0;
+}
+
+static int run_script(CljcEnv *env, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
+    err_src_name = path;
+    int rc = run_stream(env, f, path);
+    fclose(f);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     cljc_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
     CljcEnv *env = cljc_new_env();
+    const char *cmd = argc > 1 ? argv[1] : NULL;
 
-    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+    if (!cmd) {
+        set_args(env, argc, argv, 2);
+        if (!isatty(0)) { err_src_name = "<stdin>"; return run_stream(env, stdin, "<stdin>"); }
+        return run_repl(env);
+    }
+
+    /* Exact subcommand names win; `cljc run <file>` is the escape hatch
+     * for a script file that happens to be named like one. */
+    if (!strcmp(cmd, "help") || !strcmp(cmd, "--help") || !strcmp(cmd, "-h")) {
+        usage(stdout);
+        return 0;
+    }
+    if (!strcmp(cmd, "version") || !strcmp(cmd, "--version")) {
         printf("cljc %s\n", CLJC_VERSION);
         return 0;
     }
-    if (argc > 1 && strcmp(argv[1], "--nrepl") == 0)
+    if (!strcmp(cmd, "repl")) {
+        set_args(env, argc, argv, 2);
+        return run_repl(env);
+    }
+    if (!strcmp(cmd, "nrepl") || !strcmp(cmd, "--nrepl"))
         return nrepl_server(env, argc > 2 ? atoi(argv[2]) : 7888);
-    {   /* *args*: arguments after the script path, as a vector */
-        Cljc *as = mk_empty_vec();
-        for (int i = 2; i < argc; i++)
-            as = vec_conj1(as, mk_str(argv[i], strlen(argv[i])));
-        env_define_root(env, intern("*args*", 6), as);
+    if (!strcmp(cmd, "run")) {
+        if (argc < 3) { fputs("usage: cljc run <file.clj> [args]\n", stderr); return 1; }
+        set_args(env, argc, argv, 3);
+        return run_script(env, argv[2]);
     }
-    if (argc > 1) {
-        FILE *f = fopen(argv[1], "r");
-        if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
-        err_src_name = argv[1];
-        int rc = run_stream(env, f, argv[1]);
-        fclose(f);
-        return rc;
+    if (!strcmp(cmd, "eval") || !strcmp(cmd, "-e")) {
+        if (argc < 3) { fputs("usage: cljc eval <expr...>\n", stderr); return 1; }
+        set_args(env, argc, argv, 3);
+        if (setjmp(err_jmp) != 0) { print_error(); return 1; }
+        Cljc *volatile last = NIL;
+        for (int i = 2; i < argc; i++) {
+            const char *p = argv[i];
+            while (*p) {
+                skip_ws(&p);
+                if (!*p) break;
+                Cljc *form = read_form(&p);
+                if (!form) break;
+                last = eval(env, form);
+            }
+        }
+        if (last != NIL) { print(last); fputc('\n', stdout); }
+        return 0;
     }
-    if (!isatty(0)) { err_src_name = "<stdin>"; return run_stream(env, stdin, "<stdin>"); }
-    return run_repl(env);
+    if (!strcmp(cmd, "notebook") || !strcmp(cmd, "clerk")) {
+        set_args(env, argc, argv, 2);
+        return run_subprogram(env, "(load-file \"clerk.clj\") (clerk/main)", false);
+    }
+    if (!strcmp(cmd, "test")) {
+        set_args(env, argc, argv, 2);
+        return run_subprogram(env,
+            "(load-file \"test.clj\")"
+            "(doseq [f *args*] (load-file f))"
+            "(run-tests)", true);
+    }
+    if (!strcmp(cmd, "lint")) {
+        if (argc < 3) { fputs("usage: cljc lint <files...>\n", stderr); return 1; }
+        int bad = 0;
+        for (int i = 2; i < argc; i++) bad += lint_file(env, argv[i]);
+        if (!bad) printf("%d file%s, no reader errors\n", argc - 2, argc == 3 ? "" : "s");
+        return bad ? 1 : 0;
+    }
+    if (!strcmp(cmd, "bundle")) {
+        if (argc != 4) { fputs("usage: cljc bundle <script.clj> <output>\n", stderr); return 1; }
+        set_args(env, argc, argv, 2);
+        return run_subprogram(env, "(load-file \"bundle.clj\")", false);
+    }
+    if (cmd[0] == '-') {            /* unknown flag: complain, show help */
+        fprintf(stderr, "cljc: unknown option %s\n\n", cmd);
+        usage(stderr);
+        return 1;
+    }
+    /* default: treat as a script path */
+    set_args(env, argc, argv, 2);
+    return run_script(env, cmd);
 }
 #endif

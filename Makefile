@@ -3,7 +3,7 @@ CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
 PREFIX  ?= /usr/local
 DESTDIR ?=
 SHAREDIR = $(PREFIX)/share/cljc
-BATTERIES = libc.clj json.clj fs.clj process.clj test.clj jit.clj bundle.clj
+BATTERIES = libc.clj json.clj fs.clj process.clj test.clj jit.clj bundle.clj clerk.clj
 
 cljc: cljc.c
 	$(CC) $(CFLAGS) -DCLJC_SHAREDIR='"$(SHAREDIR)"' -o $@ $< -lm -ldl
@@ -27,6 +27,7 @@ install: cljc
 	install -m 755 cljc $(DESTDIR)$(PREFIX)/bin/cljc
 	install -d $(DESTDIR)$(SHAREDIR)
 	install -m 644 $(BATTERIES) $(DESTDIR)$(SHAREDIR)/
+	install -m 644 cljc.c $(DESTDIR)$(SHAREDIR)/   # `cljc bundle` needs the source
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure
 	install -m 644 vendor/clojure/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/medley

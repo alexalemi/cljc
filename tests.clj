@@ -968,4 +968,57 @@
 (assert= 0 (:exit (process/sh "true")))
 (assert= :threw (try (process/shell "false") (catch Exception e :threw)))
 
+; str/index-of
+(assert= 6 (str/index-of "hello world" "world"))
+(assert= 2 (str/index-of "ababab" "ab" 1))
+(assert= nil (str/index-of "abc" "zz"))
+(assert= 0 (str/index-of "abc" "abc"))
+
+; with-out-str
+(assert= "hi42" (with-out-str (print "hi") (print 42)))
+(assert= "" (with-out-str))
+(assert= :threw (try (with-out-str (throw (ex-info "x" {}))) (catch Exception e :threw)))
+(assert= "restored" (do (try (with-out-str (throw (ex-info "x" {}))) (catch Exception e nil))
+                        (with-out-str (print "restored"))))
+(assert= "ab" (with-out-str (print "a") (with-out-str (print "hidden")) (print "b")))
+
+; cljc/mtime* — milliseconds since epoch, nil when missing
+(assert= true (> (cljc/mtime* "tests.clj") 1500000000000))
+(assert= nil (cljc/mtime* "/no/such/file/anywhere"))
+
+; tcp primitives — listen + accept timeout + close (loopback)
+(assert= true (let [srv (tcp/listen 17893)]
+                (let [r (tcp/accept srv 10)]   ; no client: times out → nil
+                  (tcp/close srv)
+                  (nil? r))))
+
+; clerk notebook battery
+(load-file "clerk.clj")
+(assert= [{:kind :md :text "# Title"}
+          {:kind :code :text "(+ 1 2)" :dirs {}}]
+         (clerk/parse ";; # Title\n\n(+ 1 2)\n"))
+(assert= 2 (count (clerk/parse "(defn f [x]\n  (* x 2))\n\n(f 21)\n")))
+(assert= :code (:kind (first (clerk/parse "(def s \";; not prose\")\n"))))
+(assert= 1 (count (clerk/parse "(def a\n  1)\n")))           ; multiline form = one cell
+(assert= {"hide-code" true} (:dirs (second (clerk/parse ";; intro\n;; @clerk:hide-code\n(+ 1 1)\n"))))
+(assert= {:value 3 :error nil :out ""} (clerk/eval-cell "(+ 1 2)"))
+(assert= {:value 2 :error nil :out "side"} (clerk/eval-cell "(print \"side\") (+ 1 1)"))
+(assert= true (string? (:error (clerk/eval-cell "(/ 1 0)"))))
+(assert= 42 (do (clerk/eval-cell "(def clerk-test-x 42)") clerk-test-x))  ; defs persist
+(assert= "&lt;a&gt; &amp; b" (clerk/escape "<a> & b"))
+(assert= "<h1>Hi</h1>" (clerk/md->html "# Hi"))
+(assert= "<p>a <strong>b</strong> <em>c</em> <code>d</code></p>" (clerk/md->html "a **b** *c* `d`"))
+(assert= "<p><a href=\"http://x.y\">go</a></p>" (clerk/md->html "[go](http://x.y)"))
+(assert= "<ul><li>one</li><li>two</li></ul>" (clerk/md->html "- one\n- two"))
+(assert= "<ol><li>a</li><li>b</li></ol>" (clerk/md->html "1. a\n2. b"))
+(assert= "<p>x</p><p>y</p>" (clerk/md->html "x\n\ny"))
+(assert= "<p>math $e^x$ stays</p>" (clerk/md->html "math $e^x$ stays"))
+(assert= true (str/includes? (clerk/hl "(def x \"s\")") "<span class=\"str\">\"s\"</span>"))
+(assert= true (str/includes? (clerk/hl "; note") "class=\"com\""))
+(assert= true (str/includes? (clerk/hl ":kw") "class=\"kwd\""))
+(assert= true (str/includes? (clerk/render-value {:a 1}) "<table>"))
+(assert= true (str/includes? (clerk/render-value [{:a 1} {:a 2}]) "<th>"))
+(assert= "<div class=\"raw\"><b>x</b></div>" (clerk/render-value "<b>x</b>"))
+(assert= true (str/includes? (clerk/render-value [1 2 3]) "class=\"value\""))
+
 (println "tests complete")

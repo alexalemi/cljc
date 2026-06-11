@@ -388,12 +388,40 @@ required by conservative stack scanning, same as Boehm GC).
     locale is UTF-8 (term_utf8 checks LC_ALL→LC_CTYPE→LANG), errors
     render with ─ header rule, │ gutter, ▔ underline; plain -, |, ^
     otherwise — pure cosmetics, zero behavior change.
-32. NEXT: CLERK CLONE — literate
-    notebooks from .clj files; PRIOR ART to study first:
-    ~/build/s7 (their s7 version), ~/projects/clerk-janet,
-    ~/projects/clerk-racket, and the plaque skill (their Python one).
+32. ~~Clerk clone~~ ✅ done 2026-06-11 — `cljc notebook file.clj [port]`
+    (alias `clerk`; `-o out.html` for static builds). clerk.clj battery
+    (~370 lines, deliberately NO FFI deps so it works without cc):
+    line-scanner cell parser (depth/string tracking; top-level `;;` →
+    markdown prose, each top-level form → code cell, single-`;` invisible,
+    `;; @clerk:hide-code` / `hide-result` directives); per-cell eval via
+    `(do …)` wrap in the shared root env with error isolation +
+    with-out-str capture; hand-rolled markdown subset (h1-h3, lists,
+    bold/italic/code/links; `$…$` passes through to client-side KaTeX);
+    server-side syntax highlighting to span classes; viewer registry
+    (map → kv table, seq-of-maps → 2D table, "<"-string → raw html,
+    `clerk/register-viewer!` to extend; fn/nil values hidden);
+    single-threaded HTTP+SSE server — `tcp/accept` 250ms timeout doubles
+    as the mtime watch tick, browser reloads on `data: reload`. Design
+    follows their s7/janet/racket clerk clones (studied all three).
+    New C support: tcp/listen accept recv send close (MSG_NOSIGNAL),
+    cljc/mtime* (ms resolution), cljc/with-out-str* (ErrFrame-safe
+    stream swap) + with-out-str macro, str/index-of, sequential?.
+33. ~~Subcommand CLI~~ ✅ done 2026-06-11 — `cljc help|version|run|eval
+    (-e)|repl|nrepl|notebook|test|lint|bundle`. Exact subcommand match
+    wins; `cljc run <file>` is the escape hatch; bare `cljc <file.clj>`
+    still works; --version/--nrepl/-h kept as aliases. `test` loads the
+    test.clj battery + files and exits 1 on failures; `lint` is a
+    reader-level syntax check with the Elm rendering; `bundle` now finds
+    cljc.c in the share dir (installed by make install) so it works
+    outside the checkout. WISHED-FOR LATER (user): `doc`, `fmt`,
+    `docgen`, `lsp` subcommands.
+34. NEXT: JUDGE CLONE (user request) — inline snapshot testing à la
+    github.com/ianthehenry/judge (Janet): `(test (+ 1 2))` runs and
+    REWRITES the source file inserting/correcting the expected value;
+    interactive accept/reject of diffs. Would land as `cljc judge
+    [files]`. Study the upstream README/design first.
     (c) numerics/dates/fork-pmap menu from the bb-gap analysis.
-32. **Performance later, maybe**: args-as-array calling convention,
+35. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

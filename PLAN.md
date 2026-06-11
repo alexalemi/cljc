@@ -284,7 +284,17 @@ required by conservative stack scanning, same as Boehm GC).
     fails at read (#?@-class gaps); Clerk impossible (JVM-bound, not
     even bb runs it). Aliases (:as m -> m/foo) NOT implemented — flat
     globals; next compat step if multi-lib use emerges.
-23. **Performance later, maybe**: args-as-array calling convention,
+23. ~~Library survey round 2~~ ✅ done 2026-06-11 — medley runs
+    substantially and upstream clojure.walk completely. Compat landed:
+    #?@ splicing (reader-splice marker unpacked by read_list, also
+    powers #_ discard), apostrophes inside symbols (coll'), named fns
+    ((fn step [x] ...) — late binding into a wrapper env), reduced/
+    reduced?/unreduced with native reduce early-exit, conj of [k v]
+    entries and maps onto maps, :as aliases (registered by require,
+    resolved on lookup miss by prefix-strip, cached in the symbol
+    cell), instance? as always-false macro, volatile!/vreset!/vswap!
+    as atom shims, coll?/map-entry?/list*/find/key/val/nnext family.
+24. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

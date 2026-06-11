@@ -853,4 +853,28 @@
 (assert= {:a 1} (persistent! (assoc! (transient {}) :a 1)))   ; map shim
 (assert= #{:x} (persistent! (conj! (transient #{}) :x)))      ; set shim
 
+; ── library survey round 2: medley + clojure.walk + enabling compat ──
+(assert= [1 2 3 4] [1 #?@(:cljc [2 3]) 4])          ; #?@ splicing
+(assert= [1 2] [1 #_(ignored junk) 2])               ; #_ discard
+(def coll' [1 2])                                    ; apostrophe in symbols
+(assert= 2 (count coll'))
+(assert= 120 ((fn fact [n] (if (zero? n) 1 (* n (fact (dec n))))) 5))  ; named fn
+(assert= :early (reduce (fn [a x] (if (> a 10) (reduced :early) (+ a x))) 0 (range 100)))
+(assert= 6 (unreduced (reduce + [1 2 3])))
+(assert= {:a 1 :b 2} (conj {:a 1} [:b 2]))           ; entries conj onto maps
+(assert= {:a 1 :b 2} (conj {:a 1} {:b 2}))
+(assert= true (coll? [1]))
+(assert= false (coll? "s"))
+(require '[medley.core :as m])
+(assert= {:a 1 :c 3} (m/assoc-some {:a 1} :b nil :c 3))
+(assert= 4 (m/find-first even? [1 3 4 5]))
+(assert= {:a {:x 1 :y 2}} (m/deep-merge {:a {:x 1}} {:a {:y 2}}))
+(assert= {:a 1} (m/remove-vals nil? {:a 1 :b nil}))
+(assert= (list 1 :a 2 :b 3) (m/interleave-all [1 2 3] [:a :b]))
+(assert= {:b 3 :a 2} (m/map-vals inc {:a 1 :b 2}))
+(require 'clojure.walk)
+(assert= {:a 2 :b [3 4]} (postwalk (fn [x] (if (int? x) (inc x) x)) {:a 1 :b [2 3]}))
+(assert= {:a 1 :b {:c 2}} (keywordize-keys {"a" 1 "b" {"c" 2}}))
+(assert= [:y [:y :z]] (prewalk-replace {:x :y} [:x [:x :z]]))
+
 (println "tests complete")

@@ -87,17 +87,22 @@ plumbing — but it isn't built.)
 
 ## Running Clojure libraries
 
-`require` resolves namespaces against `*load-path*` (`.` and `vendor/` by
-default) and loads single-file libraries. **Upstream `clojure.set` runs in
-full** — `union`, `join`, `project`, `index`, `map-invert`, all of it — from
-Clojure's own EPL-licensed source, vendored unmodified in `vendor/clojure/`.
+`require` resolves namespaces against `*load-path*` (`.` and `vendor/`),
+loads `.clj`/`.cljc` files once, and registers `:as` aliases (`m/foo`
+resolves to the flat global `foo`). Survey results, all suite-tested from
+unmodified upstream sources vendored in `vendor/`:
 
-Survey honesty: that's the *favorable* end. Libraries needing Java interop,
-`deftype`, multi-file namespaces, or `#?@` splicing don't load (medley trips
-on its reader conditionals; Clerk is JVM-bound and doesn't run on babashka
-either). The compat machinery that made it possible: `defn` docstrings +
-attr-maps, `defn-`, interned keyword identity, transient-map shims,
-`with-meta`/`meta` no-ops.
+| library | status |
+|---|---|
+| **clojure.set** | ✅ complete — `union`/`join`/`project`/`index`/`map-invert`/… |
+| **clojure.walk** | ✅ complete — `postwalk`/`keywordize-keys`/`prewalk-replace`/… |
+| **medley** | ✅ substantially — `assoc-some`, `deep-merge`, `index-by`, `distinct-by`, `interleave-all`, lazy + `reduced`-based fns |
+| data.json | ❌ Java interop throughout (our `json.clj` covers the need) |
+| Clerk | ❌ JVM-bound (doesn't run on babashka either) |
+
+The line: pure-data single-file libraries are reachable; Java interop,
+`deftype`, and multi-file namespace graphs are not — babashka's line, drawn
+tighter.
 
 ## Tooling
 

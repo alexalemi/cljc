@@ -138,6 +138,12 @@ static Cljc **vstack;
 static size_t vsp;
 static void vpush(Cljc *v);
 void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
+/* Namespace aliases for the flat-global model: (require '[x.y :as m])
+ * registers "m"; on lookup miss, m/foo retries as bare foo. */
+#define MAX_ALIASES 64
+static const char *alias_table[MAX_ALIASES];
+static int n_aliases;
+
 static Cljc *cell_alloc(bool zero);
 static CljcEnv *env_alloc(void);
 static Cljc **chunk32_alloc(void);
@@ -1333,7 +1339,7 @@ static void skip_ws(const char **p) {
 
 static bool is_sym_char(int c) {
     if (c == '\0' || isspace(c)) return false;
-    return !strchr("()[]{}\";'`,~@", c);
+    return !strchr("()[]{}\";`,~@", c);  /* ' is legal INSIDE symbols (coll') */
 }
 
 static Cljc *read_atom(const char **p) {
@@ -1406,6 +1412,17 @@ static Cljc *read_list(const char **p, char close) {
         if (**p == '\0') cljc_error("unterminated list");
         if (**p == close) { (*p)++; return head; }
         Cljc *item = read_form(p);
+        /* unpack #?@ splice markers into this list */
+        if (item != NULL && item != NIL && item->tag == CLJC_LIST &&
+            item->as.cons.head->tag == CLJC_SYMBOL &&
+            item->as.cons.head->as.sym == intern("**reader-splice**", 17)) {
+            Cljc *branch = item->as.cons.tail->as.cons.head;
+            for (Cljc *s = to_seq(branch); s && s->tag == CLJC_LIST; s = s->as.cons.tail) {
+                *tail = mk_cons(s->as.cons.head, NIL);
+                tail = &(*tail)->as.cons.tail;
+            }
+            continue;
+        }
         *tail = mk_cons(item, NIL);
         tail = &(*tail)->as.cons.tail;
     }
@@ -1444,10 +1461,19 @@ static Cljc *read_form(const char **p) {
         if (n == 6 && !memcmp(start, "return", 6)) return mk_str("\r", 1);
         cljc_error("unsupported char literal");
     }
-    if (c == '#' && (*p)[1] == '?') {
-        /* reader conditional: keep the :cljc or :default branch */
+    if (c == '#' && (*p)[1] == '_') {
         *p += 2;
-        if (**p == '@') cljc_error("#?@ splicing is not supported");
+        read_form(p);   /* read and discard */
+        return mk_cons(mk_sym(intern("**reader-splice**", 17)),
+                       mk_cons(NIL, NIL));   /* splices zero elements */
+    }
+    if (c == '#' && (*p)[1] == '?') {
+        /* reader conditional: keep the :cljc or :default branch.
+         * #?@(...) splices the branch into the enclosing list — returned
+         * as a marker cons that read_list unpacks. */
+        *p += 2;
+        bool splicing = **p == '@';
+        if (splicing) (*p)++;
         skip_ws(p);
         if (**p != '(') cljc_error("#? expects a list");
         Cljc *clauses = read_list(p, ')');
@@ -1456,10 +1482,17 @@ static Cljc *read_form(const char **p) {
         for (Cljc *l = clauses; l && l->tag == CLJC_LIST && l->as.cons.tail != NIL;
              l = l->as.cons.tail->as.cons.tail) {
             Cljc *k = l->as.cons.head;
-            if (k->tag == CLJC_KEYWORD && (k->as.kw == KW_CLJC || k->as.kw == KW_DEFAULT))
-                return l->as.cons.tail->as.cons.head;
+            if (k->tag == CLJC_KEYWORD && (k->as.kw == KW_CLJC || k->as.kw == KW_DEFAULT)) {
+                Cljc *branch = l->as.cons.tail->as.cons.head;
+                if (!splicing) return branch;
+                return mk_cons(mk_sym(intern("**reader-splice**", 17)),
+                               mk_cons(branch, NIL));
+            }
             if (l->as.cons.tail == NIL) break;
         }
+        if (splicing)  /* no branch: splice nothing */
+            return mk_cons(mk_sym(intern("**reader-splice**", 17)),
+                           mk_cons(NIL, NIL));
         return NIL;  /* no matching branch (divergence: nil, not nothing) */
     }
     if (c == '#' && (*p)[1] == '(') {
@@ -1957,6 +1990,24 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
             if (cb) return cb->value;
             for (Binding *b = e->bindings; b; b = b->next)
                 if (b->name == name) { form->as.symc.root_cache = b; return b->value; }
+            /* alias fallback: m/foo -> foo when m is a registered alias */
+            {
+                const char *slash = strchr(name, '/');
+                if (slash && slash != name) {
+                    const char *pre = intern(name, (size_t)(slash - name));
+                    for (int i = 0; i < n_aliases; i++) {
+                        if (alias_table[i] == pre) {
+                            const char *bare = intern(slash + 1, strlen(slash + 1));
+                            for (Binding *b = e->bindings; b; b = b->next)
+                                if (b->name == bare) {
+                                    form->as.symc.root_cache = b;  /* cached: one-time cost */
+                                    return b->value;
+                                }
+                            break;
+                        }
+                    }
+                }
+            }
             cljc_error("unable to resolve symbol: %s", name);
         }
         case CLJC_LIST: {
@@ -2312,9 +2363,22 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                         return l;
                     }
                 }
-                if (s == SYM_FN)
-                    /* (fn [x y] body...) or (fn ([x] ...) ([x y] ...)) */
-                    return make_fn(env, rest, false);
+                if (s == SYM_FN) {
+                    /* (fn [x] ...) | (fn ([x] ...) ...) | (fn name [x] ...)
+                     * Named fns see themselves via late binding: the name is
+                     * defined into the closure env after construction. */
+                    Cljc *body = rest;
+                    const char *self_name = NULL;
+                    if (body != NIL && body->as.cons.head->tag == CLJC_SYMBOL) {
+                        self_name = body->as.cons.head->as.sym;
+                        body = body->as.cons.tail;
+                    }
+                    if (!self_name) return make_fn(env, body, false);
+                    CljcEnv *fenv = env_new(env);
+                    Cljc *f = make_fn(fenv, body, false);
+                    env_define(fenv, self_name, f);
+                    return f;
+                }
             }
 
             /* Application. Macros get the unevaluated forms; the expansion
@@ -2719,6 +2783,15 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
             r = vec_conj1(r, x);                    /* vectors grow at the back */
         } else if (r->tag == CLJC_SET) {
             r = set_conj(r, x);
+        } else if (r->tag == CLJC_MAP) {
+            /* (conj m [k v]) and (conj m {k v ...}) — Clojure semantics */
+            if (x != NIL && x->tag == CLJC_VECTOR && vec_len(x) == 2) {
+                r = map_assoc(r, vec_nth(x, 0), vec_nth(x, 1));
+            } else if (x != NIL && x->tag == CLJC_MAP) {
+                for (Cljc *e = map_entry_list(x); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+                    r = map_assoc(r, e->as.cons.head->as.cons.head,
+                                  e->as.cons.head->as.cons.tail);
+            } else cljc_error("conj on map: expected a [k v] entry or a map");
         } else cljc_error("conj: not a collection");
     }
     return r;
@@ -3076,6 +3149,11 @@ static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
     for (Cljc *l = seq; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
         Cljc *two[2] = {acc, l->as.cons.head};
         acc = apply(env, f, two, 2);
+        /* (reduced x) terminates early */
+        if (acc != NIL && acc->tag == CLJC_LIST &&
+            acc->as.cons.head->tag == CLJC_SYMBOL &&
+            acc->as.cons.head->as.sym == intern("**reduced**", 11))
+            return acc->as.cons.tail->as.cons.head;
     }
     return acc;
 }
@@ -3558,6 +3636,18 @@ static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs) {
     for (int i = 1; i < nargs; i++)
         s = set_disj(s, argv[i]);
     return s;
+}
+
+
+static Cljc *prim_alias(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    const char *a = as_str(argv[0], "alias*");
+    const char *in = intern(a, strlen(a));
+    for (int i = 0; i < n_aliases; i++)
+        if (alias_table[i] == in) return NIL;
+    if (n_aliases >= MAX_ALIASES) cljc_error("too many aliases");
+    alias_table[n_aliases++] = in;
+    return NIL;
 }
 
 static Cljc *prim_identical(CljcEnv *env, Cljc **argv, int nargs) {
@@ -4562,10 +4652,34 @@ static const char *PRELUDE =
     "(defn with-meta [x m] x)\n"
     "(defn meta [x] nil)\n"
     "(defn vary-meta [x & _] x)\n"
+    "(defmacro instance? [c x] `(do ~x false))\n"
+    "(defn nnext [s] (next (next s)))\n"
+    "(defn find [m k] (when (contains? m k) [k (get m k)]))\n"
+    "(defn reduced [x] (cons '**reduced** (cons x nil)))\n"
+    "(defn reduced? [x]\n"
+    "  (and (list? x) (= '**reduced** (first x))))\n"
+    "(defn unreduced [x] (if (reduced? x) (second x) x))\n"
+    "(defn ensure-reduced [x] (if (reduced? x) x (reduced x)))\n"
+    "(defn key [e] (first e))\n"
+    "(defn coll? [x] (or (list? x) (vector? x) (map? x) (set? x) (seq? x)))\n"
+    "(defn map-entry? [x] (and (vector? x) (= 2 (count x))))\n"
+    "(defn list* [& args]\n"
+    "  (let [r (reverse args)]\n"
+    "    (reduce (fn [acc x] (cons x acc)) (seq (first r)) (rest r))))\n"
+    "(defn val [e] (second e))\n"
+    "(defn ffirst [s] (first (first s)))\n"
+    "(defn nfirst [s] (next (first s)))\n"
+    "(defn fnext [s] (first (next s)))\n"
+    "(defn dorun' [s] (dorun s))\n"
+    "(def volatile! atom)\n"
+    "(def vreset! reset!)\n"
+    "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
     "(def *load-path* [\".\" \"vendor\"])\n"
     "(def cljc/loaded-namespaces (atom #{}))\n"
     "(defn cljc/require-one [spec]\n"
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
+    "    (when (and (vector? spec) (>= (count spec) 3) (= :as (nth spec 1)))\n"
+    "      (cljc/alias* (str (nth spec 2))))\n"
     "    (when-not (contains? @cljc/loaded-namespaces nsname)\n"
     "      (let [rel (str/replace (str nsname) \".\" \"/\")\n"
     "            paths (mapcat (fn [d] [(str d \"/\" rel \".clj\")\n"
@@ -4743,6 +4857,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "hash",      prim_hash);
     cljc_define_native(e, "int",       prim_int);
     cljc_define_native(e, "identical?", prim_identical);
+    cljc_define_native(e, "cljc/alias*", prim_alias);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
     cljc_define_native(e, "cljc/onto",          prim_onto);

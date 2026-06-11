@@ -101,7 +101,7 @@ treat as orders of magnitude):
 | startup (hello world) | **2 ms** | 10 ms | 440 ms |
 | fib(27), interpreted recursion | 88 ms | **56 ms** | 563 ms |
 | 5M-iteration loop/recur | 578 ms | **239 ms** | 563 ms |
-| seq pipeline (1M: filter→map→reduce) | 2.9 s¹ | **58 ms** | 488 ms |
+| seq pipeline (1M: filter→map→reduce) | 443 ms¹ | **58 ms** | 488 ms |
 | build+read 100k-entry map | 231 ms | **107 ms** | 699 ms |
 | build 1M-element vector | 223 ms | **107 ms** | 542 ms |
 | sort 200k | **126 ms** | 185 ms | 641 ms |
@@ -118,9 +118,9 @@ in `benchmarks/aoc/`, identical sources and answers on all three runtimes:
 | day 5: jump tape (25M vector assocs) | 17.0 s | 8.2 s | **2.9 s** |
 | day 6: redistribution (vectors as hash keys) | 186 ms | **101 ms** | 640 ms |
 
-¹ was 321 ms when map/filter were eager natives; real lazy sequences cost a
-thunk+closure per element in an interpreter. Chunked seqs (Clojure's own fix)
-are the planned remedy.
+¹ lazy seqs with 32-element chunking (Clojure's own design): one thunk per
+chunk, with the chunk walk in C. Was 2.9 s per-element-lazy, 321 ms when
+eager — laziness costs ~38% here and buys infinite seqs + call-by-need.
 
 Honest reading: babashka wins most compute because its `clojure.core` is
 AOT-compiled native code — SCI only interprets your glue, while cljc interprets

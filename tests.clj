@@ -678,12 +678,16 @@
 (assert= false (seq? [1]))
 (assert= 3 (count (take 3 (range))))
 (assert= nil (seq (take 0 (range))))
-; call-by-need: side effects fire only on realization
+; call-by-need with CHUNKED realization (like Clojure: <=32 at a time)
 (def lz-side (atom 0))
 (def lz (map (fn [x] (swap! lz-side inc) x) [1 2 3]))
-(assert= 0 @lz-side)
+(assert= 0 @lz-side)                ; nothing runs at creation
 (assert= 1 (first lz))
-(assert= 1 @lz-side)
+(assert= 3 @lz-side)                ; first realizes the whole (small) chunk
+(def lz-side2 (atom 0))
+(def lz2 (map (fn [x] (swap! lz-side2 inc) x) (range 100)))
+(first lz2)
+(assert= 32 @lz-side2)              ; exactly one chunk of a big seq
 ; threading macros still work (their expansions are lazy concats now)
 (assert= (list 2 4) (->> (range 5) (map inc) (filter even?)))
 (assert= (list 2 3 4) (take-while #(< % 5) (iterate inc 2)))

@@ -3393,6 +3393,54 @@ static Cljc *prim_type(CljcEnv *env, Cljc *args) {
     return mk_kw(intern(n, strlen(n)));
 }
 
+/* (cljc/chunk-map* f s n) => [strict-result-list rest-seq]; consumes
+ * exactly min(n, len) elements. The chunked-seq workhorse. */
+static Cljc *prim_chunk_map(CljcEnv *env, Cljc *args) {
+    Cljc *f = args->as.cons.head;
+    Cljc *s = seq1(args->as.cons.tail->as.cons.head);
+    int64_t n = as_int(args->as.cons.tail->as.cons.tail->as.cons.head, "chunk-map");
+    Cljc *out = NIL, **t = &out;
+    while (n-- > 0 && s != NIL) {
+        *t = mk_cons(apply(env, f, mk_cons(s->as.cons.head, NIL)), NIL);
+        t = &(*t)->as.cons.tail;
+        s = seq1(s->as.cons.tail);
+    }
+    Cljc *pair[2] = {out, s};
+    return mk_vector(pair, 2);
+}
+
+static Cljc *prim_chunk_filter(CljcEnv *env, Cljc *args) {
+    Cljc *f = args->as.cons.head;
+    Cljc *s = seq1(args->as.cons.tail->as.cons.head);
+    int64_t n = as_int(args->as.cons.tail->as.cons.tail->as.cons.head, "chunk-filter");
+    Cljc *out = NIL, **t = &out;
+    while (n-- > 0 && s != NIL) {
+        if (is_truthy(apply(env, f, mk_cons(s->as.cons.head, NIL)))) {
+            *t = mk_cons(s->as.cons.head, NIL);
+            t = &(*t)->as.cons.tail;
+        }
+        s = seq1(s->as.cons.tail);
+    }
+    Cljc *pair[2] = {out, s};
+    return mk_vector(pair, 2);
+}
+
+/* (cljc/onto strict-list tail) — copy the list's conses onto tail (which
+ * may be lazy), without per-element lazy cells. */
+static Cljc *prim_onto(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *lst = args->as.cons.head;
+    Cljc *tail = args->as.cons.tail->as.cons.head;
+    if (lst == NIL) return tail;
+    Cljc *out = NIL, **t = &out;
+    for (Cljc *l = lst; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+        *t = mk_cons(l->as.cons.head, NIL);
+        t = &(*t)->as.cons.tail;
+    }
+    *t = tail;
+    return out;
+}
+
 static Cljc *prim_gc(CljcEnv *env, Cljc *args) {
     (void)env; (void)args;
     gc_collect();
@@ -4447,6 +4495,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "type",    prim_type);
     cljc_define_native(e, "sh",        prim_sh);
     cljc_define_native(e, "hash",      prim_hash);
+    cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
+    cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
+    cljc_define_native(e, "cljc/onto",          prim_onto);
     cljc_define_native(e, "ffi-load*", prim_ffi_load);
     cljc_define_native(e, "hash-map",  prim_hash_map);
     cljc_define_native(e, "get",       prim_get);
@@ -4579,6 +4630,16 @@ CljcEnv *cljc_new_env(void) {
         "(defn mapcat [f c]\n"
         "  (lazy-seq (when-let [s (seq c)]\n"
         "              (concat (f (first s)) (mapcat f (rest s))))))\n"
+        "(defn cljc/chunked [step f c]\n"
+        "  (lazy-seq (when-let [s (seq c)]\n"
+        "              (let [pair (step f s 32)]\n"
+        "                (cljc/onto (nth pair 0)\n"
+        "                           (cljc/chunked step f (nth pair 1)))))))\n"
+        "(def cljc/map2 map)\n"
+        "(defn map\n"
+        "  ([f c] (cljc/chunked cljc/chunk-map* f c))\n"
+        "  ([f c1 c2] (cljc/map2 f c1 c2)))\n"
+        "(defn filter [pred c] (cljc/chunked cljc/chunk-filter* pred c))\n"
         "(defn interleave [c1 c2]\n"
         "  (lazy-seq (let [s1 (seq c1) s2 (seq c2)]\n"
         "              (when (and s1 s2)\n"

@@ -220,7 +220,14 @@ required by conservative stack scanning, same as Boehm GC).
     Also: sh native (popen, {:exit :out}). Requires cc at runtime
     (the s7 trade). Future: :pointer type, struct support, a libc.clj
     batteries module, caching compiled modules by signature hash.
-17. **Performance later, maybe**: args-as-array calling convention,
+17. ~~Chunked seqs (perf round 3)~~ ✅ done 2026-06-10 — map/filter
+    realize 32 elements per lazy cell, chunk walk in C natives
+    (cljc/chunk-map*, cljc/chunk-filter*, cljc/onto prepends a strict
+    list onto a lazy tail with no per-element lazy cells). Pipeline
+    2.9s -> 443ms (eager baseline was 321ms). Chunked semantics are
+    Clojure-faithful: side effects realize <=32 at a time (tests pin
+    exactly-one-chunk behavior). 2-coll map stays unchunked.
+18. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

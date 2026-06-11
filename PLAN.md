@@ -437,8 +437,10 @@ required by conservative stack scanning, same as Boehm GC).
     (constructor → field map, methods ignored);
     clojure.lang.PersistentQueue/EMPTY = [] (LIFO divergence); vendor
     clojure.data.json + clojure.math.combinatorics + nextjournal.clerk.
-    PROGRESS: 16 → 74+ passing over seven batches (sweep after batch 6:
-    74 pass / 39 fail / 38 timeout; batch 7 fixed ~8 more of the fails).
+    FINAL TALLY (after batch 7, 2026-06-11): **83 pass / 28 fail /
+    40 timeout** of 151 solution files — from 16 passing at the start of
+    the campaign. By year: 2015 15/22, 2016 12/22, 2017 13/26, 2018
+    3/11, 2021 13/25, 2022 14/25, 2023 8/13, 2024 5/6, 2025 0/1 (JS).
     Batch 5 added MD5 native + interop shims (MessageDigest idiom runs
     verbatim, .indexOf, Integer/parseInt radix, Character/digit). Batch 6:
     regex lookahead (?=)(?!), (ns foo) ENTERS foo (defs land foo/, like

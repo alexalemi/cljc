@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~3,400 lines, zero warnings, 287 assertions in `tests.clj`, ASan/UBSan clean
+~3,760 lines, zero warnings, 311 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -87,11 +87,17 @@ required by conservative stack scanning, same as Boehm GC).
    sets callable as membership fns, conj/contains?/get/count/seq work,
    prelude set/union set/intersection set/difference. '#' stays a symbol
    char except when a form starts with "#{" (so t# macro symbols still read).
-7. **More surface**: regex
-   (`re-find`/`re-matches`; needs a decision: POSIX ERE divergence vs tiny
-   regex engine); `condp`, `for` :when/:let modifiers, `..`,
-   `iterate` (eager n-limited?), `format`?
-8. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
+7. ~~Regex~~ ✅ done 2026-06-10 — tiny self-contained backtracking engine
+   (~350 lines, no deps): literals . ^ $ [a-z] [^...] \d \D \w \W \s \S,
+   capture groups, (?:...), |, * + ? with lazy variants. X+ desugars to
+   X X* (atom re-parsed); X? to ALT; star has an empty-match cycle guard.
+   #"..." reader literal = raw string (only \" escape). re-find/
+   re-matches/re-seq; patterns are plain strings (no regex value type).
+   NOT supported: {n,m}, backrefs, lookaround (braces are literals).
+8. **More surface**: `condp`, `for` :when/:let modifiers, `..`,
+   `iterate` (eager n-limited?), `format`, str/replace with regex,
+   str/split with regex?
+9. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
    bytecode VM. Not before semantics are broader.
 
 ## Known divergences from Clojure (deliberate, v0)

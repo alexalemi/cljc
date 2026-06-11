@@ -481,4 +481,30 @@
 (def evens (set (range 0 10 2)))
 (assert= (list 0 2 4) (filter evens [0 1 2 3 4 5]))
 
+; ── regex ──
+(assert= "123" (re-find #"\d+" "abc123def"))
+(assert= "123" (re-find "\\d+" "abc123def"))      ; plain strings work too
+(assert= nil (re-find #"\d+" "abcdef"))
+(assert= "aaab" (re-matches #"a+b" "aaab"))
+(assert= nil (re-matches #"a+b" "aaabc"))          ; must consume all input
+(assert= ["bob@example" "bob" "example"] (re-find #"(\w+)@(\w+)" "mail: bob@example"))
+(assert= (list "1" "22" "333") (re-seq #"\d+" "a1b22c333"))
+(assert= "color" (re-find #"colou?r" "my color!"))
+(assert= "colour" (re-find #"colou?r" "my colour!"))
+(assert= "start" (re-find #"^start" "start here"))
+(assert= nil (re-find #"^start" "false start"))
+(assert= "end" (re-find #"end$" "the end"))
+(assert= "Hello" (re-find #"[A-Z][a-z]+" "say Hello there"))
+(assert= "xyz" (re-find #"[^0-9]+" "123xyz"))
+(assert= ["abbac" "a"] (re-find #"(a|b)+c" "xabbac!"))
+(assert= "" (re-find #"x*" "yyy"))                 ; empty match is a match
+(assert= "aaa" (re-find #"a*" "aaab"))             ; greedy
+(assert= "" (re-find #"a*?" "aaab"))               ; lazy
+(assert= ["ab" nil] (re-find #"a(z)?b" "ab"))      ; unmatched group => nil
+(assert= "a.b" (re-find #"a\.b" "xa.bx"))          ; escaped dot
+(assert= "2026-06-10" (re-find #"\d\d\d\d-\d\d-\d\d" "on 2026-06-10 we"))
+(assert= (list "cat" "cow") (re-seq #"c\w+" "cat dog cow"))
+(assert= ["key=val" "key" "val"] (re-matches #"(\w+)=(\w+)" "key=val"))
+(assert= "no space" (re-find #"\S+\s\S+" "no space"))
+
 (println "tests complete")

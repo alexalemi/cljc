@@ -107,6 +107,7 @@ static Cljc *cell_alloc(void);
 static CljcEnv *env_alloc(void);
 static size_t vec_len(Cljc *v);
 static Cljc *vec_nth(Cljc *v, size_t i);
+static char *as_str(Cljc *v, const char *what);
 static Cljc *NIL, *TRUE, *FALSE;
 
 /* ───── Error handling ───────────────────────────────────────────────── */
@@ -1116,6 +1117,22 @@ static Cljc *read_form(const char **p) {
         for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
             v = vec_conj1(v, l->as.cons.head);
         return v;
+    }
+    if (c == '#' && (*p)[1] == '"') {
+        /* Raw string for regex patterns: backslashes pass through verbatim;
+         * \" is the only escape (yields a quote char in the pattern). */
+        *p += 2;
+        SBuf sb = {0};
+        while (**p && **p != '"') {
+            if (**p == '\\' && (*p)[1] == '"') { sb_putc(&sb, '"'); *p += 2; continue; }
+            sb_putc(&sb, **p);
+            (*p)++;
+        }
+        if (**p != '"') cljc_error("unterminated regex literal");
+        (*p)++;
+        Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
+        free(sb.data);
+        return r;
     }
     if (c == '#' && (*p)[1] == '{') {
         (*p)++;  /* consume '#'; read_list consumes '{' */
@@ -2554,6 +2571,364 @@ static Cljc *prim_seq(CljcEnv *env, Cljc *args) {
     return s == NIL ? NIL : s;  /* (seq []) => nil, matching Clojure */
 }
 
+/* ───── Regex engine ─────────────────────────────────────────────────── */
+
+/* Tiny backtracking matcher. Supported: literals . ^ $ [abc] [a-z] [^...]
+ * \d \D \w \W \s \S \n \t \r, ( ) capture groups, (?: ) non-capturing,
+ * | alternation, * + ? quantifiers with lazy variants (*? +? ??).
+ * Not supported: {n,m}, backreferences, lookaround. Patterns are plain
+ * strings; the #"..." reader literal passes backslashes through raw.
+ * Parse-time desugaring: X+ => X X* (atom re-parsed), X? => ALT(X, empty);
+ * only star is a real loop, guarded against empty-match cycles. */
+
+enum { RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL, RX_STAR, RX_LOOP,
+       RX_ALT, RX_JOIN, RX_GS, RX_GE };
+
+typedef struct Rx Rx;
+struct Rx {
+    uint8_t type;
+    bool lazy;
+    bool neg;
+    char ch;
+    int group;
+    uint8_t bits[32];          /* 256-bit set for classes */
+    Rx *next, *child, *alt, *owner;
+    const char *last;          /* star: last entry position (cycle guard) */
+};
+
+#define RX_MAX_NODES 1024
+#define RX_MAX_GROUPS 10
+
+typedef struct {
+    const char *p;             /* parse cursor */
+    Rx *pool;
+    int npool;
+    int ngroups;
+} RxC;
+
+typedef struct { Rx *h, *t; } RxChain;
+
+static Rx *rx_node(RxC *c, int type) {
+    if (c->npool >= RX_MAX_NODES) cljc_error("regex too complex");
+    Rx *r = &c->pool[c->npool++];
+    memset(r, 0, sizeof *r);
+    r->type = (uint8_t)type;
+    return r;
+}
+
+static void rx_bit(Rx *r, unsigned char ch) { r->bits[ch >> 3] |= (uint8_t)(1u << (ch & 7)); }
+static bool rx_bit_test(const Rx *r, unsigned char ch) {
+    bool in = (r->bits[ch >> 3] >> (ch & 7)) & 1;
+    return r->neg ? !in : in;
+}
+
+static void rx_class_shorthand(Rx *r, char c) {
+    switch (c) {
+        case 'd': for (int i = '0'; i <= '9'; i++) rx_bit(r, (unsigned char)i); break;
+        case 'w': for (int i = '0'; i <= '9'; i++) rx_bit(r, (unsigned char)i);
+                  for (int i = 'a'; i <= 'z'; i++) rx_bit(r, (unsigned char)i);
+                  for (int i = 'A'; i <= 'Z'; i++) rx_bit(r, (unsigned char)i);
+                  rx_bit(r, '_'); break;
+        case 's': rx_bit(r, ' '); rx_bit(r, '\t'); rx_bit(r, '\n');
+                  rx_bit(r, '\r'); rx_bit(r, '\f'); rx_bit(r, '\v'); break;
+        default: cljc_error("regex: unknown class \\%c", c);
+    }
+}
+
+static RxChain rx_parse_alt(RxC *c);
+
+/* One atom: a single char-matcher, class, group, or anchor. */
+static RxChain rx_parse_atom(RxC *c) {
+    RxChain ch = {NULL, NULL};
+    char c0 = *c->p;
+    if (c0 == '(') {
+        c->p++;
+        bool capture = true;
+        if (c->p[0] == '?' && c->p[1] == ':') { capture = false; c->p += 2; }
+        int idx = 0;
+        if (capture) {
+            if (c->ngroups >= RX_MAX_GROUPS) cljc_error("regex: too many groups");
+            idx = c->ngroups++;
+        }
+        RxChain inner = rx_parse_alt(c);
+        if (*c->p != ')') cljc_error("regex: missing )");
+        c->p++;
+        if (!capture) return inner;
+        Rx *gs = rx_node(c, RX_GS); gs->group = idx;
+        Rx *ge = rx_node(c, RX_GE); ge->group = idx;
+        gs->next = inner.h ? inner.h : ge;
+        if (inner.t) inner.t->next = ge;
+        ch.h = gs; ch.t = ge;
+        return ch;
+    }
+    if (c0 == '[') {
+        c->p++;
+        Rx *r = rx_node(c, RX_CLASS);
+        if (*c->p == '^') { r->neg = true; c->p++; }
+        while (*c->p && *c->p != ']') {
+            if (*c->p == '\\' && c->p[1]) {
+                char e = c->p[1]; c->p += 2;
+                if (e == 'd' || e == 'w' || e == 's') rx_class_shorthand(r, e);
+                else if (e == 'n') rx_bit(r, '\n');
+                else if (e == 't') rx_bit(r, '\t');
+                else if (e == 'r') rx_bit(r, '\r');
+                else rx_bit(r, (unsigned char)e);
+                continue;
+            }
+            unsigned char lo = (unsigned char)*c->p++;
+            if (*c->p == '-' && c->p[1] && c->p[1] != ']') {
+                unsigned char hi = (unsigned char)c->p[1];
+                c->p += 2;
+                for (unsigned i = lo; i <= hi; i++) rx_bit(r, (unsigned char)i);
+            } else rx_bit(r, lo);
+        }
+        if (*c->p != ']') cljc_error("regex: missing ]");
+        c->p++;
+        ch.h = ch.t = r;
+        return ch;
+    }
+    if (c0 == '\\') {
+        char e = c->p[1];
+        if (!e) cljc_error("regex: trailing backslash");
+        c->p += 2;
+        Rx *r;
+        if (e == 'd' || e == 'w' || e == 's') {
+            r = rx_node(c, RX_CLASS); rx_class_shorthand(r, e);
+        } else if (e == 'D' || e == 'W' || e == 'S') {
+            r = rx_node(c, RX_CLASS); rx_class_shorthand(r, (char)tolower(e)); r->neg = true;
+        } else {
+            r = rx_node(c, RX_CHAR);
+            r->ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
+        }
+        ch.h = ch.t = r;
+        return ch;
+    }
+    c->p++;
+    Rx *r;
+    if (c0 == '.') r = rx_node(c, RX_ANY);
+    else if (c0 == '^') r = rx_node(c, RX_BOL);
+    else if (c0 == '$') r = rx_node(c, RX_EOL);
+    else { r = rx_node(c, RX_CHAR); r->ch = c0; }
+    ch.h = ch.t = r;
+    return ch;
+}
+
+/* Wrap a chain in a star node (child loops back via RX_LOOP). */
+static RxChain rx_star(RxC *c, RxChain atom, bool lazy) {
+    Rx *s = rx_node(c, RX_STAR);
+    s->lazy = lazy;
+    Rx *loop = rx_node(c, RX_LOOP);
+    loop->owner = s;
+    s->child = atom.h ? atom.h : loop;
+    if (atom.t) atom.t->next = loop;
+    RxChain ch = {s, s};
+    return ch;
+}
+
+static RxChain rx_parse_cat(RxC *c) {
+    RxChain out = {NULL, NULL};
+    while (*c->p && *c->p != '|' && *c->p != ')') {
+        const char *atom_src = c->p;
+        RxChain atom = rx_parse_atom(c);
+        const char *after_atom = c->p;
+        char q = *c->p;
+        RxChain unit = atom;
+        if (q == '*' || q == '+' || q == '?') {
+            c->p++;
+            bool lazy = *c->p == '?';
+            if (lazy) c->p++;
+            if (q == '*') {
+                unit = rx_star(c, atom, lazy);
+            } else if (q == '+') {
+                /* X+ => X X*: re-parse the atom for the star's copy. */
+                const char *save = c->p;
+                int save_groups = c->ngroups;
+                c->p = atom_src;
+                RxChain atom2 = rx_parse_atom(c);
+                c->ngroups = save_groups;  /* copies share group numbers */
+                (void)after_atom;
+                c->p = save;
+                RxChain star = rx_star(c, atom2, lazy);
+                atom.t->next = star.h;
+                unit.h = atom.h; unit.t = star.t;
+            } else {  /* ? => ALT(X, empty); lazy ?? prefers empty */
+                Rx *a = rx_node(c, RX_ALT);
+                Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
+                Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
+                if (atom.t) atom.t->next = j1;
+                Rx *xbranch = atom.h ? atom.h : j1;
+                a->child = lazy ? j2 : xbranch;
+                a->alt   = lazy ? xbranch : j2;
+                unit.h = unit.t = a;
+            }
+        }
+        if (!out.h) out = unit;
+        else { out.t->next = unit.h; out.t = unit.t; }
+    }
+    return out;
+}
+
+static RxChain rx_parse_alt(RxC *c) {
+    RxChain left = rx_parse_cat(c);
+    if (*c->p != '|') return left;
+    c->p++;
+    RxChain right = rx_parse_alt(c);
+    Rx *a = rx_node(c, RX_ALT);
+    Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
+    Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
+    if (left.t) left.t->next = j1;
+    if (right.t) right.t->next = j2;
+    a->child = left.h ? left.h : j1;
+    a->alt = right.h ? right.h : j2;
+    RxChain ch = {a, a};
+    return ch;
+}
+
+/* ── matcher ── */
+
+static const char *rx_str_begin;
+static const char *rx_match_end;
+static const char *rx_cap_s[RX_MAX_GROUPS], *rx_cap_e[RX_MAX_GROUPS];
+
+static bool rx_m(Rx *r, const char *s) {
+    if (!r) { rx_match_end = s; return true; }
+    switch (r->type) {
+        case RX_CHAR:  return *s == r->ch && rx_m(r->next, s + 1);
+        case RX_ANY:   return *s && *s != '\n' && rx_m(r->next, s + 1);
+        case RX_CLASS: return *s && rx_bit_test(r, (unsigned char)*s) && rx_m(r->next, s + 1);
+        case RX_BOL:   return s == rx_str_begin && rx_m(r->next, s);
+        case RX_EOL:   return *s == '\0' && rx_m(r->next, s);
+        case RX_GS: {
+            const char *save = rx_cap_s[r->group];
+            rx_cap_s[r->group] = s;
+            if (rx_m(r->next, s)) return true;
+            rx_cap_s[r->group] = save;
+            return false;
+        }
+        case RX_GE: {
+            const char *save = rx_cap_e[r->group];
+            rx_cap_e[r->group] = s;
+            if (rx_m(r->next, s)) return true;
+            rx_cap_e[r->group] = save;
+            return false;
+        }
+        case RX_ALT:  return rx_m(r->child, s) || rx_m(r->alt, s);
+        case RX_JOIN: return rx_m(r->owner->next, s);
+        case RX_LOOP: return rx_m(r->owner, s);
+        case RX_STAR: {
+            if (r->lazy && rx_m(r->next, s)) return true;
+            if (s != r->last) {           /* empty-iteration cycle guard */
+                const char *save = r->last;
+                r->last = s;
+                if (rx_m(r->child, s)) { r->last = save; return true; }
+                r->last = save;
+            }
+            if (!r->lazy) return rx_m(r->next, s);
+            return false;
+        }
+    }
+    return false;
+}
+
+/* Compile into a malloc'd pool; caller frees pool. */
+static Rx *rx_compile(const char *pattern, Rx **pool_out, int *ngroups_out) {
+    RxC c;
+    c.p = pattern;
+    c.pool = xmalloc(sizeof(Rx) * RX_MAX_NODES);
+    c.npool = 0;
+    c.ngroups = 1;  /* group 0 = whole match */
+    RxChain top = rx_parse_alt(&c);
+    if (*c.p) { free(c.pool); cljc_error("regex: unexpected )"); }
+    *pool_out = c.pool;
+    *ngroups_out = c.ngroups;
+    return top.h;  /* may be NULL: empty pattern matches everywhere */
+}
+
+/* Build the Clojure-style result: string when no groups, else
+ * [full g1 g2 ...] with nil for unmatched groups. */
+static Cljc *rx_result(const char *mstart, int ngroups) {
+    Cljc *full = mk_str(mstart, (size_t)(rx_match_end - mstart));
+    if (ngroups == 1) return full;
+    Cljc *v = mk_empty_vec();
+    v = vec_conj1(v, full);
+    for (int i = 1; i < ngroups; i++) {
+        if (rx_cap_s[i] && rx_cap_e[i] && rx_cap_e[i] >= rx_cap_s[i])
+            v = vec_conj1(v, mk_str(rx_cap_s[i], (size_t)(rx_cap_e[i] - rx_cap_s[i])));
+        else
+            v = vec_conj1(v, NIL);
+    }
+    return v;
+}
+
+static void rx_reset_caps(void) {
+    memset(rx_cap_s, 0, sizeof rx_cap_s);
+    memset(rx_cap_e, 0, sizeof rx_cap_e);
+}
+
+static Cljc *prim_re_find(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *pat = as_str(args->as.cons.head, "re-find");
+    char *s = as_str(args->as.cons.tail->as.cons.head, "re-find");
+    Rx *pool; int ngroups;
+    Rx *prog = rx_compile(pat, &pool, &ngroups);
+    rx_str_begin = s;
+    for (const char *start = s; ; start++) {
+        rx_reset_caps();
+        if (rx_m(prog, start)) {
+            Cljc *r = rx_result(start, ngroups);
+            free(pool);
+            return r;
+        }
+        if (!*start) break;
+    }
+    free(pool);
+    return NIL;
+}
+
+static Cljc *prim_re_matches(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *pat = as_str(args->as.cons.head, "re-matches");
+    char *s = as_str(args->as.cons.tail->as.cons.head, "re-matches");
+    Rx *pool; int ngroups;
+    Rx *prog = rx_compile(pat, &pool, &ngroups);
+    rx_str_begin = s;
+    rx_reset_caps();
+    Cljc *r = NIL;
+    if (rx_m(prog, s) && *rx_match_end == '\0')  /* must consume everything */
+        r = rx_result(s, ngroups);
+    free(pool);
+    return r;
+}
+
+static Cljc *prim_re_seq(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *pat = as_str(args->as.cons.head, "re-seq");
+    char *s = as_str(args->as.cons.tail->as.cons.head, "re-seq");
+    Rx *pool; int ngroups;
+    Rx *prog = rx_compile(pat, &pool, &ngroups);
+    rx_str_begin = s;
+    Cljc *out = NIL, **t = &out;
+    const char *pos = s;
+    for (;;) {
+        const char *start = pos;
+        bool found = false;
+        for (; ; start++) {
+            rx_reset_caps();
+            if (rx_m(prog, start)) { found = true; break; }
+            if (!*start) break;
+        }
+        if (!found) break;
+        *t = mk_cons(rx_result(start, ngroups), NIL);
+        t = &(*t)->as.cons.tail;
+        pos = rx_match_end > start ? rx_match_end : start + 1;  /* advance past empty */
+        if (start + (rx_match_end - start) > s + strlen(s)) break;
+        if (!*pos && rx_match_end == start) break;
+        if (*start == '\0') break;
+    }
+    free(pool);
+    return out;
+}
+
 static Cljc *prim_set(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *s = mk_set();
@@ -3215,6 +3590,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "hash-set",  prim_hash_set);
     cljc_define_native(e, "disj",      prim_disj);
     cljc_define_native(e, "set?",      prim_set_p);
+    cljc_define_native(e, "re-find",    prim_re_find);
+    cljc_define_native(e, "re-matches", prim_re_matches);
+    cljc_define_native(e, "re-seq",     prim_re_seq);
     cljc_define_native(e, "nil?",    prim_nil_p);
     cljc_define_native(e, "list?",   prim_list_p);
     cljc_define_native(e, "vector?", prim_vector_p);

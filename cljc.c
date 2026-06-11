@@ -180,6 +180,7 @@ static const char *err_src_text;   /* retained main-script source */
 static const char *err_src_name;   /* its display name */
 static long long err_line = -1;    /* innermost located frame at raise */
 static const char *err_token;      /* offending symbol, when known */
+static long long err_col = -1;
 static ErrFrame *err_top;
 static jmp_buf err_jmp;
 static char err_msg[256];
@@ -418,6 +419,7 @@ static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
 static void trace_snapshot(void) {
     err_trace[0] = '\0';
     err_line = -1;
+    err_col = -1;
     size_t off = 0;
     int shown = 0;
     for (int i = eval_sp - 1; i >= 0 && shown < 8; i--) {
@@ -432,7 +434,13 @@ static void trace_snapshot(void) {
                 line = (long long)lv->as.i;
         }
         int n;
-        if (line >= 0 && err_line < 0) err_line = line;
+        if (line >= 0 && err_line < 0) {
+            err_line = line;
+            Cljc *cv;
+            if (f->meta && map_find(f->meta, mk_kw(intern("col", 3)), &cv) &&
+                cv->tag == CLJC_INT)
+                err_col = (long long)cv->as.i;
+        }
         if (line >= 0)
             n = snprintf(err_trace + off, sizeof err_trace - off,
                          "  at (%s ...) line %lld\n", head, line);
@@ -1418,10 +1426,11 @@ static void sb_printf(SBuf *sb, const char *fmt, ...) {
 /* ───── Reader ───────────────────────────────────────────────────────── */
 
 static int rd_line;                 /* 1-based; 0 = no tracking */
+static const char *rd_line_start;   /* for column computation */
 
 static void skip_ws(const char **p) {
     while (**p) {
-        if (**p == '\n') { if (rd_line) rd_line++; (*p)++; }
+        if (**p == '\n') { if (rd_line) { rd_line++; rd_line_start = *p + 1; } (*p)++; }
         else if (isspace((unsigned char)**p) || **p == ',') { (*p)++; }
         else if (**p == ';') { while (**p && **p != '\n') (*p)++; }
         else break;
@@ -1486,7 +1495,7 @@ static Cljc *read_string(const char **p) {
                 default:   cljc_error("unsupported escape: \\%c", **p);
             }
         } else {
-            if (c == '\n' && rd_line) rd_line++;
+            if (c == '\n' && rd_line) { rd_line++; rd_line_start = *p + 1; }
             sb_putc(&sb, c);
         }
         (*p)++;
@@ -1499,6 +1508,8 @@ static Cljc *read_string(const char **p) {
 }
 
 static Cljc *read_list(const char **p, char close) {
+    int col0 = (rd_line && rd_line_start && *p >= rd_line_start)
+        ? (int)(*p - rd_line_start) + 1 : 0;
     (*p)++; /* consume open */
     int line0 = rd_line;
     Cljc *head = NIL, **tail = &head;
@@ -1510,6 +1521,7 @@ static Cljc *read_list(const char **p, char close) {
             if (line0 && head != NIL) {   /* location for error traces */
                 Cljc *m = mk_map();
                 m = map_assoc(m, mk_kw(intern("line", 4)), mk_int(line0));
+                if (col0) m = map_assoc(m, mk_kw(intern("col", 3)), mk_int(col0));
                 head->meta = m;
             }
             return head;
@@ -2762,16 +2774,27 @@ static void print_error(void) {
             fprintf(CERR, "\n%s%4lld |%s ", CYN, err_line, OFF);
             fwrite(p, 1, len, CERR);
             fputc('\n', CERR);
-            if (err_token) {
-                const char *hit = strstr(p, err_token);
-                if (hit && (e == NULL || hit < e)) {
-                    fprintf(CERR, "     %s| ", CYN);
-                    for (const char *c = p; c < hit; c++)
-                        fputc(*c == '\t' ? '\t' : ' ', CERR);
-                    fprintf(CERR, "%s", RED);
-                    for (size_t i = 0; i < strlen(err_token); i++) fputc('^', CERR);
-                    fprintf(CERR, "%s\n", OFF);
-                }
+            const char *hit = NULL;
+            size_t hitlen = 1;
+            if (err_token) {   /* precise: the named token, searched from the form's col */
+                const char *from = (err_col > 0 && (size_t)err_col <= len)
+                    ? p + err_col - 1 : p;
+                hit = strstr(from, err_token);
+                if (!hit || (e && hit >= e)) hit = strstr(p, err_token);
+                if (hit && e && hit >= e) hit = NULL;
+                if (hit) hitlen = strlen(err_token);
+            }
+            if (!hit && err_col > 0 && (size_t)err_col <= len) {
+                hit = p + err_col - 1;   /* fallback: the form's opening paren */
+                hitlen = 1;
+            }
+            if (hit) {
+                fprintf(CERR, "     %s| ", CYN);
+                for (const char *c = p; c < hit; c++)
+                    fputc(*c == '\t' ? '\t' : ' ', CERR);
+                fprintf(CERR, "%s", RED);
+                for (size_t i = 0; i < hitlen; i++) fputc('^', CERR);
+                fprintf(CERR, "%s\n", OFF);
             }
         }
     }

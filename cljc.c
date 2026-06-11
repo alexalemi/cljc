@@ -2495,6 +2495,15 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
+    if (v->tag == CLJC_STRING) {
+        /* Strings seq into 1-char strings — no char type (divergence). */
+        Cljc *out = NIL, **t = &out;
+        for (const char *c = v->as.str; *c; c++) {
+            *t = mk_cons(mk_str(c, 1), NIL);
+            t = &(*t)->as.cons.tail;
+        }
+        return out;
+    }
     if (v->tag == CLJC_SET) return set_element_list(v);
     if (v->tag == CLJC_MAP) {
         /* Maps seq into [k v] entry vectors. */
@@ -3588,6 +3597,24 @@ static Cljc *prim_rand_int(CljcEnv *env, Cljc *args) {
 
 /* ── read-string / eval / peek / pop / empty ── */
 
+static Cljc *prim_parse_long(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *s = as_str(args->as.cons.head, "parse-long");
+    char *end;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return NIL;  /* whole string or nil */
+    return mk_int((int64_t)v);
+}
+
+static Cljc *prim_parse_double(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *s = as_str(args->as.cons.head, "parse-double");
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0') return NIL;
+    return mk_double(v);
+}
+
 static Cljc *prim_read_string(CljcEnv *env, Cljc *args) {
     (void)env;
     const char *p = as_str(args->as.cons.head, "read-string");
@@ -3686,6 +3713,8 @@ static const char *PRELUDE =
     "(defn filterv [f coll] (apply vector (filter f coll)))\n"
     "(defn repeat [n x] (map (constantly x) (range n)))\n"
     "(defn nthrest [coll n] (drop n coll))\n"
+    "(defn split-at [n coll] [(take n coll) (drop n coll)])\n"
+    "(defn str/split-lines [s] (re-split s \"\\r?\\n\"))\n"
     "(defmacro if-not [test then & else] `(if (not ~test) ~then ~@else))\n"
     "(defmacro when-not [test & body] `(when (not ~test) ~@body))\n"
     "(defmacro -> [x & forms]\n"
@@ -3737,12 +3766,14 @@ static const char *PRELUDE =
     "      (recur (next a) (next b) (cons (first b) (cons (first a) acc)))\n"
     "      (reverse acc))))\n"
     "(defn interpose [sep coll] (rest (mapcat (fn [x] (list sep x)) coll)))\n"
-    "(defn partition [n coll]\n"
-    "  (loop [s (seq coll) acc (list)]\n"
-    "    (let [chunk (take n s)]\n"
-    "      (if (< (count chunk) n)\n"
-    "        (reverse acc)\n"
-    "        (recur (seq (drop n s)) (cons chunk acc))))))\n"
+    "(defn partition\n"
+    "  ([n coll] (partition n n coll))\n"
+    "  ([n step coll]\n"
+    "   (loop [s (seq coll) acc (list)]\n"
+    "     (let [chunk (take n s)]\n"
+    "       (if (< (count chunk) n)\n"
+    "         (reverse acc)\n"
+    "         (recur (seq (drop step s)) (cons chunk acc)))))))\n"
     "(defn distinct [coll]\n"
     "  (reverse (loop [s (seq coll) acc (list)]\n"
     "    (if s\n"
@@ -3870,8 +3901,8 @@ static const char *PRELUDE =
     "              (recur (rest (rest cs))\n"
     "                     (cons (first (rest cs)) (cons (list p (first cs) e) acc))))))))))\n"
     "(defn rand-nth [coll] (nth (vec coll) (rand-int (count coll))))\n"
-    "(defn max-key [f x & xs] (reduce (fn [a b] (if (>= (f a) (f b)) a b)) x xs))\n"
-    "(defn min-key [f x & xs] (reduce (fn [a b] (if (<= (f a) (f b)) a b)) x xs))\n"
+    "(defn max-key [f x & xs] (reduce (fn [a b] (if (> (f a) (f b)) a b)) x xs))\n"
+    "(defn min-key [f x & xs] (reduce (fn [a b] (if (< (f a) (f b)) a b)) x xs))\n"
     "(defn set/union [& sets] (reduce (fn [a s] (reduce conj a (seq s))) #{} sets))\n"
     "(defn set/intersection [s1 s2] (set (filter (fn [x] (contains? s2 x)) (seq s1))))\n"
     "(defn set/difference [s1 s2] (set (remove (fn [x] (contains? s2 x)) (seq s1))))\n"
@@ -4000,6 +4031,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "rand",       prim_rand);
     cljc_define_native(e, "rand-int",   prim_rand_int);
     cljc_define_native(e, "read-string", prim_read_string);
+    cljc_define_native(e, "parse-long",   prim_parse_long);
+    cljc_define_native(e, "parse-double", prim_parse_double);
     cljc_define_native(e, "eval",        prim_eval);
     cljc_define_native(e, "peek",        prim_peek);
     cljc_define_native(e, "pop",         prim_pop);

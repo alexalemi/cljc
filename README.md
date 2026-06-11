@@ -92,6 +92,16 @@ treat as orders of magnitude):
 | regex word-frequency | **23 ms** | 23 ms | 632 ms |
 | fib(32), ~1 s of compute | 1.00 s | **0.54 s** | 0.63 s |
 
+Real-program benchmarks — [Advent of Code](https://adventofcode.com/) solutions
+in `benchmarks/aoc/`, identical sources and answers on all three runtimes:
+
+| puzzle (AoC 2017) | cljc | babashka | Clojure |
+|---|---|---|---|
+| day 1: digit pairs | **5 ms** | 12 ms | 586 ms |
+| day 4: passphrases (sets + regex) | **11 ms** | 16 ms | 608 ms |
+| day 5: jump tape (25M vector assocs) | 17.0 s | 8.2 s | **2.9 s** |
+| day 6: redistribution (vectors as hash keys) | 186 ms | **101 ms** | 640 ms |
+
 Honest reading: babashka wins most compute because its `clojure.core` is
 AOT-compiled native code — SCI only interprets your glue, while cljc interprets
 *everything*. That cljc stays within ~1.5–4× of bb with a 4,000-line tree-walker

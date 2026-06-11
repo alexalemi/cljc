@@ -612,4 +612,24 @@
 (defn redefn-test [] :v3)
 (assert= :v3 (fn-using-redef))             ; calls see the latest def
 
+; ── AoC-portability compat additions ──
+(assert= (list "a" "b" "c") (seq "abc"))             ; strings seq as 1-char strings
+(assert= nil (seq ""))
+(assert= "h" (first "hello"))
+(assert= 42 (parse-long "42"))
+(assert= -7 (parse-long "-7"))
+(assert= nil (parse-long "4x"))
+(assert= nil (parse-long ""))
+(assert= 2.5 (parse-double "2.5"))
+(assert= nil (parse-double "abc"))
+(assert= (list (list 1 2) (list 2 3) (list 3 4)) (partition 2 1 [1 2 3 4]))
+(assert= (list (list 1 2) (list 3 4)) (partition 2 [1 2 3 4 5]))
+(assert= [(list 1 2) (list 3 4 5)] (split-at 2 [1 2 3 4 5]))
+(assert= ["a" "b" "c"] (str/split-lines "a\nb\nc"))
+(assert= ["x" "y"] (str/split-lines "x\r\ny"))
+(assert= [3 4] (max-key count [1 2] [3 4]))          ; ties: LAST wins, like Clojure
+(assert= :b (max-key (constantly 1) :a :b))
+(assert= :b (min-key (constantly 1) :a :b))
+(assert= {"l" 2 "h" 1 "e" 1 "o" 1} (frequencies (seq "hello")))
+
 (println "tests complete")

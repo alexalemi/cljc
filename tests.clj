@@ -1080,4 +1080,67 @@
 (assert= '(1 2) (distinct [1 1 2]))
 (assert= '((1 2) (3)) (partition-all 2 [1 2 3]))
 
+; case — list branches match members; no match without default throws
+(assert= :slide (case \> (\> \<) :slide :other))
+(assert= :other (case \^ (\> \<) :slide :other))
+(assert= :mid (case 5 (1 2 3) :low (4 5 6) :mid :high))
+(assert= :threw (try (case :zz :a 1) (catch Exception e :threw)))
+(assert= :dflt (case :zz :a 1 :dflt))
+
+; bit ops
+(assert= 7 (bit-or 1 2 4))
+(assert= 2 (bit-and 6 3))
+(assert= 6 (bit-xor 5 3))
+(assert= -1 (bit-not 0))
+(assert= 1024 (bit-shift-left 1 10))
+(assert= -4 (bit-shift-right -16 2))
+(assert= 15 (unsigned-bit-shift-right -1 60))
+(assert= true (bit-test 5 2))
+(assert= 8 (bit-set 0 3))
+(assert= 14 (bit-clear 15 0))
+(assert= 4 (bit-and-not 5 1))
+
+; missing-builtins batch
+(assert= "a" (char 97))
+(assert= "a" (char "a"))
+(assert= '(1 3 6) (reductions + [1 2 3]))
+(assert= '(10 11 13) (reductions + 10 [1 2]))
+(assert= true ((every-pred pos? odd?) 3 5))
+(assert= false ((every-pred pos? odd?) 3 4))
+(assert= true ((some-fn neg? odd?) 2 3))
+(assert= nil ((some-fn neg? odd?) 2 4))
+(assert= 3 ((memoize +) 1 2))
+(assert= '(3 4) (take-last 2 [1 2 3 4]))
+(assert= '(1 2) (drop-last [1 2 3]))
+(assert= '(1) (drop-last 2 [1 2 3]))
+(assert= '(0 3 6 9) (take-nth 3 (range 10)))
+(assert= [0 2 4] (into [] (take-nth 2) (range 6)))
+(assert= {"a" 1} (update-keys {:a 1} name))
+(assert= {:a 2} (update-vals {:a 1} inc))
+(assert= "a-bXc" (str/replace-first "aXbXc" "X" "-"))
+(assert= "aXbXc" (str/replace-first "aXbXc" "Z" "-"))
+(assert= "aa" (re-find (re-pattern "a+") "caat"))
+(assert= :int (class 1))
+(assert= true (boolean? false))
+(assert= false (boolean? nil))
+(assert= true (nat-int? 0))
+(assert= false (nat-int? -1))
+(assert= true (sequential? [1]))
+(assert= false (sequential? {:a 1}))
+
+; cons onto lazy-seq: print/equality/nth/count see through lazy tails
+(assert= "(10 11 13)" (pr-str (cons 10 (lazy-seq (list 11 13)))))
+(assert= true (= (cons 1 (lazy-seq (list 2))) (list 1 2)))
+(assert= 6 (nth (map inc (range)) 5))
+(assert= 2 (nth (cons 0 (lazy-seq (list 1 2))) 2))
+(assert= 3 (count (cons 0 (lazy-seq (list 1 2)))))
+
+; clojure.test + clojure.string shims; ns with [:require ...] vectors
+(ns cljc-test-shim-probe [:require [clojure.test :as ctest]
+                          [clojure.string :as string]])
+(ctest/deftest cljc-shim-works (ctest/is (= 4 (+ 2 2))) (ctest/are [x y] (= x y) 1 1 2 2))
+(assert= true (fn? ctest/run-tests))
+(assert= ["a" "b"] (string/split "a b" #" "))
+(assert= "HI" (clojure.string/upper-case "hi"))
+
 (println "tests complete")

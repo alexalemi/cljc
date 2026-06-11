@@ -2306,6 +2306,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         if (!KW_REQ) KW_REQ = intern("require", 7);
                         for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
                             Cljc *cl = c->as.cons.head;
+                            /* a clause is (:require ...) or [:require ...] */
                             if (cl != NIL && cl->tag == CLJC_LIST &&
                                 cl->as.cons.head->tag == CLJC_KEYWORD &&
                                 cl->as.cons.head->as.kw == KW_REQ) {
@@ -2314,6 +2315,17 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                     Cljc *callee = env_lookup_maybe(env, "cljc/require-one");
                                     if (callee) {
                                         Cljc *one[1] = {sp->as.cons.head};
+                                        apply(env, callee, one, 1);
+                                    }
+                                }
+                            } else if (cl != NIL && cl->tag == CLJC_VECTOR &&
+                                       vec_len(cl) > 0 &&
+                                       vec_nth(cl, 0)->tag == CLJC_KEYWORD &&
+                                       vec_nth(cl, 0)->as.kw == KW_REQ) {
+                                for (uint32_t vi = 1; vi < vec_len(cl); vi++) {
+                                    Cljc *callee = env_lookup_maybe(env, "cljc/require-one");
+                                    if (callee) {
+                                        Cljc *one[1] = {vec_nth(cl, vi)};
                                         apply(env, callee, one, 1);
                                     }
                                 }
@@ -2642,7 +2654,8 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_LIST: {
             sb_putc(sb, '(');
             bool first = true;
-            for (Cljc *l = v; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+            /* seq1 step: a lazy tail (cons onto lazy-seq) keeps printing */
+            for (Cljc *l = v; l && l->tag == CLJC_LIST; l = seq1(l->as.cons.tail)) {
                 if (!first) sb_putc(sb, ' ');
                 first = false;
                 print_to(sb, l->as.cons.head, readably);
@@ -2922,9 +2935,9 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
     if (a == NULL || b == NULL) return false;
     bool a_seq = a->tag == CLJC_LIST || a->tag == CLJC_VECTOR || a->tag == CLJC_LAZY;
     bool b_seq = b->tag == CLJC_LIST || b->tag == CLJC_VECTOR || b->tag == CLJC_LAZY;
-    if (a_seq && b_seq)
-        return seq_eq(a->tag == CLJC_LAZY ? to_seq(a) : a,
-                      b->tag == CLJC_LAZY ? to_seq(b) : b);
+    if (a_seq && b_seq)  /* to_seq also surfaces lazy tails hidden in lists */
+        return seq_eq(a->tag == CLJC_VECTOR ? a : to_seq(a),
+                      b->tag == CLJC_VECTOR ? b : to_seq(b));
     if (a->tag != b->tag) {
         /* Numeric cross-equality: int vs double. */
         if ((a->tag == CLJC_INT && b->tag == CLJC_DOUBLE) ||
@@ -3067,8 +3080,8 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
         ? argv[2] : NULL;
     if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
-    } else if (coll && coll->tag == CLJC_LIST) {
-        for (Cljc *l = coll; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    } else if (coll && (coll->tag == CLJC_LIST || coll->tag == CLJC_LAZY)) {
+        for (Cljc *l = seq1(coll); l && l->tag == CLJC_LIST; l = seq1(l->as.cons.tail))
             if (n-- == 0) return l->as.cons.head;
     }
     if (not_found) return not_found;
@@ -4832,6 +4845,111 @@ static Cljc *prim_rand_int(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 
+/* ── bit operations (int64) ── */
+
+#define BIT_FOLD(NAME, OP) \
+    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+        (void)env; \
+        int64_t v = as_int(argv[0], #NAME); \
+        for (int bi_ = 1; bi_ < nargs; bi_++) v = v OP as_int(argv[bi_], #NAME); \
+        return mk_int(v); \
+    }
+
+BIT_FOLD(bit_and, &)
+BIT_FOLD(bit_or,  |)
+BIT_FOLD(bit_xor, ^)
+
+static Cljc *prim_bit_not(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_int(~as_int(argv[0], "bit-not"));
+}
+
+static Cljc *prim_bit_and_not(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    int64_t v = as_int(argv[0], "bit-and-not");
+    for (int bi_ = 1; bi_ < nargs; bi_++) v &= ~as_int(argv[bi_], "bit-and-not");
+    return mk_int(v);
+}
+
+static Cljc *prim_bsl(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_int((int64_t)((uint64_t)as_int(argv[0], "bit-shift-left")
+                            << (as_int(argv[1], "bit-shift-left") & 63)));
+}
+
+static Cljc *prim_bsr(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_int(as_int(argv[0], "bit-shift-right")
+                  >> (as_int(argv[1], "bit-shift-right") & 63));
+}
+
+static Cljc *prim_ubsr(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_int((int64_t)((uint64_t)as_int(argv[0], "unsigned-bit-shift-right")
+                            >> (as_int(argv[1], "unsigned-bit-shift-right") & 63)));
+}
+
+static Cljc *prim_bit_test(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_bool((as_int(argv[0], "bit-test") >> (as_int(argv[1], "bit-test") & 63)) & 1);
+}
+
+static Cljc *prim_bit_set(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_int(as_int(argv[0], "bit-set") | ((int64_t)1 << (as_int(argv[1], "bit-set") & 63)));
+}
+
+static Cljc *prim_bit_clear(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_int(as_int(argv[0], "bit-clear") & ~((int64_t)1 << (as_int(argv[1], "bit-clear") & 63)));
+}
+
+static Cljc *prim_bit_flip(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return mk_int(as_int(argv[0], "bit-flip") ^ ((int64_t)1 << (as_int(argv[1], "bit-flip") & 63)));
+}
+
+/* (char 97) → "a" — code point to (UTF-8) one-char string; strings pass
+ * through, so (char (first "abc")) works in char-as-string cljc. */
+static Cljc *prim_char(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (argv[0] != NIL && argv[0]->tag == CLJC_STRING) return argv[0];
+    int64_t c = as_int(argv[0], "char");
+    char b[4];
+    int n = 0;
+    if (c < 0x80) b[n++] = (char)c;
+    else if (c < 0x800) {
+        b[n++] = (char)(0xC0 | (c >> 6));
+        b[n++] = (char)(0x80 | (c & 0x3F));
+    } else {
+        b[n++] = (char)(0xE0 | (c >> 12));
+        b[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
+        b[n++] = (char)(0x80 | (c & 0x3F));
+    }
+    return mk_str(b, (size_t)n);
+}
+
+/* (str/replace-first s match repl) — first occurrence only, literal match. */
+static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    char *s = as_str(argv[0], "str/replace-first");
+    char *m = as_str(argv[1], "str/replace-first");
+    char *r = as_str(argv[2], "str/replace-first");
+    char *hit = *m ? strstr(s, m) : NULL;
+    if (!hit) return argv[0];
+    SBuf sb = {0};
+    sb_grow(&sb, 1);
+    sb.data[0] = '\0';
+    size_t pre = (size_t)(hit - s), ml = strlen(m), rl = strlen(r);
+    sb_grow(&sb, pre + rl + strlen(hit + ml));
+    memcpy(sb.data + sb.len, s, pre); sb.len += pre;
+    memcpy(sb.data + sb.len, r, rl); sb.len += rl;
+    strcpy(sb.data + sb.len, hit + ml); sb.len += strlen(hit + ml);
+    Cljc *out = mk_str(sb.data, sb.len);
+    free(sb.data);
+    return out;
+}
+
 /* ── read-string / eval / peek / pop / empty ── */
 
 static Cljc *prim_parse_long(CljcEnv *env, Cljc **argv, int nargs) {
@@ -5145,18 +5263,27 @@ static const char *PRELUDE =
     "       (recur (next s#)))))\n"
     "(defmacro while [test & body]\n"
     "  `(loop [] (when ~test ~@body (recur))))\n"
+    /* case: a (v1 v2 ...) test matches any member (Clojure semantics);
+     * no match and no default throws No matching clause. */
     "(defmacro case [e & clauses]\n"
-    "  (let [g (gensym \"case\")]\n"
+    "  (let [g (gensym \"case\")\n"
+    "        pred (fn [t]\n"
+    "               (if (and (list? t) (seq t))\n"
+    "                 (cons 'or (map (fn [v] (list '= g (list 'quote v))) t))\n"
+    "                 (list '= g (list 'quote t))))]\n"
     "    (list 'let [g e]\n"
     "      (cons 'cond\n"
     "        (loop [cs clauses acc (list)]\n"
     "          (if (empty? cs)\n"
-    "            (reverse acc)\n"
+    "            (reverse (cons (list 'throw (list 'ex-info\n"
+    "                                             (list 'str \"No matching clause: \" (list 'pr-str g))\n"
+    "                                             {}))\n"
+    "                           (cons :else acc)))\n"
     "            (if (empty? (rest cs))\n"
     "              (reverse (cons (first cs) (cons :else acc)))\n"
     "              (recur (rest (rest cs))\n"
     "                     (cons (first (rest cs))\n"
-    "                           (cons (list '= g (list 'quote (first cs))) acc))))))))))\n"
+    "                           (cons (pred (first cs)) acc))))))))))\n"
     "(defmacro for [bindings body]\n"
     "  (if (empty? bindings)\n"
     "    `(list ~body)\n"
@@ -5196,6 +5323,30 @@ static const char *PRELUDE =
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
     "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
     "(defn sequential? [x] (or (list? x) (vector? x) (seq? x)))\n"
+    "(def class type)\n"
+    "(defn re-pattern [s] s)\n"           /* regexes are plain strings */
+    "(defn boolean? [x] (or (true? x) (false? x)))\n"
+    "(defn nat-int? [x] (and (int? x) (>= x 0)))\n"
+    "(defn isa? [c p] (= c p))\n"          /* no hierarchies (v0) */
+    "(defn every-pred [& ps]\n"
+    "  (fn [& args] (every? (fn [p] (every? p args)) ps)))\n"
+    "(defn some-fn [& ps]\n"
+    "  (fn [& args] (some (fn [p] (some p args)) ps)))\n"
+    "(defn memoize [f]\n"
+    "  (let [cache (atom {})]\n"
+    "    (fn [& args]\n"
+    "      (let [hit (get @cache args :cljc/memo-miss)]\n"
+    "        (if (= hit :cljc/memo-miss)\n"
+    "          (let [v (apply f args)] (swap! cache assoc args v) v)\n"
+    "          hit)))))\n"
+    "(defn take-last [n coll] (drop (max 0 (- (count coll) n)) coll))\n"
+    "(defn drop-last\n"
+    "  ([coll] (drop-last 1 coll))\n"
+    "  ([n coll] (take (max 0 (- (count coll) n)) coll)))\n"
+    "(defn update-keys [m f]\n"
+    "  (into {} (map (fn [kv] [(f (first kv)) (second kv)]) (seq m))))\n"
+    "(defn update-vals [m f]\n"
+    "  (into {} (map (fn [kv] [(first kv) (f (second kv))]) (seq m))))\n"
     /* defonce: evaluating a bare unbound symbol throws — catch it and def.
      * Keeps atoms etc. alive across re-evaluation (notebook saves, reloads). */
     "(defmacro defonce [n e] `(try ~n (catch Exception ex# (def ~n ~e))))\n"
@@ -5502,6 +5653,20 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "str/ends-with?",   prim_ends_with);
     cljc_define_native(e, "str/includes?",    prim_includes);
     cljc_define_native(e, "str/index-of",     prim_index_of);
+    cljc_define_native(e, "str/replace-first", prim_replace_first);
+    cljc_define_native(e, "bit-and", prim_bit_and);
+    cljc_define_native(e, "bit-or",  prim_bit_or);
+    cljc_define_native(e, "bit-xor", prim_bit_xor);
+    cljc_define_native(e, "bit-not", prim_bit_not);
+    cljc_define_native(e, "bit-and-not", prim_bit_and_not);
+    cljc_define_native(e, "bit-shift-left",  prim_bsl);
+    cljc_define_native(e, "bit-shift-right", prim_bsr);
+    cljc_define_native(e, "unsigned-bit-shift-right", prim_ubsr);
+    cljc_define_native(e, "bit-test",  prim_bit_test);
+    cljc_define_native(e, "bit-set",   prim_bit_set);
+    cljc_define_native(e, "bit-clear", prim_bit_clear);
+    cljc_define_native(e, "bit-flip",  prim_bit_flip);
+    cljc_define_native(e, "char", prim_char);
     cljc_define_native(e, "str/blank?",       prim_blank_p);
     cljc_eval_string(e, PRELUDE);
     /* Lazy core: shadows the eager natives so pipelines compose lazily.
@@ -5752,7 +5917,24 @@ CljcEnv *cljc_new_env(void) {
         "(def cljc/into-impl into)\n"
         "(defn into\n"
         "  ([to from] (cljc/into-impl to from))\n"
-        "  ([to xform from] (transduce xform conj to from)))\n");
+        "  ([to xform from] (transduce xform conj to from)))\n"
+        "(defn reductions\n"
+        "  ([f coll] (lazy-seq (if-let [s (seq coll)]\n"
+        "                        (reductions f (first s) (rest s))\n"
+        "                        (list (f)))))\n"
+        "  ([f init coll]\n"
+        "   (cons init (lazy-seq (when-let [s (seq coll)]\n"
+        "                          (reductions f (f init (first s)) (rest s)))))))\n"
+        "(defn take-nth-xf [n]\n"
+        "  (fn [rf]\n"
+        "    (let [i (volatile! -1)]\n"
+        "      (fn ([] (rf)) ([acc] (rf acc))\n"
+        "        ([acc x] (if (zero? (mod (vswap! i inc) n)) (rf acc x) acc))))))\n"
+        "(defn take-nth\n"
+        "  ([n] (take-nth-xf n))\n"
+        "  ([n coll] (lazy-seq (when-let [s (seq coll)]\n"
+        "                        (cons (first s) (take-nth n (drop n s)))))))\n"
+        "(def pmap map)\n");   /* single-threaded: same results, no parallelism */
     /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
     cljc_eval_string(e,
         "(def cljc/multi-tables (atom {}))\n"

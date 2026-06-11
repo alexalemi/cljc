@@ -39,15 +39,36 @@
                      (println "ERROR in is:" (ex-message e#)) false))
         '~form ~msg))))
 
-(defn run-tests []
-  (reset! cljc/test-pass 0)
-  (reset! cljc/test-fail 0)
-  (doseq [[tname f] @cljc/tests]
-    (swap! cljc/test-context conj (str tname))
-    (try (f) (catch Exception e
-               (swap! cljc/test-fail inc)
-               (println "ERROR" tname ":" (ex-message e))))
-    (swap! cljc/test-context pop))
-  (println "\nRan" (count @cljc/tests) "tests:"
-           @cljc/test-pass "passed," @cljc/test-fail "failed.")
-  (zero? @cljc/test-fail))
+;; (are [x y] (= x y)  1 1  2 (inc 1)) — template substitution per group
+(defn cljc/test-subst [smap form]
+  (cond
+    (contains? smap form) (get smap form)
+    (list? form) (apply list (map (fn [f] (cljc/test-subst smap f)) form))
+    (vector? form) (mapv (fn [f] (cljc/test-subst smap f)) form)
+    (map? form) (into {} (map (fn [kv] [(cljc/test-subst smap (first kv))
+                                        (cljc/test-subst smap (second kv))])
+                              (seq form)))
+    :else form))
+
+(defmacro are [argv expr & args]
+  (cons 'do
+        (map (fn [group] (list 'is (cljc/test-subst (zipmap argv group) expr)))
+             (partition (count argv) args))))
+
+(defn use-fixtures [& _] nil)   ; fixtures are a no-op (flat env, no vars)
+
+(defn run-tests
+  ([& _]
+   (reset! cljc/test-pass 0)
+   (reset! cljc/test-fail 0)
+   (doseq [[tname f] @cljc/tests]
+     (swap! cljc/test-context conj (str tname))
+     (try (f) (catch Exception e
+                (swap! cljc/test-fail inc)
+                (println "ERROR" tname ":" (ex-message e))))
+     (swap! cljc/test-context pop))
+   (println "\nRan" (count @cljc/tests) "tests:"
+            @cljc/test-pass "passed," @cljc/test-fail "failed.")
+   (zero? @cljc/test-fail)))
+
+(def run-all-tests run-tests)

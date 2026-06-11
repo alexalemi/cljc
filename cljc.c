@@ -1288,7 +1288,8 @@ static Cljc *read_form(const char **p) {
         int maxn = 0;
         bool pct = false, pctn = false, variadic = false;
         /* scan for %-symbols (iterative worklist over nested collections) */
-        Cljc *work[64]; int wn = 0;
+        Cljc *work[256]; int wn = 0;
+        bool overflow = false;
         work[wn++] = body;
         while (wn > 0) {
             Cljc *f = work[--wn];
@@ -1302,19 +1303,21 @@ static Cljc *read_form(const char **p) {
                     if (s[1] - '0' > maxn) maxn = s[1] - '0';
                 }
             } else if (f->tag == CLJC_LIST) {
-                for (Cljc *l = f; l && l->tag == CLJC_LIST && wn < 62; l = l->as.cons.tail)
+                for (Cljc *l = f; l && l->tag == CLJC_LIST && wn < 254; l = l->as.cons.tail)
                     work[wn++] = l->as.cons.head;
             } else if (f->tag == CLJC_VECTOR) {
-                for (size_t i = 0; i < vec_len(f) && wn < 62; i++)
+                for (size_t i = 0; i < vec_len(f) && wn < 254; i++)
                     work[wn++] = vec_nth(f, i);
             } else if (f->tag == CLJC_MAP) {
-                for (Cljc *e = map_entry_list(f); e && e->tag == CLJC_LIST && wn < 61;
+                for (Cljc *e = map_entry_list(f); e && e->tag == CLJC_LIST && wn < 253;
                      e = e->as.cons.tail) {
                     work[wn++] = e->as.cons.head->as.cons.head;
                     work[wn++] = e->as.cons.head->as.cons.tail;
                 }
             }
         }
+        if (wn >= 253) overflow = true;
+        if (overflow) cljc_error("#(): body too complex to scan for %% params");
         if (pct && pctn) cljc_error("#(): use %% or %%1, not both");
         Cljc *items[11];
         size_t ni = 0;
@@ -2799,7 +2802,6 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
-    if (v->tag == CLJC_LIST) return v;
     if (v->tag == CLJC_VECTOR) {
         Cljc *out = NIL, **t = &out;
         for (size_t i = 0; i < vec_len(v); i++) {
@@ -4476,7 +4478,19 @@ CljcEnv *cljc_new_env(void) {
         "(defn cycle [c] (lazy-seq (concat (seq c) (cycle c))))\n"
         "(defn repeatedly\n"
         "  ([f] (lazy-seq (cons (f) (repeatedly f))))\n"
-        "  ([n f] (take n (repeatedly f))))\n");
+        "  ([n f] (take n (repeatedly f))))\n"
+        "(defn drop [n c]\n"
+        "  (lazy-seq (loop [n n s (seq c)]\n"
+        "              (if (and (pos? n) s) (recur (dec n) (seq (rest s))) s))))\n"
+        "(defn mapcat [f c]\n"
+        "  (lazy-seq (when-let [s (seq c)]\n"
+        "              (concat (f (first s)) (mapcat f (rest s))))))\n"
+        "(defn interleave [c1 c2]\n"
+        "  (lazy-seq (let [s1 (seq c1) s2 (seq c2)]\n"
+        "              (when (and s1 s2)\n"
+        "                (cons (first s1)\n"
+        "                      (cons (first s2)\n"
+        "                            (interleave (rest s1) (rest s2))))))))\n");
     /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
     cljc_eval_string(e,
         "(def cljc/multi-tables (atom {}))\n"

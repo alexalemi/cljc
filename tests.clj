@@ -722,4 +722,11 @@
 (assert= :int (type 5))
 (assert= :vector (type []))
 
+; ── bughunt: lazy stragglers (used to hang on infinite seqs) ──
+(assert= (list 2 3 4) (take 3 (drop 2 (range))))
+(assert= (list 0 0 1) (take 3 (mapcat (fn [x] [x x]) (range))))
+(assert= (list 0 :a 1 :a) (take 4 (interleave (range) (cycle [:a]))))
+(assert= (list 3 4) (drop 2 [1 2 3 4]))          ; finite drop still right
+(assert= (list 1 1 2 2) (mapcat (fn [x] [x x]) [1 2]))
+
 (println "tests complete")

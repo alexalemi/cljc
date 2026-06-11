@@ -4540,6 +4540,70 @@ static Cljc *prim_mtime(CljcEnv *env, Cljc **argv, int nargs) {
                   + st.st_mtim.tv_nsec / 1000000);
 }
 
+/* ── MD5 (RFC 1321) — backs util/md5-style hashing puzzles ── */
+
+static const uint32_t md5_k[64] = {
+    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,
+    0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,
+    0x6b901122,0xfd987193,0xa679438e,0x49b40821,0xf61e2562,0xc040b340,
+    0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,
+    0x676f02d9,0x8d2a4c8a,0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,
+    0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,
+    0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,
+    0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,
+    0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
+static const int md5_r[64] = {
+    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+
+static void md5_block(uint32_t st[4], const unsigned char *p) {
+    uint32_t m[16], a = st[0], b = st[1], c = st[2], d = st[3];
+    for (int i = 0; i < 16; i++)
+        m[i] = (uint32_t)p[i*4] | ((uint32_t)p[i*4+1] << 8)
+             | ((uint32_t)p[i*4+2] << 16) | ((uint32_t)p[i*4+3] << 24);
+    for (int i = 0; i < 64; i++) {
+        uint32_t f, g;
+        if (i < 16)      { f = (b & c) | (~b & d);  g = (uint32_t)i; }
+        else if (i < 32) { f = (d & b) | (~d & c);  g = (5u*(uint32_t)i + 1) & 15; }
+        else if (i < 48) { f = b ^ c ^ d;           g = (3u*(uint32_t)i + 5) & 15; }
+        else             { f = c ^ (b | ~d);        g = (7u*(uint32_t)i) & 15; }
+        uint32_t t = d;
+        d = c; c = b;
+        uint32_t x = a + f + md5_k[i] + m[g];
+        b += (x << md5_r[i]) | (x >> (32 - md5_r[i]));
+        a = t;
+    }
+    st[0] += a; st[1] += b; st[2] += c; st[3] += d;
+}
+
+/* (cljc/md5* s) → 32-char lowercase hex digest. */
+static Cljc *prim_md5(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    char *s = as_str(argv[0], "cljc/md5*");
+    size_t n = strlen(s);
+    uint32_t st[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) md5_block(st, (const unsigned char *)s + i);
+    unsigned char tail[128];
+    size_t tn = n - i;
+    memcpy(tail, s + i, tn);
+    tail[tn++] = 0x80;
+    size_t blocks = tn + 8 <= 64 ? 64 : 128;
+    memset(tail + tn, 0, blocks - tn);
+    uint64_t bits = (uint64_t)n * 8;
+    for (int k = 0; k < 8; k++) tail[blocks - 8 + k] = (unsigned char)(bits >> (8 * k));
+    md5_block(st, tail);
+    if (blocks == 128) md5_block(st, tail + 64);
+    char hex[33];
+    for (int k = 0; k < 16; k++)
+        snprintf(hex + 2*k, 3, "%02x", (st[k/4] >> (8 * (k & 3))) & 0xff);
+    return mk_str(hex, 32);
+}
+
 /* (cljc/now-ms*) → monotonic milliseconds as a double (for `time`). */
 static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
@@ -4747,6 +4811,14 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
                 break;
             }
             case 'd': case 'x': case 'X': case 'o':
+                /* %x with a pre-formatted string (e.g. an md5 hex digest
+                 * standing in for BigInteger): zero-pad and pass through. */
+                if (v != NIL && v->tag == CLJC_STRING && (conv == 'x' || conv == 'X')) {
+                    size_t want = (size_t)atoi(*spec == '0' ? spec + 1 : spec);
+                    for (size_t k = strlen(v->as.str); k < want; k++) sb_putc(&out, '0');
+                    sb_puts(&out, v->as.str);
+                    break;
+                }
                 snprintf(cfmt, sizeof cfmt, "%%%sll%c", spec, conv);
                 snprintf(tmp, sizeof tmp, cfmt, (long long)as_int(v, "format"));
                 sb_puts(&out, tmp);
@@ -5458,6 +5530,37 @@ static const char *PRELUDE =
     /* PersistentQueue, as a vector: conj at back; peek/pop on vectors act
      * at the back too (LIFO not FIFO — divergence, noted in PLAN). */
     "(def clojure.lang.PersistentQueue/EMPTY [])\n"
+    /* Java-interop shims: enough for the canonical md5 idiom and common
+     * static calls to run verbatim. Method symbols (.foo) are plain
+     * globals here. */
+    "(defn MessageDigest/getInstance [algo]\n"
+    "  (if (= (str/upper-case algo) \"MD5\") :md5\n"
+    "      (throw (ex-info (str \"MessageDigest: only MD5 (got \" algo \")\") {}))))\n"
+    "(defn .getBytes [s] s)\n"
+    "(defn .digest [algo s] (cljc/md5* s))\n"   /* → 32-char hex string */
+    "(defn BigInteger. [signum x] x)\n"         /* hex passes through */
+    "(defn .indexOf [coll x]\n"
+    "  (if (string? coll)\n"
+    "    (or (str/index-of coll x) -1)\n"
+    "    (loop [i 0 s (seq coll)]\n"
+    "      (cond (nil? s) -1\n"
+    "            (= (first s) x) i\n"
+    "            :else (recur (inc i) (next s))))))\n"
+    /* Math/sqrt|pow|floor|ceil|round|abs are already natives */
+    "(def cljc/digit-chars \"0123456789abcdefghijklmnopqrstuvwxyz\")\n"
+    "(defn Character/digit [c radix]\n"
+    "  (let [i (str/index-of cljc/digit-chars (str/lower-case (str c)))]\n"
+    "    (if (and i (< i radix)) i -1)))\n"
+    "(defn Integer/parseInt\n"
+    "  ([s] (parse-long s))\n"
+    "  ([s radix]\n"
+    "   (reduce (fn [acc c]\n"
+    "             (let [d (Character/digit c radix)]\n"
+    "               (when (neg? d) (throw (ex-info (str \"bad digit: \" c) {})))\n"
+    "               (+ (* acc radix) d)))\n"
+    "           0 (seq s))))\n"
+    "(def Long/parseLong Integer/parseInt)\n"
+    "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
     "(def *load-path*\n"
     "  (vec (concat [\".\" \"vendor\"]\n"
     "               (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
@@ -5746,6 +5849,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/mtime*", prim_mtime);
     cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
     cljc_define_native(e, "cljc/epoch*", prim_epoch);
+    cljc_define_native(e, "cljc/md5*", prim_md5);
     cljc_define_native(e, "cljc/dir?*",  prim_dir_p);
     cljc_define_native(e, "cljc/list-dir*", prim_list_dir);
     cljc_define_native(e, "tcp/listen", prim_tcp_listen);

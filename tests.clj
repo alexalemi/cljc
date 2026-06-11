@@ -1206,4 +1206,26 @@
 (assert= ["aab" "aa" "b"] (re-matches #"(a*)(b)" "aab"))
 (assert= "x" (re-find #"x|xy" "xy"))               ; re-find stays unanchored
 
+; md5 native + the canonical Java digest idiom verbatim
+(assert= "d41d8cd98f00b204e9800998ecf8427e" (cljc/md5* ""))
+(assert= "900150983cd24fb0d6963f7d28e17f72" (cljc/md5* "abc"))
+(assert= "9e107d9d372bb6826bd81d3542a419d6" (cljc/md5* "The quick brown fox jumps over the lazy dog"))
+(defn cljc-test-md5 [s]
+  (let [algorithm (MessageDigest/getInstance "MD5")
+        raw (.digest algorithm (.getBytes s))]
+    (format "%032x" (BigInteger. 1 raw))))
+(assert= "000001dbbfa3a5c83a2d506429c7b00e" (cljc-test-md5 "abcdef609043"))
+
+; interop shims
+(assert= 2 (.indexOf "hello" "llo"))
+(assert= -1 (.indexOf "hello" "z"))
+(assert= 2 (.indexOf [4 5 6] 6))
+(assert= -1 (.indexOf [1] 9))
+(assert= 5 (Integer/parseInt "101" 2))
+(assert= 42 (Integer/parseInt "42"))
+(assert= 15 (Character/digit \f 16))
+(assert= -1 (Character/digit \z 10))
+(assert= 2.0 (Math/sqrt 4))
+(assert= :threw (try (throw (AssertionError. "boom")) (catch Exception e :threw)))
+
 (println "tests complete")

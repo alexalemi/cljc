@@ -836,7 +836,7 @@
 (assert= "still works!" (jit-no "still works"))     ; interpreted version intact
 
 ; ── library survey: upstream clojure.set via loading require ──
-(require 'clojure.set)
+(require '[clojure.set :refer [union intersection difference rename-keys map-invert project join select subset?]])
 (assert= #{1 2 3} (union #{1 2} #{2 3}))
 (assert= #{2 3} (intersection #{1 2 3} #{2 3 4}))
 (assert= #{1 3} (difference #{1 2 3} #{2}))
@@ -873,7 +873,7 @@
 (assert= {:a 1} (m/remove-vals nil? {:a 1 :b nil}))
 (assert= (list 1 :a 2 :b 3) (m/interleave-all [1 2 3] [:a :b]))
 (assert= {:b 3 :a 2} (m/map-vals inc {:a 1 :b 2}))
-(require 'clojure.walk)
+(require '[clojure.walk :refer [postwalk keywordize-keys prewalk-replace]])
 (assert= {:a 2 :b [3 4]} (postwalk (fn [x] (if (int? x) (inc x) x)) {:a 1 :b [2 3]}))
 (assert= {:a 1 :b {:c 2}} (keywordize-keys {"a" 1 "b" {"c" 2}}))
 (assert= [:y [:y :z]] (prewalk-replace {:x :y} [:x [:x :z]]))
@@ -884,12 +884,12 @@
 (assert= [1] (with-meta [1] {:k :v}))                ; meta invisible to =
 (assert= {:a 1 :b 2} (meta (vary-meta (with-meta [] {:a 1}) assoc :b 2)))
 (assert= :no (try (with-meta 42 {}) (catch Exception e :no)))
-(require 'clojure.zip)
-(def zt (vector-zip [1 [2 3] 4]))
-(assert= 3 (-> zt down right down right node))
-(assert= [2 [2 3] 4] (root (edit (-> zt down) inc)))
-(assert= [:X [2 3] 4] (-> zt down (replace :X) root))
-(assert= [1 [3] 4] (-> zt down right down remove root))
+(require '[clojure.zip :as z])
+(def zt (z/vector-zip [1 [2 3] 4]))
+(assert= 3 (-> zt z/down z/right z/down z/right z/node))
+(assert= [2 [2 3] 4] (z/root (z/edit (-> zt z/down) inc)))
+(assert= [:X [2 3] 4] (-> zt z/down (z/replace :X) z/root))
+(assert= [1 [3] 4] (-> zt z/down z/right z/down z/remove z/root))
 
 ; ── metadata propagation through collection ops ──
 (assert= {:m 1} (meta (conj (with-meta [] {:m 1}) 2)))

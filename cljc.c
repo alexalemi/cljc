@@ -72,7 +72,7 @@ struct Cljc {
         const char *sym;
         /* Wider view of the same symbol cell: name aliases .sym; root_cache
          * memoizes the resolved ROOT binding (stable — root def mutates). */
-        struct { const char *name; Binding *root_cache; } symc;
+        struct { const char *name; Binding *root_cache; const char *home_ns; } symc;
         const char *kw;
         char *str;
         struct { Cljc *head; Cljc *tail; } cons;
@@ -142,7 +142,8 @@ void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
 /* Namespace aliases for the flat-global model: (require '[x.y :as m])
  * registers "m"; on lookup miss, m/foo retries as bare foo. */
 #define MAX_ALIASES 64
-static const char *alias_table[MAX_ALIASES];
+static const char *alias_table[MAX_ALIASES];   /* alias prefix */
+static const char *alias_ns[MAX_ALIASES];      /* full namespace it names */
 static int n_aliases;
 
 static Cljc *cell_alloc(bool zero);
@@ -232,7 +233,13 @@ static Cljc *mk_int(int64_t i) {
 }
 static Cljc *mk_double(double d)     { Cljc *v = alloc(CLJC_DOUBLE); v->as.d = d; return v; }
 static Cljc *mk_bool(bool b)         { return b ? TRUE : FALSE; }
-static Cljc *mk_sym(const char *s)   { Cljc *v = alloc(CLJC_SYMBOL); v->as.sym = s; return v; }
+static const char *cur_reader_ns;   /* set while require loads a library */
+static Cljc *mk_sym(const char *s) {
+    Cljc *v = alloc(CLJC_SYMBOL);
+    v->as.sym = s;
+    v->as.symc.home_ns = cur_reader_ns;  /* NULL outside library loads */
+    return v;
+}
 /* Keyword CELLS are interned too (like Clojure): one immortal cell per
  * name, allocated outside the GC pools — so (identical? :a :a) holds and
  * keyword-heavy code allocates nothing per read. */
@@ -362,6 +369,13 @@ static void env_define(CljcEnv *env, const char *name, Cljc *value) {
  * root_cache sound — a cached binding sees redefinitions through the
  * mutation instead of going stale. */
 static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
+    /* While a library loads, its defs land under "ns/name" — isolation
+     * from the flat globals (and from each other). */
+    if (cur_reader_ns) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s/%s", cur_reader_ns, name);
+        name = intern(buf, strlen(buf));
+    }
     for (Binding *b = root->bindings; b; b = b->next)
         if (b->name == name) { b->value = value; return; }
     env_define(root, name, value);
@@ -2030,6 +2044,13 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     if (b->name == name) return b->value;
             Binding *cb = form->as.symc.root_cache;
             if (cb) return cb->value;
+            if (form->as.symc.home_ns) {   /* library code: own ns wins */
+                char buf[256];
+                snprintf(buf, sizeof buf, "%s/%s", form->as.symc.home_ns, name);
+                const char *qual = intern(buf, strlen(buf));
+                for (Binding *b = e->bindings; b; b = b->next)
+                    if (b->name == qual) { form->as.symc.root_cache = b; return b->value; }
+            }
             for (Binding *b = e->bindings; b; b = b->next)
                 if (b->name == name) { form->as.symc.root_cache = b; return b->value; }
             /* alias fallback: m/foo -> foo when m is a registered alias */
@@ -2039,10 +2060,15 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     const char *pre = intern(name, (size_t)(slash - name));
                     for (int i = 0; i < n_aliases; i++) {
                         if (alias_table[i] == pre) {
+                            /* m/foo => <full-ns>/foo, falling back to bare foo
+                             * (pre-isolation libs and core shims) */
+                            char buf[256];
+                            snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
+                            const char *qual = intern(buf, strlen(buf));
                             const char *bare = intern(slash + 1, strlen(slash + 1));
                             for (Binding *b = e->bindings; b; b = b->next)
-                                if (b->name == bare) {
-                                    form->as.symc.root_cache = b;  /* cached: one-time cost */
+                                if (b->name == qual || b->name == bare) {
+                                    form->as.symc.root_cache = b;
                                     return b->value;
                                 }
                             break;
@@ -3715,12 +3741,26 @@ static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_alias(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     const char *a = as_str(argv[0], "alias*");
+    const char *ns = as_str(argv[1], "alias*");
     const char *in = intern(a, strlen(a));
+    const char *nsin = intern(ns, strlen(ns));
     for (int i = 0; i < n_aliases; i++)
-        if (alias_table[i] == in) return NIL;
+        if (alias_table[i] == in) { alias_ns[i] = nsin; return NIL; }
     if (n_aliases >= MAX_ALIASES) cljc_error("too many aliases");
-    alias_table[n_aliases++] = in;
+    alias_table[n_aliases] = in;
+    alias_ns[n_aliases] = nsin;
+    n_aliases++;
     return NIL;
+}
+
+/* (cljc/in-ns* name-or-nil) — set the reader/def namespace, return the old. */
+static Cljc *prim_in_ns(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    const char *old = cur_reader_ns;
+    Cljc *v = argv[0];
+    cur_reader_ns = (v == NIL) ? NULL
+        : intern(v->as.str, strlen(v->as.str));
+    return old ? mk_str(old, strlen(old)) : NIL;
 }
 
 static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
@@ -4777,10 +4817,15 @@ static const char *PRELUDE =
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
     "(def *load-path* [\".\" \"vendor\"])\n"
     "(def cljc/loaded-namespaces (atom #{}))\n"
+    "(defn cljc/spec-opt [spec k]\n"
+    "  (loop [s (seq (rest spec))]\n"
+    "    (cond (nil? s) nil\n"
+    "          (= k (first s)) (second s)\n"
+    "          :else (recur (nnext s)))))\n"
     "(defn cljc/require-one [spec]\n"
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
-    "    (when (and (vector? spec) (>= (count spec) 3) (= :as (nth spec 1)))\n"
-    "      (cljc/alias* (str (nth spec 2))))\n"
+    "    (when-let [a (and (vector? spec) (cljc/spec-opt spec :as))]\n"
+    "      (cljc/alias* (str a) (str nsname)))\n"
     "    (when-not (contains? @cljc/loaded-namespaces nsname)\n"
     "      (let [rel (str/replace (str/replace (str nsname) \"-\" \"_\") \".\" \"/\")\n"
     "            paths (mapcat (fn [d] [(str d \"/\" rel \".clj\")\n"
@@ -4790,7 +4835,12 @@ static const char *PRELUDE =
     "                      paths)]\n"
     "        (when hit\n"
     "          (swap! cljc/loaded-namespaces conj nsname)\n"
-    "          (load-file hit))))))\n"
+    "          (let [old (cljc/in-ns* (str nsname))]\n"
+    "            (try (load-file hit)\n"
+    "                 (finally (cljc/in-ns* old)))))))\n"
+    "    (when-let [refers (and (vector? spec) (cljc/spec-opt spec :refer))]\n"
+    "      (doseq [r refers]\n"
+    "        (eval (list 'def r (symbol (str nsname \"/\" r))))))))\n"
     "(defmacro require [& specs]\n"
     "  `(do ~@(map (fn [s] `(cljc/require-one ~s)) specs) nil))\n"
     "(defmacro declare [& names]\n"
@@ -4961,6 +5011,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "with-meta",  prim_with_meta);
     cljc_define_native(e, "meta",       prim_meta);
     cljc_define_native(e, "cljc/alias*", prim_alias);
+    cljc_define_native(e, "cljc/in-ns*", prim_in_ns);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
     cljc_define_native(e, "cljc/onto",          prim_onto);

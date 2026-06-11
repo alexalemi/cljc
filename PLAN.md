@@ -329,14 +329,17 @@ required by conservative stack scanning, same as Boehm GC).
     environments. reify now builds its expansion eagerly (loop/concat
     of realized lists) as the workaround. Reproduce from git history:
     the reify version at commit 0ac1817. Hunt with fresh context.
-27. FOUND 2026-06-11 (user's "which work?" audit): FLAT-GLOBAL
-    COLLISIONS — clojure.zip defines next/remove/replace, shadowing
-    core seq fns for everything loaded after; libraries verify
-    individually but compose load-order-dependently. The honest fix is
-    require ISOLATION (namespaces-lite): load each lib's defs under
-    prefixed names with internal references resolved within the lib —
-    an architectural milestone (touches def/lookup), mapped not built.
-    Interim rule documented: zip loads alone or last.
+27. ~~Namespaces-lite (require isolation)~~ ✅ done 2026-06-11 — the
+    flat-global collision fix. Design: symbol cells carry a home_ns
+    stamped by the reader during library loads (cljc/in-ns* set/
+    restored around load-file, nesting-safe); defs during a load land
+    under "ns/name"; resolution is locals -> home-ns/name -> bare ->
+    alias (m/foo -> <full-ns>/foo -> bare), all cached in the symbol
+    cell so steady-state cost is zero. require parses :as (alias ->
+    full ns) and :refer (copies bindings to bare names). ACCEPTANCE:
+    zip+medley+set+walk coexist, core next intact. KEY INSIGHT: the
+    context must live on symbol CELLS, not an eval-time global —
+    library code evaluates at call time, long after loading.
 28. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 

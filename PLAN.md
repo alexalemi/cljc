@@ -155,7 +155,34 @@ required by conservative stack scanning, same as Boehm GC).
     comment macro, loop destructuring (gensym rewrite + inner let, the
     same rewrite Clojure does). Remaining compat tiers: lazy seqs
     (Tier 2, big), vars/multimethods/protocols (Tier 3, usage-driven).
-14. **Performance later, maybe**: args-as-array calling convention,
+14. **NEXT UP — Lazy sequences (Tier 2 compat, full-session milestone)**
+    Design (agreed, ready to execute):
+    a. New tag CLJC_LAZY: union { Cljc *thunk; Cljc *cached; bool done; }
+       — thunk is a zero-arg fn; forcing calls it once, caches the
+       result (which must be a seq: nil, cons, or another lazy), marks
+       done, and drops the thunk reference (GC reclaims the closure).
+    b. (lazy-seq & body) special form => lazy cell wrapping (fn [] body).
+    c. Force discipline: first/rest/seq/to_seq force ONE cell, never the
+       chain — laziness survives only if cons tails can be lazy cells.
+       to_seq must stop materializing: return the cons chain as-is and
+       let consumers walk via first/rest (audit every to_seq caller —
+       the iteration idiom `for (l = to_seq(x); l->tag == CLJC_LIST;)`
+       must become a seq-cursor helper that forces as it walks).
+    d. Move map/filter/take/drop/concat/iterate/repeat/cycle/range
+       (infinite arity) to lazy prelude definitions via lazy-seq, e.g.
+       (defn map [f c] (lazy-seq (when-let [s (seq c)]
+         (cons (f (first s)) (map f (rest s)))))).
+       Eager consumers (reduce/count/doseq/into/vec/sort) force
+       progressively via the cursor.
+    e. GC: mark thunk+cached; print realizes fully (infinite seq print
+       hangs — same as Clojure); equality forces both sides.
+    f. Tests: (take 5 (range)) infinite range, (take 3 (iterate inc 0)),
+       cycle, map-over-infinite, ensure 1M-element eager pipelines do
+       not regress (benchmarks/), GC-stress with half-realized chains.
+    Risks: every `->as.cons.tail` walk in primitives is a potential
+    eager-forcing bug; introduce `static Cljc *seq_first/seq_next` and
+    convert callers mechanically.
+15. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

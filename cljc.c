@@ -375,6 +375,14 @@ static Cljc *env_lookup(CljcEnv *env, const char *name) {
     return NIL;
 }
 
+static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
+    const char *name = intern(raw, strlen(raw));
+    for (CljcEnv *e = env; e; e = e->parent)
+        for (Binding *b = e->bindings; b; b = b->next)
+            if (b->name == name) return b->value;
+    return NULL;
+}
+
 static CljcEnv *env_root(CljcEnv *e) {
     while (e->parent) e = e->parent;
     return e;
@@ -901,6 +909,7 @@ static Cljc *map_assoc(Cljc *m, Cljc *k, Cljc *v) {
     Cljc *nm = alloc(CLJC_MAP);  /* root is stack-rooted here */
     nm->as.map.root = root;
     nm->as.map.count = m->as.map.count + (added ? 1 : 0);
+    nm->meta = m->meta;
     return nm;
 }
 
@@ -911,6 +920,7 @@ static Cljc *map_dissoc_one(Cljc *m, Cljc *k) {
     Cljc *nm = alloc(CLJC_MAP);
     nm->as.map.root = root;
     nm->as.map.count = m->as.map.count - 1;
+    nm->meta = m->meta;
     return nm;
 }
 
@@ -946,6 +956,7 @@ static Cljc *set_conj(Cljc *s, Cljc *x) {
     Cljc *ns = alloc(CLJC_SET);
     ns->as.map.root = root;
     ns->as.map.count = s->as.map.count + (added ? 1 : 0);
+    ns->meta = s->meta;
     return ns;
 }
 
@@ -956,6 +967,7 @@ static Cljc *set_disj(Cljc *s, Cljc *x) {
     Cljc *ns = alloc(CLJC_SET);
     ns->as.map.root = root;
     ns->as.map.count = s->as.map.count - 1;
+    ns->meta = s->meta;
     return ns;
 }
 
@@ -1044,9 +1056,12 @@ static Cljc *vec_pushtail(int level, Cljc *parent, Cljc *tailnode, uint32_t cnt)
 
 static Cljc *vec_conj1(Cljc *v, Cljc *x) {
     uint32_t cnt = v->as.vec.count;
-    if (cnt - vec_tailoff(v) < 32)  /* room in tail: the cheap path */
-        return vec_cell(v->as.vec.root, v->as.vec.shift, cnt + 1,
-                        v->as.vec.tail, v->as.vec.taillen, x);
+    if (cnt - vec_tailoff(v) < 32) {  /* room in tail: the cheap path */
+        Cljc *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt + 1,
+                            v->as.vec.tail, v->as.vec.taillen, x);
+        nv->meta = v->meta;
+        return nv;
+    }
     /* Tail full: push it into the trie as a leaf. */
     Cljc *leaf = vec_node32();
     memcpy(leaf->as.hnode.kids, v->as.vec.tail, sizeof(Cljc *) * 32);
@@ -1064,7 +1079,9 @@ static Cljc *vec_conj1(Cljc *v, Cljc *x) {
     } else {
         newroot = vec_pushtail(v->as.vec.shift, v->as.vec.root, leaf, cnt);
     }
-    return vec_cell(newroot, newshift, cnt + 1, &x, 0, x) /* tail = [x] */;
+    Cljc *nv = vec_cell(newroot, newshift, cnt + 1, &x, 0, x); /* tail = [x] */
+    nv->meta = v->meta;
+    return nv;
 }
 
 static Cljc *vec_doassoc(int level, Cljc *node, size_t i, Cljc *x) {
@@ -1091,11 +1108,14 @@ static Cljc *vec_assoc_idx(Cljc *v, size_t i, Cljc *x) {
         Cljc *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt,
                             v->as.vec.tail, v->as.vec.taillen, NULL);
         nv->as.vec.tail[i - off] = x;
+        nv->meta = v->meta;
         return nv;
     }
     Cljc *newroot = vec_doassoc(v->as.vec.shift, v->as.vec.root, i, x);
-    return vec_cell(newroot, v->as.vec.shift, cnt,
-                    v->as.vec.tail, v->as.vec.taillen, NULL);
+    Cljc *nv = vec_cell(newroot, v->as.vec.shift, cnt,
+                        v->as.vec.tail, v->as.vec.taillen, NULL);
+    nv->meta = v->meta;
+    return nv;
 }
 
 /* ── transient vectors: in-place edits behind transient/persistent! ──
@@ -1138,6 +1158,7 @@ static Cljc *prim_transient(CljcEnv *env, Cljc **argv, int nargs) {
     t->as.vec.taillen = v->as.vec.taillen;
     t->as.vec.edit_id = tvec_next_edit++;
     t->as.vec.alive = true;
+    t->meta = v->meta;          /* carried through the transient roundtrip */
     if (tvec_next_edit == 0) cljc_error("transient: edit ids exhausted");
     return t;
 }
@@ -1148,8 +1169,10 @@ static Cljc *prim_persistent_bang(CljcEnv *env, Cljc **argv, int nargs) {
         return argv[0];                       /* shim passthrough */
     Cljc *t = as_tvec(argv[0], "persistent!");
     t->as.vec.alive = false;            /* invalidate further edits */
-    return vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
-                    t->as.vec.tail, t->as.vec.taillen, NULL);
+    Cljc *nv = vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
+                        t->as.vec.tail, t->as.vec.taillen, NULL);
+    nv->meta = t->meta;
+    return nv;
 }
 
 static Cljc *tvec_pushtail(int level, Cljc *parent, Cljc *tailnode,
@@ -1471,6 +1494,13 @@ static Cljc *read_form(const char **p) {
         if (n == 7 && !memcmp(start, "newline", 7)) return mk_str("\n", 1);
         if (n == 3 && !memcmp(start, "tab", 3)) return mk_str("\t", 1);
         if (n == 6 && !memcmp(start, "return", 6)) return mk_str("\r", 1);
+        if (n == 8 && !memcmp(start, "formfeed", 8)) return mk_str("\f", 1);
+        if (n == 9 && !memcmp(start, "backspace", 9)) return mk_str("\b", 1);
+        if (start[0] == 'o' && n >= 2 && n <= 4) {   /* \oNNN octal */
+            char ch = 0;
+            for (size_t i = 1; i < n; i++) ch = (char)(ch * 8 + (start[i] - '0'));
+            return mk_str(&ch, 1);
+        }
         cljc_error("unsupported char literal");
     }
     if (c == '#' && (*p)[1] == '_') {
@@ -2133,8 +2163,29 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     }
                     /* compat no-ops: flat globals already match the universal
                      * (:require [clojure.string :as str]) alias convention */
-                    if (s == SYM_NS || s == SYM_USE || s == SYM_IMPORT)
+                    if (s == SYM_USE || s == SYM_IMPORT) return NIL;
+                    if (s == SYM_NS) {
+                        /* (ns name (:require [a.b :as x] ...)) — load the
+                         * :require clauses; everything else is tolerated. */
+                        static const char *KW_REQ;
+                        if (!KW_REQ) KW_REQ = intern("require", 7);
+                        for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
+                            Cljc *cl = c->as.cons.head;
+                            if (cl != NIL && cl->tag == CLJC_LIST &&
+                                cl->as.cons.head->tag == CLJC_KEYWORD &&
+                                cl->as.cons.head->as.kw == KW_REQ) {
+                                for (Cljc *sp = cl->as.cons.tail; sp && sp->tag == CLJC_LIST;
+                                     sp = sp->as.cons.tail) {
+                                    Cljc *callee = env_lookup_maybe(env, "cljc/require-one");
+                                    if (callee) {
+                                        Cljc *one[1] = {sp->as.cons.head};
+                                        apply(env, callee, one, 1);
+                                    }
+                                }
+                            }
+                        }
                         return NIL;
+                    }
                     (void)SYM_REQUIRE;
                 }
                 {
@@ -2790,7 +2841,9 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
     for (int i = 1; i < nargs; i++) {
         Cljc *x = argv[i];
         if (r == NIL || r->tag == CLJC_LIST) {
+            Cljc *prev = r;
             r = mk_cons(x, r);                      /* lists grow at the front */
+            if (prev != NIL) r->meta = prev->meta;
         } else if (r->tag == CLJC_VECTOR) {
             r = vec_conj1(r, x);                    /* vectors grow at the back */
         } else if (r->tag == CLJC_SET) {
@@ -4698,6 +4751,9 @@ static const char *PRELUDE =
     "(defn unreduced [x] (if (reduced? x) (second x) x))\n"
     "(defn ensure-reduced [x] (if (reduced? x) x (reduced x)))\n"
     "(defn key [e] (first e))\n"
+    "(defn subvec\n"
+    "  ([v s] (subvec v s (count v)))\n"
+    "  ([v s e] (vec (take (- e s) (drop s v)))))\n"
     "(defn coll? [x] (or (list? x) (vector? x) (map? x) (set? x) (seq? x)))\n"
     "(defn map-entry? [x] (and (vector? x) (= 2 (count x))))\n"
     "(defn list* [& args]\n"
@@ -4718,7 +4774,7 @@ static const char *PRELUDE =
     "    (when (and (vector? spec) (>= (count spec) 3) (= :as (nth spec 1)))\n"
     "      (cljc/alias* (str (nth spec 2))))\n"
     "    (when-not (contains? @cljc/loaded-namespaces nsname)\n"
-    "      (let [rel (str/replace (str nsname) \".\" \"/\")\n"
+    "      (let [rel (str/replace (str/replace (str nsname) \"-\" \"_\") \".\" \"/\")\n"
     "            paths (mapcat (fn [d] [(str d \"/\" rel \".clj\")\n"
     "                                   (str d \"/\" rel \".cljc\")])\n"
     "                          *load-path*)\n"
@@ -5093,7 +5149,14 @@ CljcEnv *cljc_new_env(void) {
         "       (assoc (zipmap ~(mapv keyword (map str fields))\n"
         "                      ~fields)\n"
         "              :cljc/type ~kw))))\n"
-        "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\\n");
+        "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\\n"
+        "(defmacro reify [& clauses]\\n"
+        "  (let [t (keyword (str (gensym)))\n"
+        "        impls (filter list? clauses)]\\n"
+        "    `(do ~@(map (fn [[m params & body]]\\n"
+        "                  `(defmethod ~m ~t ~(vec params) ~@body))\\n"
+        "                impls)\\n"
+        "         {:cljc/type ~t})))\\n");
     /* FFI glue generator — declare C signatures as data, compile, load:
      * (ffi/define [[:double cos [:double]] [:int getpid []]]
      *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */

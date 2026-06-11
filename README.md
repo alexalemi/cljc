@@ -204,8 +204,8 @@ and zero dependencies matter; use bb/JVM where throughput does.
 - Patterns are plain strings (`#"…"` is raw-string sugar); `{n,m}` braces are
   literals; `str/replace` is literal — regex replace is spelled `re-replace`
 - Quasiquote: no auto-gensym `x#`, no nesting levels
-- Metadata works (`with-meta`/`meta`/`^{}`) but is NOT preserved through
-  collection ops (`conj` etc.) — explicit threading only, which zip does
+- Metadata works (`with-meta`/`meta`/`^{}`) and propagates through
+  collection ops (`conj`/`assoc`/`dissoc`/`into`, incl. transient roundtrips)
 - `ns` is a tolerated no-op; `require` loads; `#?(:cljc …)` reader conditionals;
   `#(…)`, `\a` char literals (1-char strings), `^meta` (discarded) supported
 

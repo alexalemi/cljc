@@ -891,4 +891,22 @@
 (assert= [:X [2 3] 4] (-> zt down (replace :X) root))
 (assert= [1 [3] 4] (-> zt down right down remove root))
 
+; ── metadata propagation through collection ops ──
+(assert= {:m 1} (meta (conj (with-meta [] {:m 1}) 2)))
+(assert= {:m 2} (meta (assoc (with-meta {} {:m 2}) :k :v)))
+(assert= {:m 3} (meta (dissoc (assoc (with-meta {} {:m 3}) :k 1) :k)))
+(assert= {:m 4} (meta (conj (with-meta #{} {:m 4}) :x)))
+(assert= {:m 5} (meta (conj (with-meta (list 1) {:m 5}) 0)))
+(assert= {:m 6} (meta (assoc (with-meta [1 2] {:m 6}) 0 :x)))
+(assert= {:m 7} (meta (into (with-meta [] {:m 7}) [1 2 3])))  ; transient roundtrip
+(assert= {:m 8} (meta (update (with-meta {:n 1} {:m 8}) :n inc)))
+(assert= nil (meta (conj [] 1)))                     ; no meta, no cost
+; ── reify over the type/multimethod machinery ──
+(defprotocol RTest (r-go [x]))
+(def r-obj (reify RTest (r-go [_] :reified)))
+(assert= :reified (r-go r-obj))
+(assert= [1 2] (subvec [0 1 2 3] 1 3))
+(assert= "\f" \formfeed)
+(assert= 11 (int \o013))
+
 (println "tests complete")

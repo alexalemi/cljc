@@ -308,7 +308,18 @@ required by conservative stack scanning, same as Boehm GC).
     cell->meta side table (with-meta copies the cell, records meta;
     sweep drops dead entries). ~a session. Other untried candidates:
     clojure.data (diff), camel-snake-kebab, hiccup core, tools.cli.
-25. **Performance later, maybe**: args-as-array calling convention,
+25. ~~Meta propagation + survey round 4~~ ✅ done 2026-06-11 — metadata
+    now propagates through conj/assoc/dissoc on all collections, list
+    conj, vector index-assoc, and the transient/persistent! roundtrip
+    (into preserves meta). reify implemented over the type/multimethod
+    machinery (anon type keyword + defmethods + tagged map). ns now
+    PROCESSES (:require ...) clauses (transitive library deps load);
+    namespace dashes map to file underscores. Added: subvec, \formfeed
+    \backspace \oNNN char literals. camel-snake-kebab: loads all 5
+    files transitively, still one arity error from green — PARTIAL
+    (next session: chase the 2-arg arity miss in its split path).
+    clojure.data: upstream URL 404'd, untried.
+26. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

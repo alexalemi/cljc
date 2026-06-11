@@ -1250,4 +1250,23 @@
 (assert= 6 (+ 1 5))                        ; core fns still reachable
 (cljc/in-ns* nil)
 
+; batch 7: conj on lazy seqs, dynamic vars under ns, variadic set ops,
+; mapv n-coll, sort-by comparator, alias-over-bare precedence
+(assert= '(:x 0 1) (conj (take 2 (range 5)) :x))
+(assert= '(:y :x 0) (conj (take 1 (range 5)) :x :y))
+(ns cljc.bindns)
+(def ^:dynamic *bindns-probe* 1)
+(assert= 9 (binding [*bindns-probe* 9] *bindns-probe*))
+(assert= 1 *bindns-probe*)
+(cljc/in-ns* nil)
+(assert= #{2} (set/intersection #{1 2} #{2 3} #{2}))
+(assert= #{3} (set/difference #{1 2 3} #{1} #{2}))
+(assert= #{1 2 3} (set/union #{1} #{2} #{3}))
+(require '[clojure.set :as cset])
+(assert= #{2} (cset/intersection #{1 2} #{2 3} #{2}))     ; vendor, not bare-2-arity
+(assert= [3 6] (apply mapv + [[1 2] [2 4]]))
+(assert= '([1 2 3] [1 2] [1]) (sort-by count > [[1] [1 2 3] [1 2]]))
+(assert= '([1] [2] [3]) (sort-by first compare [[3] [1] [2]]))
+(assert= 11 (count (re-matches #"(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)" "abcdefghij")))
+
 (println "tests complete")

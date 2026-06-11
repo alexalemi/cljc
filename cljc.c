@@ -2183,8 +2183,16 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
                             const char *qual = intern(buf, strlen(buf));
                             const char *bare = intern(slash + 1, strlen(slash + 1));
+                            /* the ns-qualified def must win over any bare
+                             * global of the same name (two passes — a one-
+                             * pass || takes whichever was defined last) */
                             for (Binding *b = e->bindings; b; b = b->next)
-                                if (b->name == qual || b->name == bare) {
+                                if (b->name == qual) {
+                                    form->as.symc.root_cache = b;
+                                    return b->value;
+                                }
+                            for (Binding *b = e->bindings; b; b = b->next)
+                                if (b->name == bare) {
                                     form->as.symc.root_cache = b;
                                     return b->value;
                                 }
@@ -2402,10 +2410,23 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         Cljc *saved[16];
                         CljcEnv *root = env_root(env);
                         for (size_t i = 0; i < n; i++) {
-                            const char *nm = sym_name(vec_nth(bv, i * 2), "binding");
+                            Cljc *symc = vec_nth(bv, i * 2);
+                            const char *nm = sym_name(symc, "binding");
                             Binding *b = NULL;
-                            for (Binding *x = root->bindings; x; x = x->next)
-                                if (x->name == nm) { b = x; break; }
+                            /* home-ns first, like symbol resolution: a
+                             * (def ^:dynamic *v*) inside (ns foo) lands
+                             * under foo/, and binding must find it there */
+                            if (symc->as.symc.home_ns && !strchr(nm, '/')) {
+                                char buf[256];
+                                snprintf(buf, sizeof buf, "%s/%s",
+                                         symc->as.symc.home_ns, nm);
+                                const char *qual = intern(buf, strlen(buf));
+                                for (Binding *x = root->bindings; x; x = x->next)
+                                    if (x->name == qual) { b = x; break; }
+                            }
+                            if (!b)
+                                for (Binding *x = root->bindings; x; x = x->next)
+                                    if (x->name == nm) { b = x; break; }
                             if (!b) cljc_error("binding: unable to resolve %s", nm);
                             slots[i] = b;
                             saved[i] = b->value;
@@ -3151,10 +3172,10 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *r = argv[0];  /* nil works: conj onto nil yields a list */
     for (int i = 1; i < nargs; i++) {
         Cljc *x = argv[i];
-        if (r == NIL || r->tag == CLJC_LIST) {
-            Cljc *prev = r;
+        if (r == NIL || r->tag == CLJC_LIST || r->tag == CLJC_LAZY) {
+            Cljc *prev = r;                         /* lazy: cons keeps it lazy */
             r = mk_cons(x, r);                      /* lists grow at the front */
-            if (prev != NIL) r->meta = prev->meta;
+            if (prev != NIL && prev->tag == CLJC_LIST) r->meta = prev->meta;
         } else if (r->tag == CLJC_VECTOR) {
             r = vec_conj1(r, x);                    /* vectors grow at the back */
         } else if (r->tag == CLJC_SET) {
@@ -3651,7 +3672,7 @@ struct Rx {
 };
 
 #define RX_MAX_NODES 1024
-#define RX_MAX_GROUPS 10
+#define RX_MAX_GROUPS 32
 
 typedef struct {
     const char *p;             /* parse cursor */
@@ -5354,7 +5375,8 @@ static const char *PRELUDE =
     "    (reduce conj to from)))\n"
     "(defn mapv\n"
     "  ([f coll] (apply vector (map f coll)))\n"
-    "  ([f c1 c2] (apply vector (map f c1 c2))))\n"
+    "  ([f c1 c2] (apply vector (map f c1 c2)))\n"
+    "  ([f c1 c2 & more] (apply vector (apply map f c1 c2 more))))\n"
     "(defn filterv [f coll] (apply vector (filter f coll)))\n"
     "(defn repeat [n x] (map (constantly x) (range n)))\n"
     "(defn nthrest [coll n] (drop n coll))\n"
@@ -5431,7 +5453,11 @@ static const char *PRELUDE =
     "  (reduce (fn [m x] (assoc m x (inc (get m x 0)))) {} coll))\n"
     "(defn juxt [& fs] (fn [& args] (mapv (fn [f] (apply f args)) fs)))\n"
     "(defn sort-by\n"
-    "  ([f coll] (sort (fn [a b] (< (compare (f a) (f b)) 0)) coll)))\n"
+    "  ([f coll] (sort (fn [a b] (< (compare (f a) (f b)) 0)) coll))\n"
+    /* comparator arity: cmp may be a boolean pred (>) or 3-way (compare) */
+    "  ([f cmp coll]\n"
+    "   (sort (fn [a b] (let [r (cmp (f a) (f b))]\n"
+    "                     (if (number? r) (neg? r) r))) coll)))\n"
     /* associative utilities */
     "(defn update [m k f & args] (assoc m k (apply f (get m k) args)))\n"
     "(defn get-in\n"
@@ -5699,8 +5725,10 @@ static const char *PRELUDE =
     "(defn max-key [f x & xs] (reduce (fn [a b] (if (> (f a) (f b)) a b)) x xs))\n"
     "(defn min-key [f x & xs] (reduce (fn [a b] (if (< (f a) (f b)) a b)) x xs))\n"
     "(defn set/union [& sets] (reduce (fn [a s] (reduce conj a (seq s))) #{} sets))\n"
-    "(defn set/intersection [s1 s2] (set (filter (fn [x] (contains? s2 x)) (seq s1))))\n"
-    "(defn set/difference [s1 s2] (set (remove (fn [x] (contains? s2 x)) (seq s1))))\n"
+    "(defn set/intersection [s1 & ss]\n"
+    "  (reduce (fn [a s] (set (filter (fn [x] (contains? s x)) (seq a)))) s1 ss))\n"
+    "(defn set/difference [s1 & ss]\n"
+    "  (reduce (fn [a s] (set (remove (fn [x] (contains? s x)) (seq a)))) s1 ss))\n"
     "(defmacro some-> [expr & forms]\n"
     "  (if (empty? forms)\n"
     "    expr\n"

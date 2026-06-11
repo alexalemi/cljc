@@ -437,10 +437,28 @@ required by conservative stack scanning, same as Boehm GC).
     (constructor → field map, methods ignored);
     clojure.lang.PersistentQueue/EMPTY = [] (LIFO divergence); vendor
     clojure.data.json + clojure.math.combinatorics + nextjournal.clerk.
-    KNOWN REMAINING: util/md5 (needs MessageDigest interop — consider a
-    C md5 native + shim), java interop (.indexOf, Character/digit),
-    perf timeouts (p22 2022 cube-walk >300s, p23 2023 part-2 ~15min —
-    the corpus is now the benchmark set), Bag deftype methods.
+    PROGRESS: 16 → 74+ passing over seven batches (sweep after batch 6:
+    74 pass / 39 fail / 38 timeout; batch 7 fixed ~8 more of the fails).
+    Batch 5 added MD5 native + interop shims (MessageDigest idiom runs
+    verbatim, .indexOf, Integer/parseInt radix, Character/digit). Batch 6:
+    regex lookahead (?=)(?!), (ns foo) ENTERS foo (defs land foo/, like
+    require'd libs), syntax-quote qualifies home-ns-defined symbols
+    (matches JVM-qualified case constants), n-coll map. Batch 7: conj on
+    lazy seqs; binding resolves ^:dynamic defs under their home ns
+    (regression from ns-entering); alias resolution prefers the
+    ns-qualified def over a bare global (one-pass || bug); bootstrap
+    set/intersection+difference made variadic; mapv n-coll; sort-by
+    comparator arity; RX_MAX_GROUPS 10→32.
+    KNOWN REMAINING (~10 fails + 38 timeouts): perf timeouts are the big
+    bucket — the corpus is the benchmark set for any future perf work
+    (PLAN item 36). Unfixable-ish: BufferedImage/jpeg visualization
+    files, defproject, 2025 cherry-compiled JS, 2 missing input files,
+    2018 p16 references undefined OPS (broken upstream). Odd tail to
+    diagnose someday: 2017 p03 case-clause \"I\", 2021 p13/2015 p22
+    expected-number, 2022 p17 case nil, 2022 p21/2023 p22 not-seqable,
+    2023 p18 keyword-coercion, 2016 p19 pop-empty-vector, 2017 p16
+    dumped-core under timeout, 2 huge-apply value-stack overflows
+    (apply str on multi-million-char seqs).
 35. NEXT: JUDGE CLONE (user request) — inline snapshot testing à la
     github.com/ianthehenry/judge (Janet): `(test (+ 1 2))` runs and
     REWRITES the source file inserting/correcting the expected value;

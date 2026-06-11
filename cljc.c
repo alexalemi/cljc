@@ -50,6 +50,7 @@ typedef enum {
 
 typedef struct Cljc Cljc;
 typedef struct CljcEnv CljcEnv;
+typedef struct Binding Binding;
 typedef Cljc *(*CljcNativeFn)(CljcEnv *env, Cljc *args);
 
 struct Cljc {
@@ -60,6 +61,9 @@ struct Cljc {
         int64_t i;
         double d;
         const char *sym;
+        /* Wider view of the same symbol cell: name aliases .sym; root_cache
+         * memoizes the resolved ROOT binding (stable — root def mutates). */
+        struct { const char *name; Binding *root_cache; } symc;
         const char *kw;
         char *str;
         struct { Cljc *head; Cljc *tail; } cons;
@@ -82,11 +86,11 @@ struct Cljc {
 
 /* ───── Environment (lexical scope, linked frames) ───────────────────── */
 
-typedef struct Binding {
+struct Binding {
     const char *name;   /* interned symbol pointer — compare by == */
     Cljc *value;
     struct Binding *next;
-} Binding;
+};
 
 struct CljcEnv {
     Binding *bindings;
@@ -244,10 +248,47 @@ static CljcEnv *env_new(CljcEnv *parent) {
     return e;
 }
 
+/* Bindings are pooled like cells/envs (a fn call allocates one per param —
+ * too hot for malloc). Freed bindings recycle through a free list when their
+ * env is swept. binding_alloc never triggers GC (env_define runs mid-bind). */
+#define BINDING_BLOCK_N 4096
+typedef struct BindingBlock { struct BindingBlock *next; size_t used; Binding b[BINDING_BLOCK_N]; } BindingBlock;
+static BindingBlock *binding_blocks;
+static Binding *binding_freelist;
+
+static Binding *binding_alloc(void) {
+    Binding *b;
+    if (binding_freelist) {
+        b = binding_freelist;
+        binding_freelist = b->next;
+    } else {
+        if (!binding_blocks || binding_blocks->used == BINDING_BLOCK_N) {
+            BindingBlock *blk = malloc(sizeof *blk);
+            if (!blk) cljc_error("out of memory");
+            blk->used = 0;
+            blk->next = binding_blocks;
+            binding_blocks = blk;
+        }
+        b = &binding_blocks->b[binding_blocks->used++];
+    }
+    return b;
+}
+
 static void env_define(CljcEnv *env, const char *name, Cljc *value) {
-    Binding *b = xmalloc(sizeof *b);
+    Binding *b = binding_alloc();
     b->name = name; b->value = value; b->next = env->bindings;
     env->bindings = b;
+}
+
+/* def/defmacro/native install: mutate an existing root binding in place
+ * rather than shadowing it. This keeps root Binding pointers stable for
+ * the lifetime of the interpreter, which is what makes the per-symbol
+ * root_cache sound — a cached binding sees redefinitions through the
+ * mutation instead of going stale. */
+static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
+    for (Binding *b = root->bindings; b; b = b->next)
+        if (b->name == name) { b->value = value; return; }
+    env_define(root, name, value);
 }
 
 static Cljc *env_lookup(CljcEnv *env, const char *name) {
@@ -423,7 +464,8 @@ static void gc_collect(void) {
             if (!e->gcfree) {
                 for (Binding *bn = e->bindings; bn; ) {
                     Binding *next = bn->next;
-                    free(bn);
+                    bn->next = binding_freelist;
+                    binding_freelist = bn;
                     bn = next;
                 }
                 e->gcfree = 1;
@@ -1547,8 +1589,20 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
         }
         case CLJC_HNODE:
             cljc_error("internal: evaluated a HAMT node");
-        case CLJC_SYMBOL:
-            return env_lookup(env, form->as.sym);
+        case CLJC_SYMBOL: {
+            /* Locals shadow, so scan non-root frames first (they're tiny);
+             * at the root, hit the per-symbol cache or fill it once. */
+            const char *name = form->as.symc.name;
+            CljcEnv *e = env;
+            for (; e->parent; e = e->parent)
+                for (Binding *b = e->bindings; b; b = b->next)
+                    if (b->name == name) return b->value;
+            Binding *cb = form->as.symc.root_cache;
+            if (cb) return cb->value;
+            for (Binding *b = e->bindings; b; b = b->next)
+                if (b->name == name) { form->as.symc.root_cache = b; return b->value; }
+            cljc_error("unable to resolve symbol: %s", name);
+        }
         case CLJC_LIST: {
             Cljc *head = form->as.cons.head;
             Cljc *rest = form->as.cons.tail;
@@ -1655,7 +1709,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     need_args(rest, 2, "defmacro");
                     const char *name = sym_name(rest->as.cons.head, "defmacro");
                     Cljc *m = make_fn(env, rest->as.cons.tail, true);
-                    env_define(env_root(env), name, m);
+                    env_define_root(env_root(env), name, m);
                     return m;
                 }
                 if (s == SYM_DEFN) {
@@ -1681,7 +1735,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     need_args(rest, 2, "def");
                     const char *name = sym_name(rest->as.cons.head, "def");
                     Cljc *val = eval(env, rest->as.cons.tail->as.cons.head);
-                    env_define(env_root(env), name, val);  /* def is always global */
+                    env_define_root(env_root(env), name, val);  /* def is always global */
                     return val;
                 }
                 if (s == SYM_LET) {
@@ -3587,7 +3641,7 @@ void     cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
 void     cljc_set_stack_base(void *p);
 
 void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn) {
-    env_define(env_root(env), intern(name, strlen(name)), mk_native(fn));
+    env_define_root(env_root(env), intern(name, strlen(name)), mk_native(fn));
 }
 
 /* Record the high-water mark of the C stack for conservative root scanning.

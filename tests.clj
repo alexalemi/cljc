@@ -595,4 +595,21 @@
 (assert= 0 (apply + {}))                             ; and (empty) maps
 (assert= 14 (apply + 1 2 [4 7]))
 
+; ── symbol-cache / root-redefinition semantics ──
+(defn cache-probe [] cached-global)        ; forward reference, resolved at call
+(def cached-global 1)
+(assert= 1 (cache-probe))                  ; first call fills the cache
+(def cached-global 2)
+(assert= 2 (cache-probe))                  ; redefinition seen through mutation
+(defn cache-probe2 [cached-global] cached-global)
+(assert= :local (cache-probe2 :local))     ; locals still shadow cached roots
+(assert= 99 (let [cached-global 99] cached-global))
+(assert= 2 cached-global)
+(defn redefn-test [] :v1)
+(defn redefn-test [] :v2)
+(assert= :v2 (redefn-test))
+(def fn-using-redef (fn [] (redefn-test)))
+(defn redefn-test [] :v3)
+(assert= :v3 (fn-using-redef))             ; calls see the latest def
+
 (println "tests complete")

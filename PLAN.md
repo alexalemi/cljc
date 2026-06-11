@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~4,100 lines, zero warnings, 381 assertions in `tests.clj`, ASan/UBSan clean
+~4,170 lines, zero warnings, 388 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -115,8 +115,18 @@ required by conservative stack scanning, same as Boehm GC).
    root env, no lexical capture, like Clojure), peek/pop (vector pop
    has an O(1) tail fast path, O(n) rebuild every 32nd), empty,
    not-empty, doall/dorun (eager no-ops), flatten, fnil.
-10. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
-   bytecode VM. Not before semantics are broader.
+10. ~~Performance round 1~~ ✅ done 2026-06-10 — 5.7x on the eval
+    benchmark (fib 27 + 3M loop + seq pipeline: 2.65s → 0.46s):
+    (a) root def MUTATES the existing binding instead of shadowing,
+    making root Binding* stable for the process lifetime; (b) each
+    symbol cell carries a root_cache (as.symc aliases as.sym) that
+    memoizes its resolved root binding — locals scan first, the root
+    scan happens once per symbol cell ever; (c) bindings are pooled
+    like cells/envs (a fn call allocates one per param), recycled at
+    env sweep. CAVEAT: the cache assumes a single root env per
+    process (already documented in the README embedding rules).
+11. **Performance later, maybe**: NaN-boxing, bytecode VM, arity-info
+    precomputation. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

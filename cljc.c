@@ -5957,18 +5957,39 @@ static bool balanced(const char *s) {
     return depth <= 0 && !in_str;
 }
 
+/* Record a result in the absolute history: Out grows by one; (Out n)
+ * retrieves it because vectors are callable. Index 0 is a nil spacer
+ * so numbers match the prompt. */
+static void repl_record(CljcEnv *env, Cljc *result) {
+    Cljc *outv = env_lookup_maybe(env, "Out");
+    if (!outv || outv->tag != CLJC_VECTOR) {
+        outv = mk_empty_vec();
+        outv = vec_conj1(outv, NIL);
+    }
+    outv = vec_conj1(outv, result);
+    env_define_root(env_root(env), intern("Out", 3), outv);
+    Cljc *star2 = env_lookup_maybe(env, "*1");
+    Cljc *star3 = env_lookup_maybe(env, "*2");
+    if (star3) env_define_root(env_root(env), intern("*3", 2), star3);
+    if (star2) env_define_root(env_root(env), intern("*2", 2), star2);
+    env_define_root(env_root(env), intern("*1", 2), result);
+}
+
 static int run_repl(CljcEnv *env) {
     hist_load();
-    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 hold results, ctrl-d exits\n",
+    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 / (Out n) hold results, !cmd shells out\n",
            CLJC_VERSION);
     char form[RL_MAX * 4];
     char line[RL_MAX];
+    int out_n = 1;
+    char prompt[48];
     for (;;) {
         form[0] = 0;
-        if (!rl_edit("cljc> ", line, sizeof line)) break;
+        snprintf(prompt, sizeof prompt, "cljc[%d]> ", out_n);
+        if (!rl_edit(prompt, line, sizeof line)) break;
         snprintf(form, sizeof form, "%s", line);
         while (form[0] != '!' && !balanced(form)) {
-            if (!rl_edit("  ... ", line, sizeof line)) break;
+            if (!rl_edit("    ...> ", line, sizeof line)) break;
             size_t fl = strlen(form);
             snprintf(form + fl, sizeof form - fl, "\n%s", line);
         }
@@ -5992,7 +6013,8 @@ static int run_repl(CljcEnv *env) {
             if (map_find(r, mk_kw(intern("exit", 4)), &exitc) &&
                 exitc->tag == CLJC_INT && exitc->as.i != 0)
                 printf("\x1b[31m[exit %lld]\x1b[0m\n", (long long)exitc->as.i);
-            env_define_root(env_root(env), intern("*1", 2), r);  /* capturable */
+            repl_record(env, r);   /* shell results are numbered too */
+            out_n++;
             continue;
         }
         const char *p = form;
@@ -6002,14 +6024,11 @@ static int run_repl(CljcEnv *env) {
             Cljc *f = read_form(&p);
             if (!f) break;
             Cljc *result = eval(env, f);
-            /* ipython-style result history */
-            Cljc *star2 = env_lookup_maybe(env, "*1");
-            Cljc *star3 = env_lookup_maybe(env, "*2");
-            if (star3) env_define_root(env_root(env), intern("*3", 2), star3);
-            if (star2) env_define_root(env_root(env), intern("*2", 2), star2);
-            env_define_root(env_root(env), intern("*1", 2), result);
+            repl_record(env, result);
+            printf("\x1b[2m[%d]\x1b[0m ", out_n);
             print(result);
             putchar('\n');
+            out_n++;
         }
     }
     return 0;

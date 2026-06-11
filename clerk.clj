@@ -1,7 +1,9 @@
 ;; clerk.clj — Clerk-style literate notebooks for cljc.
 ;;
-;;   cljc clerk notebook.clj [port]        live server (default 7878)
-;;   cljc clerk notebook.clj -o out.html   static single-file build
+;;   cljc notebook notebook.clj [port]     live server (default 7878)
+;;   cljc notebook somedir/ [port]         watch the tree; saving any .clj
+;;                                         in it switches the view to it
+;;   cljc notebook notebook.clj -o out.html  static single-file build
 ;;
 ;; A notebook is an ordinary .clj file: top-level ;; comments render as
 ;; markdown prose, every top-level form is a code cell evaluated in order
@@ -384,20 +386,76 @@ th{background:#efeeea}
          (println "clerk: render failed:" (ex-message e))
          old-html)))
 
+(defn cljc/clerk-broadcast
+  "Send a reload to every SSE client; returns the survivors."
+  [sse]
+  (filterv (fn [c] (tcp/send c "data: reload\n\n")) sse))
+
+(defn cljc/clerk-serve-file [path port]
+  (let [srv (tcp/listen port)]
+    (println (str "clerk: " path " → http://127.0.0.1:" port "  (ctrl-c to stop)"))
+    (loop [html (cljc/clerk-render-safe path "") mt (cljc/mtime* path) sse []]
+      (let [fd (tcp/accept srv 250)
+            sse (if fd (cljc/clerk-handle fd html sse) sse)
+            nmt (cljc/mtime* path)]
+        (if (and nmt (not= nmt mt))
+          (recur (cljc/clerk-render-safe path html) nmt (cljc/clerk-broadcast sse))
+          (recur html mt sse))))))
+
+;; ── directory mode: watch the whole tree, show whichever file changed ──
+
+(defn cljc/clerk-walk
+  "All .clj files under dir, recursive; skips dot-directories."
+  [dir]
+  (mapcat (fn [n]
+            (let [p (str dir "/" n)]
+              (cond
+                (str/starts-with? n ".") []
+                (cljc/dir?* p) (cljc/clerk-walk p)
+                (str/ends-with? n ".clj") [p]
+                :else [])))
+          (or (cljc/list-dir* dir) [])))
+
+(defn cljc/clerk-snapshot
+  "Map of path → mtime for every .clj under dir."
+  [dir]
+  (reduce (fn [m p] (assoc m p (cljc/mtime* p))) {} (cljc/clerk-walk dir)))
+
+(defn cljc/clerk-changed
+  "Some path that is new or has a different mtime than in old, else nil."
+  [old new]
+  (some (fn [[p t]] (when (not= t (get old p)) p)) (seq new)))
+
+(defn cljc/clerk-newest [snap]
+  (first (last (sort-by (fn [[_ t]] t) (seq snap)))))
+
+(defn cljc/clerk-serve-dir [dir port]
+  (let [srv (tcp/listen port)
+        snap (cljc/clerk-snapshot dir)
+        cur (cljc/clerk-newest snap)
+        empty-page (clerk/page dir "<p>no .clj files here yet — save one and it will appear.</p>" true)]
+    (println (str "clerk: " dir "/ (" (count snap) " files) → http://127.0.0.1:" port "  (ctrl-c to stop)"))
+    (when cur (println (str "clerk: showing " cur)))
+    (loop [cur cur
+           html (if cur (cljc/clerk-render-safe cur empty-page) empty-page)
+           snap snap sse []]
+      (let [fd (tcp/accept srv 250)
+            sse (if fd (cljc/clerk-handle fd html sse) sse)
+            nsnap (cljc/clerk-snapshot dir)
+            chg (cljc/clerk-changed snap nsnap)]
+        (if chg
+          (do (when (not= chg cur) (println (str "clerk: showing " chg)))
+              (recur chg (cljc/clerk-render-safe chg html) nsnap (cljc/clerk-broadcast sse)))
+          (recur cur html nsnap sse))))))
+
 (defn clerk/serve
+  "Serve a notebook file, or a directory — in directory mode every .clj in
+  the tree is watched and saving any of them switches the view to it."
   ([path] (clerk/serve path 7878))
   ([path port]
-   (let [srv (tcp/listen port)]
-     (println (str "clerk: " path " → http://127.0.0.1:" port "  (ctrl-c to stop)"))
-     (loop [html (cljc/clerk-render-safe path "") mt (cljc/mtime* path) sse []]
-       (let [fd (tcp/accept srv 250)
-             sse (if fd (cljc/clerk-handle fd html sse) sse)
-             nmt (cljc/mtime* path)]
-         (if (and nmt (not= nmt mt))
-           (let [html (cljc/clerk-render-safe path html)
-                 live (filterv (fn [c] (tcp/send c "data: reload\n\n")) sse)]
-             (recur html nmt live))
-           (recur html mt sse)))))))
+   (if (cljc/dir?* path)
+     (cljc/clerk-serve-dir path port)
+     (cljc/clerk-serve-file path port))))
 
 ;; ── CLI entry (invoked by `cljc clerk ...`) ──
 
@@ -406,7 +464,7 @@ th{background:#efeeea}
         file (first args)]
     (cond
       (nil? file)
-      (println "usage: cljc clerk <notebook.clj> [port] [-o out.html]")
+      (println "usage: cljc notebook <file.clj | dir> [port] [-o out.html]")
       (= (second args) "-o")
       (if-let [out (nth args 2 nil)]
         (println "clerk: wrote" (clerk/build file out))

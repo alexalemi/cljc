@@ -1021,4 +1021,32 @@
 (assert= "<div class=\"raw\"><b>x</b></div>" (clerk/render-value "<b>x</b>"))
 (assert= true (str/includes? (clerk/render-value [1 2 3]) "class=\"value\""))
 
+; defonce
+(defonce cljc-defonce-probe (atom 0))
+(swap! cljc-defonce-probe inc)
+(defonce cljc-defonce-probe (atom 0))
+(assert= 1 @cljc-defonce-probe)
+
+; dir natives + clerk directory walking
+(assert= true (cljc/dir?* "vendor"))
+(assert= false (cljc/dir?* "cljc.c"))
+(assert= false (cljc/dir?* "/no/such/dir"))
+(assert= true (vector? (cljc/list-dir* "vendor")))
+(assert= nil (cljc/list-dir* "/no/such/dir"))
+(fs/create-dir "/tmp/cljc-clerk-walk")
+(fs/create-dir "/tmp/cljc-clerk-walk/sub")
+(fs/create-dir "/tmp/cljc-clerk-walk/.git")
+(spit "/tmp/cljc-clerk-walk/a.clj" "(+ 1 1)")
+(spit "/tmp/cljc-clerk-walk/sub/b.clj" "(+ 2 2)")
+(spit "/tmp/cljc-clerk-walk/.git/c.clj" "(+ 3 3)")
+(spit "/tmp/cljc-clerk-walk/notes.txt" "hi")
+(assert= #{"/tmp/cljc-clerk-walk/a.clj" "/tmp/cljc-clerk-walk/sub/b.clj"}
+         (set (cljc/clerk-walk "/tmp/cljc-clerk-walk")))
+(assert= "/tmp/cljc-clerk-walk/sub/b.clj"
+         (cljc/clerk-changed (dissoc (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")
+                                     "/tmp/cljc-clerk-walk/sub/b.clj")
+                             (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")))
+(assert= nil (let [s (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")] (cljc/clerk-changed s s)))
+(sh "rm -rf /tmp/cljc-clerk-walk")
+
 (println "tests complete")

@@ -24,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>      /* isatty, close — REPL detection, tcp primitives */
 #include <sys/stat.h>    /* stat — file mtimes (clerk file watching) */
+#include <dirent.h>      /* opendir — directory walking (clerk dir mode) */
 #include <sys/socket.h>  /* tcp primitives (clerk notebook server) */
 #include <netinet/in.h>
 #include <poll.h>
@@ -4463,6 +4464,31 @@ static Cljc *prim_mtime(CljcEnv *env, Cljc **argv, int nargs) {
                   + st.st_mtim.tv_nsec / 1000000);
 }
 
+/* (cljc/dir?* path) → true if path exists and is a directory. */
+static Cljc *prim_dir_p(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    char *path = as_str(argv[0], "cljc/dir?*");
+    struct stat st;
+    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? TRUE : FALSE;
+}
+
+/* (cljc/list-dir* path) → vector of entry names (sans . and ..), or nil
+ * if path is unreadable / not a directory. */
+static Cljc *prim_list_dir(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    char *path = as_str(argv[0], "cljc/list-dir*");
+    DIR *d = opendir(path);
+    if (!d) return NIL;
+    Cljc *v = mk_empty_vec();
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        v = vec_conj1(v, mk_str(e->d_name, strlen(e->d_name)));
+    }
+    closedir(d);
+    return v;
+}
+
 /* ── TCP primitives ──
  * Generic loopback TCP for clj-land servers (the clerk notebook uses them;
  * the nREPL server predates them and keeps its own loop). File descriptors
@@ -5170,6 +5196,9 @@ static const char *PRELUDE =
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
     "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
     "(defn sequential? [x] (or (list? x) (vector? x) (seq? x)))\n"
+    /* defonce: evaluating a bare unbound symbol throws — catch it and def.
+     * Keeps atoms etc. alive across re-evaluation (notebook saves, reloads). */
+    "(defmacro defonce [n e] `(try ~n (catch Exception ex# (def ~n ~e))))\n"
     "(def *load-path*\n"
     "  (vec (concat [\".\" \"vendor\"]\n"
     "               (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
@@ -5454,6 +5483,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "slurp",   prim_slurp);
     cljc_define_native(e, "spit",    prim_spit);
     cljc_define_native(e, "cljc/mtime*", prim_mtime);
+    cljc_define_native(e, "cljc/dir?*",  prim_dir_p);
+    cljc_define_native(e, "cljc/list-dir*", prim_list_dir);
     cljc_define_native(e, "tcp/listen", prim_tcp_listen);
     cljc_define_native(e, "tcp/accept", prim_tcp_accept);
     cljc_define_native(e, "tcp/recv",   prim_tcp_recv);
@@ -6419,7 +6450,8 @@ static void usage(FILE *f) {
         "  eval <expr...>             evaluate, print the last value (alias -e)\n"
         "  repl                       interactive REPL\n"
         "  nrepl [port]               nREPL server for editors (default 7888)\n"
-        "  notebook <file> [port]     live literate notebook (default 7878)\n"
+        "  notebook <file|dir> [port] live literate notebook (default 7878);\n"
+        "                             dir: any .clj saved in the tree is shown\n"
         "  notebook <file> -o <html>  static notebook build\n"
         "  test [files...]            load files, run deftests, exit 1 on failure\n"
         "  lint [files...]            reader syntax check, full error rendering\n"

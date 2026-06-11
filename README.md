@@ -19,11 +19,19 @@ in ~4,000 lines of C99 with no dependencies.
 ## Quick start
 
 ```sh
-make            # builds ./cljc (cc, -lm, nothing else)
+make            # builds ./cljc (cc, -lm -ldl, nothing else)
 ./cljc          # interactive REPL (multi-line aware)
 ./cljc file.clj # run a script
-make test       # 380+ assertions, run twice: normal + GC-stress mode
+make test       # 600+ assertions, run twice: normal + GC-stress mode
+
+./install.sh                      # install to ~/.local (no sudo)
+PREFIX=/usr/local ./install.sh    # system-wide
 ```
+
+Installed, `cljc` works from anywhere: batteries (`json.clj`, `fs.clj`,
+`process.clj`, …) and vendored libraries (`clojure.set`, medley, …) resolve
+through `$PREFIX/share/cljc`, with `CLJC_PATH` (colon-separated) for extra
+roots. `cljc --version` tells you what you have.
 
 ## What's inside
 

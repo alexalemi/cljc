@@ -26,6 +26,11 @@
 #include <unistd.h>  /* isatty — REPL vs script-mode detection */
 #endif
 
+#define CLJC_VERSION "0.1.0"
+#ifndef CLJC_SHAREDIR
+#define CLJC_SHAREDIR "/usr/local/share/cljc"
+#endif
+
 /* Interpreter output streams — swappable so the nREPL server can capture
  * println/error output into protocol messages. NULL means stdout/stderr. */
 static FILE *cljc_out, *cljc_err;
@@ -3885,6 +3890,17 @@ static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
+static Cljc *prim_getenv_raw(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    const char *v = getenv(as_str(argv[0], "cljc/env*"));
+    return v ? mk_str(v, strlen(v)) : NIL;
+}
+
+static Cljc *prim_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    return mk_str(CLJC_SHAREDIR, strlen(CLJC_SHAREDIR));
+}
+
 static Cljc *prim_hash(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     return mk_int((int64_t)cljc_hash(argv[0]));
@@ -4892,7 +4908,11 @@ static const char *PRELUDE =
     "(def volatile! atom)\n"
     "(def vreset! reset!)\n"
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
-    "(def *load-path* [\".\" \"vendor\"])\n"
+    "(def *load-path*\n"
+    "  (vec (concat [\".\" \"vendor\"]\n"
+    "               (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
+    "                 (str/split p \":\"))\n"
+    "               [(cljc/sharedir*) (str (cljc/sharedir*) \"/vendor\")])))\n"
     "(def cljc/loaded-namespaces (atom #{}))\n"
     "(defn cljc/spec-opt [spec k]\n"
     "  (loop [s (seq (rest spec))]\n"
@@ -5083,6 +5103,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "type",    prim_type);
     cljc_define_native(e, "sh",        prim_sh);
     cljc_define_native(e, "hash",      prim_hash);
+    cljc_define_native(e, "cljc/env*",      prim_getenv_raw);
+    cljc_define_native(e, "cljc/sharedir*", prim_sharedir);
     cljc_define_native(e, "int",       prim_int);
     cljc_define_native(e, "identical?", prim_identical);
     cljc_define_native(e, "with-meta",  prim_with_meta);
@@ -5454,7 +5476,12 @@ CljcEnv *cljc_new_env(void) {
         "     (cljc/ffi-build code libs))))\n"
         "(defmacro ffi/defstruct [sname fields & opts]\n"
         "  `(ffi/defstruct* '~sname '~fields ~@opts))\n"
-        "(defn load-file [path] (eval (read-string (str \"(do \" (slurp path) \")\"))))\n");
+        "(defn cljc/slurp-maybe [p] (try (slurp p) (catch Exception e nil)))\n"
+    "(defn load-file [path]\n"
+    "  (let [src (or (cljc/slurp-maybe path)\n"
+    "                (some (fn [d] (cljc/slurp-maybe (str d \"/\" path))) *load-path*)\n"
+    "                (throw (ex-info (str \"load-file: not found on *load-path*: \" path) {})))]\n"
+    "    (eval (read-string (str \"(do \" src \")\")))))\n");
     return e;
 }
 
@@ -5761,6 +5788,10 @@ int main(int argc, char **argv) {
     cljc_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
     CljcEnv *env = cljc_new_env();
 
+    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+        printf("cljc %s\n", CLJC_VERSION);
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "--nrepl") == 0)
         return nrepl_server(env, argc > 2 ? atoi(argv[2]) : 7888);
     {   /* *args*: arguments after the script path, as a vector */

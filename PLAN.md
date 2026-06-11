@@ -356,7 +356,14 @@ required by conservative stack scanning, same as Boehm GC).
     run! not-any? not-every? edn/read-string pprint. (d) fs.clj
     (babashka.fs-flavored; list-dir via FFI opendir/readdir/dirent
     defstruct!) + process.clj (shell-escaped sh/shell/out).
-29. **Performance later, maybe**: args-as-array calling convention,
+29. ~~Install story~~ ✅ done 2026-06-11 — make install/uninstall with
+    PREFIX/DESTDIR conventions; batteries + vendor libs land in
+    $PREFIX/share/cljc (path compiled in via -DCLJC_SHAREDIR);
+    *load-path* = [. vendor CLJC_PATH-dirs sharedir sharedir/vendor];
+    load-file searches *load-path* after the literal path; --version
+    flag; install.sh (defaults to ~/.local, tests before installing).
+    Verified end-to-end from a scratch prefix + unrelated cwd.
+30. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

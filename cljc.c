@@ -5707,11 +5707,19 @@ static void hist_add(const char *line) {
     if (f) { fprintf(f, "%s\n", line); fclose(f); }
 }
 
-/* Index of the bracket matching the one at `target`, or -1. */
-static long rl_match(const char *buf, long target) {
+/* Index of the bracket matching `target`; -1 = none, -2 = orphan closer.
+ * *mismatch set when the pair's TYPES disagree: ( closed by ] etc. */
+static bool rl_pair_ok(char open, char close) {
+    return (open == '(' && close == ')') ||
+           (open == '[' && close == ']') ||
+           (open == '{' && close == '}');
+}
+
+static long rl_match(const char *buf, long target, bool *mismatch) {
     long stack[256];
     int sp = 0;
     bool in_str = false, in_com = false;
+    *mismatch = false;
     for (long i = 0; buf[i]; i++) {
         char c = buf[i];
         if (in_com) { if (c == '\n') in_com = false; continue; }
@@ -5726,22 +5734,26 @@ static long rl_match(const char *buf, long target) {
         else if (strchr(")]}", c)) {
             if (sp > 0) {
                 long open = stack[--sp];
-                if (i == target) return open;
-                if (open == target) return i;
-            }
+                if (i == target || open == target) {
+                    *mismatch = !rl_pair_ok(buf[open], c);
+                    return i == target ? open : i;
+                }
+            } else if (i == target) return -2;   /* closer with no opener */
         }
     }
     return -1;
 }
 
 /* Render the buffer with syntax highlighting into out; the bracket pair
- * (hl_a, hl_b) renders in reverse video. */
-static void rl_highlight(const char *buf, SBuf *out, long hl_a, long hl_b) {
+ * (hl_a, hl_b) renders in reverse video — red when hl_bad (mismatched
+ * types or an orphan closer). */
+static void rl_highlight(const char *buf, SBuf *out, long hl_a, long hl_b,
+                         bool hl_bad) {
     const char *p = buf;
     while (*p) {
         long off = (long)(p - buf);
         if ((off == hl_a || off == hl_b) && strchr("()[]{}", *p)) {
-            sb_puts(out, "\x1b[7;1m");      /* matched pair: reverse video */
+            sb_puts(out, hl_bad ? "\x1b[7;31;1m" : "\x1b[7;1m");
             sb_putc(out, *p++);
             sb_puts(out, "\x1b[0m");
             continue;
@@ -5784,14 +5796,16 @@ static void rl_refresh_opt(const char *prompt, const char *buf, size_t pos,
     if (show_match && pos > 0 && strchr(")]}", buf[pos - 1])) hl_a = (long)pos - 1;
     else if (!show_match) { /* accepted line: no lingering highlight */ }
     else if (show_match && strchr("([{", buf[pos] ? buf[pos] : ' ')) hl_a = (long)pos;
+    bool hl_bad = false;
     if (hl_a >= 0) {
-        hl_b = rl_match(buf, hl_a);
-        if (hl_b < 0) hl_a = -1;
+        hl_b = rl_match(buf, hl_a, &hl_bad);
+        if (hl_b == -2) { hl_b = -1; hl_bad = true; }  /* orphan: red alone */
+        else if (hl_b < 0) hl_a = -1;
     }
     SBuf out = {0};
     sb_puts(&out, "\r\x1b[K");
     sb_puts(&out, prompt);
-    rl_highlight(buf, &out, hl_a, hl_b);
+    rl_highlight(buf, &out, hl_a, hl_b, hl_bad);
     /* cursor: return to col 0, advance past prompt + pos */
     char mv[32];
     snprintf(mv, sizeof mv, "\r\x1b[%zuC", strlen(prompt) + pos);

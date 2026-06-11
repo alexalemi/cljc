@@ -97,7 +97,7 @@ unmodified upstream sources vendored in `vendor/`:
 | **clojure.set** | ✅ complete — `union`/`join`/`project`/`index`/`map-invert`/… |
 | **clojure.walk** | ✅ complete — `postwalk`/`keywordize-keys`/`prewalk-replace`/… |
 | **medley** | ✅ substantially — `assoc-some`, `deep-merge`, `index-by`, `distinct-by`, `interleave-all`, lazy + `reduced`-based fns |
-| clojure.zip | ❌ zippers live in *metadata* — needs real meta support (mapped, unbuilt) |
+| **clojure.zip** | ✅ complete — metadata is real now (`with-meta`/`meta`, `^{}` evaluated) |
 | data.json | ❌ Java interop throughout (our `json.clj` covers the need) |
 | Clerk | ❌ JVM-bound (doesn't run on babashka either) |
 
@@ -204,7 +204,9 @@ and zero dependencies matter; use bb/JVM where throughput does.
 - Patterns are plain strings (`#"…"` is raw-string sugar); `{n,m}` braces are
   literals; `str/replace` is literal — regex replace is spelled `re-replace`
 - Quasiquote: no auto-gensym `x#`, no nesting levels
-- `ns`/`require` are tolerated no-ops; `#?(:cljc …)` reader conditionals;
+- Metadata works (`with-meta`/`meta`/`^{}`) but is NOT preserved through
+  collection ops (`conj` etc.) — explicit threading only, which zip does
+- `ns` is a tolerated no-op; `require` loads; `#?(:cljc …)` reader conditionals;
   `#(…)`, `\a` char literals (1-char strings), `^meta` (discarded) supported
 
 The full list, the roadmap, and the GC invariants live in [PLAN.md](PLAN.md).

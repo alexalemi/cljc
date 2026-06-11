@@ -294,7 +294,14 @@ required by conservative stack scanning, same as Boehm GC).
     resolved on lookup miss by prefix-strip, cached in the symbol
     cell), instance? as always-false macro, volatile!/vreset!/vswap!
     as atom shims, coll?/map-entry?/list*/find/key/val/nnext family.
-24. Survey round 3 finding (2026-06-11): clojure.zip is BLOCKED
+24. ~~Metadata~~ ✅ done 2026-06-11 — Cljc gains a meta slot (+8B/cell,
+    one gc_mark line); with-meta copies the cell (vectors also copy
+    their owned tail — double-free otherwise) and errors on non-
+    carriers like Clojure; ^{} / ^:kw in the reader compile to
+    runtime (with-meta form m), ^Tag hints still discarded; vary-meta
+    real. NOT preserved through coll ops (deferred — zip threads meta
+    explicitly so it doesn't need it). UPSTREAM CLOJURE.ZIP RUNS IN
+    FULL (4th library). Previous finding, now resolved: clojure.zip was BLOCKED
     structurally — zippers carry their branch?/children/make-node fns
     in ^{:zip/...} metadata, so the metadata-discard divergence is
     load-bearing there. Unlock if wanted: real with-meta/meta via a

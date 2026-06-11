@@ -64,6 +64,7 @@ typedef Cljc *(*CljcNativeFn)(CljcEnv *env, Cljc **argv, int nargs);
 struct Cljc {
     CljcTag tag;
     uint8_t gcmark;
+    Cljc *meta;     /* metadata map or NULL; ignored by equality/hash */
     union {
         bool b;
         int64_t i;
@@ -415,6 +416,7 @@ static void gc_mark(Cljc *v) {
     while (v && !v->gcmark) {
         if (v->tag == CLJC_FREE) return;
         v->gcmark = 1;
+        if (v->meta) gc_mark(v->meta);
         switch (v->tag) {
             case CLJC_LIST:
                 gc_mark(v->as.cons.head);
@@ -1256,6 +1258,7 @@ static Cljc *cell_alloc(bool zero) {
      * skip it — they overwrite the value slot immediately. */
     if (zero) memset(&c->as, 0, sizeof c->as);
     c->gcmark = 0;
+    c->meta = NULL;
     return c;
 }
 
@@ -1443,10 +1446,19 @@ static Cljc *read_form(const char **p) {
             v = vec_conj1(v, l->as.cons.head);
         return v;
     }
-    if (c == '^') {  /* metadata: parse and discard (^:kw, ^{...}, ^Tag) */
+    if (c == '^') {
+        /* ^{...} and ^:kw compile to (with-meta form m), evaluated at
+         * runtime like Clojure; ^Tag type hints are discarded. */
         (*p)++;
-        read_form(p);          /* the metadata itself */
-        return read_form(p);   /* the annotated form */
+        Cljc *m = read_form(p);
+        Cljc *form = read_form(p);
+        if (m != NIL && m->tag == CLJC_KEYWORD) {
+            Cljc *mm = mk_map();
+            m = map_assoc(mm, m, TRUE);
+        }
+        if (m == NIL || m->tag != CLJC_MAP) return form;  /* type hint */
+        return mk_cons(mk_sym(intern("with-meta", 9)),
+                       mk_cons(form, mk_cons(m, NIL)));
     }
     if (c == '\\') {  /* char literal => 1-char string (no char type) */
         (*p)++;
@@ -3650,6 +3662,33 @@ static Cljc *prim_alias(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
+static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *v = argv[0];
+    Cljc *m = argv[1];
+    if (m != NIL && m->tag != CLJC_MAP) cljc_error("with-meta: meta must be a map");
+    if (v == NIL) cljc_error("with-meta: nil cannot carry metadata");
+    switch (v->tag) {
+        case CLJC_LIST: case CLJC_VECTOR: case CLJC_MAP: case CLJC_SET:
+        case CLJC_FN: case CLJC_SYMBOL: break;
+        default: cljc_error("with-meta: this type cannot carry metadata");
+    }
+    Cljc *c = alloc(v->tag);
+    c->as = v->as;
+    if (v->tag == CLJC_VECTOR) {        /* tails are exclusively owned */
+        c->as.vec.tail = tail_alloc(v->as.vec.taillen);
+        memcpy(c->as.vec.tail, v->as.vec.tail, sizeof(Cljc *) * v->as.vec.taillen);
+    }
+    c->meta = m == NIL ? NULL : m;
+    return c;
+}
+
+static Cljc *prim_meta(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *v = argv[0];
+    return (v != NIL && v->meta) ? v->meta : NIL;
+}
+
 static Cljc *prim_identical(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     return mk_bool(argv[0] == argv[1] ||
@@ -4649,9 +4688,7 @@ static const char *PRELUDE =
     /* batch 5-lite */
     "(defmacro comment [& _] nil)\n"
     "(defmacro defn- [name & body] `(defn ~name ~@body))\n"
-    "(defn with-meta [x m] x)\n"
-    "(defn meta [x] nil)\n"
-    "(defn vary-meta [x & _] x)\n"
+    "(defn vary-meta [x f & args] (with-meta x (apply f (meta x) args)))\n"
     "(defmacro instance? [c x] `(do ~x false))\n"
     "(defn nnext [s] (next (next s)))\n"
     "(defn find [m k] (when (contains? m k) [k (get m k)]))\n"
@@ -4857,6 +4894,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "hash",      prim_hash);
     cljc_define_native(e, "int",       prim_int);
     cljc_define_native(e, "identical?", prim_identical);
+    cljc_define_native(e, "with-meta",  prim_with_meta);
+    cljc_define_native(e, "meta",       prim_meta);
     cljc_define_native(e, "cljc/alias*", prim_alias);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);

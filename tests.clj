@@ -654,7 +654,8 @@
 (assert= " " \space)
 (assert= "\n" \newline)
 (assert= 3 (count (filter #(= % \a) (seq "banana"))))
-(assert= 3 ^:private (+ 1 2))
+(assert= [1 2] ^:private [1 2])
+(assert= {:private true} (meta ^:private [1 2]))
 (assert= :ours #?(:clj :jvm :cljc :ours :default :other))
 (assert= :fallback #?(:clj :jvm :default :fallback))
 (assert= nil (comment (this is ignored)))
@@ -876,5 +877,18 @@
 (assert= {:a 2 :b [3 4]} (postwalk (fn [x] (if (int? x) (inc x) x)) {:a 1 :b [2 3]}))
 (assert= {:a 1 :b {:c 2}} (keywordize-keys {"a" 1 "b" {"c" 2}}))
 (assert= [:y [:y :z]] (prewalk-replace {:x :y} [:x [:x :z]]))
+
+; ── metadata + clojure.zip (the structural unlock) ──
+(assert= {:k :v} (meta (with-meta [1] {:k :v})))
+(assert= nil (meta [1]))
+(assert= [1] (with-meta [1] {:k :v}))                ; meta invisible to =
+(assert= {:a 1 :b 2} (meta (vary-meta (with-meta [] {:a 1}) assoc :b 2)))
+(assert= :no (try (with-meta 42 {}) (catch Exception e :no)))
+(require 'clojure.zip)
+(def zt (vector-zip [1 [2 3] 4]))
+(assert= 3 (-> zt down right down right node))
+(assert= [2 [2 3] 4] (root (edit (-> zt down) inc)))
+(assert= [:X [2 3] 4] (-> zt down (replace :X) root))
+(assert= [1 [3] 4] (-> zt down right down remove root))
 
 (println "tests complete")

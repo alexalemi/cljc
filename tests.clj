@@ -729,4 +729,18 @@
 (assert= (list 3 4) (drop 2 [1 2 3 4]))          ; finite drop still right
 (assert= (list 1 1 2 2) (mapcat (fn [x] [x x]) [1 2]))
 
+; ── FFI (s7 cload model: generate glue, compile, dlopen) ──
+(assert= 0 (:exit (sh "true")))
+(assert= 1 (:exit (sh "false")))
+(assert= "ping\n" (:out (sh "echo ping")))
+(ffi/define [[:double cos [:double]]
+             [:double hypot [:double :double]]
+             [:int abs [:int]]
+             [:string getenv [:string]]]
+            {:headers ["math.h" "stdlib.h" "unistd.h"] :libs "-lm"})
+(assert= 1.0 (cos 0.0))
+(assert= 5.0 (hypot 3.0 4.0))
+(assert= 7 (abs -7))
+(assert= true (string? (getenv "HOME")))
+
 (println "tests complete")

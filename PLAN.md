@@ -199,7 +199,17 @@ required by conservative stack scanning, same as Boehm GC).
     maps and participate in protocols). Divergences: type returns
     keywords not classes; no defrecord positional equality semantics
     beyond map equality; extend-type takes type KEYWORDS.
-16. **Performance later, maybe**: args-as-array calling convention,
+16. ~~C FFI (s7/cload model)~~ ✅ done 2026-06-10 — inspired by
+    ~/build/s7's cload.scm: (ffi/define [[:double cos [:double]] ...]
+    {:headers [...] :libs "-lm"}) declares signatures as DATA; a
+    prelude generator emits glue C marshalling through a CljcFfiApi
+    VTABLE (append-only struct — modules need no cljc symbols/headers),
+    (sh ...) compiles it -shared -fPIC, ffi-load* dlopens and calls
+    cljc_module_init(env, api). Types: :int :double :string :void.
+    Also: sh native (popen, {:exit :out}). Requires cc at runtime
+    (the s7 trade). Future: :pointer type, struct support, a libc.clj
+    batteries module, caching compiled modules by signature hash.
+17. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

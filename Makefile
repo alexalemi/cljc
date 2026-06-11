@@ -2,7 +2,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
 
 cljc: cljc.c
-	$(CC) $(CFLAGS) -o $@ $< -lm
+	$(CC) $(CFLAGS) -o $@ $< -lm -ldl
 
 run: cljc
 	./cljc

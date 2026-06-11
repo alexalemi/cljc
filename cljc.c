@@ -120,6 +120,7 @@ static bool map_find(Cljc *m, Cljc *key, Cljc **out);
 static double as_num(Cljc *v);
 static Cljc *to_seq(Cljc *v);
 static Cljc *seq1(Cljc *v);
+void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
 static Cljc *cell_alloc(bool zero);
 static CljcEnv *env_alloc(void);
 static Cljc **chunk32_alloc(void);
@@ -4019,6 +4020,88 @@ static Cljc *prim_empty(CljcEnv *env, Cljc *args) {
     }
 }
 
+/* ── sh / FFI (the s7 cload model: generate glue C, compile, dlopen) ── */
+
+#include <dlfcn.h>
+
+static Cljc *prim_sh(CljcEnv *env, Cljc *args) {
+    /* (sh "cmd") => {:exit n :out "captured stdout+stderr"} */
+    (void)env;
+    char *cmd = as_str(args->as.cons.head, "sh");
+    SBuf full = {0};
+    sb_puts(&full, cmd);
+    sb_puts(&full, " 2>&1");
+    FILE *p = popen(full.data, "r");
+    free(full.data);
+    if (!p) cljc_error("sh: popen failed");
+    SBuf out = {0};
+    sb_grow(&out, 1); out.data[0] = '\0';
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, p)) > 0) {
+        sb_grow(&out, n);
+        memcpy(out.data + out.len, buf, n);
+        out.len += n; out.data[out.len] = '\0';
+    }
+    int status = pclose(p);
+    Cljc *m = mk_map();
+    m = map_assoc(m, mk_kw(intern("exit", 4)), mk_int(status == -1 ? -1 : WEXITSTATUS(status)));
+    Cljc *s = mk_str(out.data, out.len);
+    free(out.data);
+    m = map_assoc(m, mk_kw(intern("out", 3)), s);
+    return m;
+}
+
+/* Vtable handed to FFI modules — generated glue marshals exclusively
+ * through these, so modules need no cljc symbols or headers. Append-only:
+ * reordering breaks every compiled module. */
+typedef struct {
+    void *(*mk_int)(long long);
+    void *(*mk_double)(double);
+    void *(*mk_str)(const char *);
+    void *(*nil)(void);
+    long long (*as_int)(void *);
+    double (*as_double)(void *);
+    const char *(*as_str)(void *);
+    void *(*nth_arg)(void *args, int i);
+    void (*def_native)(void *env, const char *name, void *(*fn)(void *, void *));
+    void (*error)(const char *msg);
+} CljcFfiApi;
+
+static void *fa_mk_int(long long i) { return mk_int((int64_t)i); }
+static void *fa_mk_double(double d) { return mk_double(d); }
+static void *fa_mk_str(const char *s) { return mk_str(s, strlen(s)); }
+static void *fa_nil(void) { return NIL; }
+static long long fa_as_int(void *v) { return (long long)as_int((Cljc *)v, "ffi"); }
+static double fa_as_double(void *v) { return as_num((Cljc *)v); }
+static const char *fa_as_str(void *v) { return as_str((Cljc *)v, "ffi"); }
+static void *fa_nth_arg(void *args, int i) {
+    Cljc *a = (Cljc *)args;
+    while (i-- > 0 && a != NIL) a = a->as.cons.tail;
+    return a == NIL ? NIL : a->as.cons.head;
+}
+static void fa_def_native(void *env, const char *name, void *(*fn)(void *, void *)) {
+    cljc_define_native((CljcEnv *)env, name, (CljcNativeFn)fn);
+}
+static void fa_error(const char *msg) { cljc_error("%s", msg); }
+
+static CljcFfiApi ffi_api = {
+    fa_mk_int, fa_mk_double, fa_mk_str, fa_nil,
+    fa_as_int, fa_as_double, fa_as_str, fa_nth_arg, fa_def_native, fa_error,
+};
+
+static Cljc *prim_ffi_load(CljcEnv *env, Cljc *args) {
+    /* (ffi-load* "/path/mod.so") — dlopen + call cljc_module_init. */
+    char *path = as_str(args->as.cons.head, "ffi-load*");
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) cljc_error("ffi-load*: %s", dlerror());
+    void (*init)(void *, CljcFfiApi *) =
+        (void (*)(void *, CljcFfiApi *))dlsym(h, "cljc_module_init");
+    if (!init) cljc_error("ffi-load*: no cljc_module_init in %s", path);
+    init(env_root(env), &ffi_api);
+    return TRUE;
+}
+
 /* ───── Public C API ─────────────────────────────────────────────────── */
 
 CljcEnv *cljc_new_env(void);
@@ -4354,6 +4437,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "seq",     prim_seq);
     cljc_define_native(e, "seq?",    prim_seq_p);
     cljc_define_native(e, "type",    prim_type);
+    cljc_define_native(e, "sh",        prim_sh);
+    cljc_define_native(e, "ffi-load*", prim_ffi_load);
     cljc_define_native(e, "hash-map",  prim_hash_map);
     cljc_define_native(e, "get",       prim_get);
     cljc_define_native(e, "assoc",     prim_assoc);
@@ -4530,7 +4615,57 @@ CljcEnv *cljc_new_env(void) {
         "       (assoc (zipmap ~(mapv keyword (map str fields))\n"
         "                      ~fields)\n"
         "              :cljc/type ~kw))))\n"
-        "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\n");
+        "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\\n");
+    /* FFI glue generator — declare C signatures as data, compile, load:
+     * (ffi/define [[:double cos [:double]] [:int getpid []]]
+     *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */
+    cljc_eval_string(e,
+        "(def cljc/ffi-counter (atom 0))\n"
+        "(defn cljc/ffi-ret [t expr]\n"
+        "  (case t\n"
+        "    :int (str \"return api->mk_int(\" expr \");\")\n"
+        "    :double (str \"return api->mk_double(\" expr \");\")\n"
+        "    :string (str \"return api->mk_str(\" expr \");\")\n"
+        "    :void (str expr \"; return api->nil();\")))\n"
+        "(defn cljc/ffi-arg [t i]\n"
+        "  (case t\n"
+        "    :int (str \"api->as_int(api->nth_arg(args, \" i \"))\")\n"
+        "    :double (str \"api->as_double(api->nth_arg(args, \" i \"))\")\n"
+        "    :string (str \"api->as_str(api->nth_arg(args, \" i \"))\")))\n"
+        "(defn cljc/ffi-wrapper [[ret cname argts]]\n"
+        "  (str \"static void *w_\" cname \"(void *env, void *args) { (void)env; \"\n"
+        "       (cljc/ffi-ret ret (str cname \"(\"\n"
+        "                              (str/join \", \" (map-indexed (fn [i t] (cljc/ffi-arg t i)) argts))\n"
+        "                              \")\"))\n"
+        "       \" }\\n\"))\n"
+        "(defn ffi/define*\n"
+        "  ([sigs] (ffi/define* sigs {}))\n"
+        "  ([sigs {:keys [headers libs prefix] :or {headers [] libs \"\" prefix \"\"}}]\n"
+        "   (let [n (swap! cljc/ffi-counter inc)\n"
+        "         base (str \"/tmp/cljc-ffi-\" n)\n"
+        "         api-decl (str \"typedef struct { void*(*mk_int)(long long);\"\n"
+        "                       \" void*(*mk_double)(double); void*(*mk_str)(const char*);\"\n"
+        "                       \" void*(*nil)(void); long long(*as_int)(void*);\"\n"
+        "                       \" double(*as_double)(void*); const char*(*as_str)(void*);\"\n"
+        "                       \" void*(*nth_arg)(void*,int);\"\n"
+        "                       \" void(*def_native)(void*,const char*,void*(*)(void*,void*));\"\n"
+        "                       \" void(*error)(const char*); } CljcFfiApi;\\n\"\n"
+        "                       \"static CljcFfiApi *api;\\n\")\n"
+        "         code (str (str/join \"\" (map (fn [h] (str \"#include <\" h \">\\n\")) headers))\n"
+        "                   api-decl\n"
+        "                   (str/join \"\" (map cljc/ffi-wrapper sigs))\n"
+        "                   \"void cljc_module_init(void *env, CljcFfiApi *a) { api = a;\\n\"\n"
+        "                   (str/join \"\" (map (fn [[_ cname _]]\n"
+        "                                        (str \"  api->def_native(env, \\\"\" prefix cname \"\\\", w_\" cname \");\\n\"))\n"
+        "                                      sigs))\n"
+        "                   \"}\\n\")]\n"
+        "     (spit (str base \".c\") code)\n"
+        "     (let [r (sh (str \"cc -shared -fPIC -O2 -o \" base \".so \" base \".c \" libs))]\n"
+        "       (when-not (zero? (:exit r))\n"
+        "         (throw (ex-info (str \"ffi/define: compile failed:\\n\" (:out r)) {})))\n"
+        "       (ffi-load* (str base \".so\"))))))\n"
+        "(defmacro ffi/define [sigs & opts]\n"
+        "  `(ffi/define* '~sigs ~@opts))\n");
     return e;
 }
 

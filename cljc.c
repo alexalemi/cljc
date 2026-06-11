@@ -5971,17 +5971,18 @@ static bool balanced(const char *s) {
     return depth <= 0 && !in_str;
 }
 
-/* Record a result in the absolute history: Out grows by one; (Out n)
- * retrieves it because vectors are callable. Index 0 is a nil spacer
- * so numbers match the prompt. */
+/* Record a result in the absolute history: *out* grows by one; (*out* n)
+ * retrieves it because vectors are callable. Index 0 is a nil spacer so
+ * numbers match the prompt. (Divergence: Clojure's *out* is the stdout
+ * stream var — ours is REPL output history, by choice.) */
 static void repl_record(CljcEnv *env, Cljc *result) {
-    Cljc *outv = env_lookup_maybe(env, "Out");
+    Cljc *outv = env_lookup_maybe(env, "*out*");
     if (!outv || outv->tag != CLJC_VECTOR) {
         outv = mk_empty_vec();
         outv = vec_conj1(outv, NIL);
     }
     outv = vec_conj1(outv, result);
-    env_define_root(env_root(env), intern("Out", 3), outv);
+    env_define_root(env_root(env), intern("*out*", 5), outv);
     Cljc *star2 = env_lookup_maybe(env, "*1");
     Cljc *star3 = env_lookup_maybe(env, "*2");
     if (star3) env_define_root(env_root(env), intern("*3", 2), star3);
@@ -5991,7 +5992,7 @@ static void repl_record(CljcEnv *env, Cljc *result) {
 
 static int run_repl(CljcEnv *env) {
     hist_load();
-    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 / (Out n) hold results, !cmd shells out\n",
+    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 / (*out* n) hold results, !cmd shells out\n",
            CLJC_VERSION);
     char form[RL_MAX * 4];
     char line[RL_MAX];

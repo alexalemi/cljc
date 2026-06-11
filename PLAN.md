@@ -381,7 +381,7 @@ required by conservative stack scanning, same as Boehm GC).
     candidate listing); live syntax highlighting per keypress incl. MATCHING-BRACKET reverse-video (closer behind cursor or opener at cursor, string/comment-aware pairing) (strings
     green, keywords cyan, numbers yellow, delimiters+comments dim);
     paren-balance multiline with ... continuation; *1 *2 *3 result
-    history (ipython-style); !cmd shell mode ({:exit :out} into *1+Out, red exit notice); MISMATCH detection: pairs type-check — ( closed by ] renders both in red reverse, orphan closers (no opener) red alone. ABSOLUTE history: prompt is cljc[N]>, results print as dim [N], and Out is a literal vector so (Out 3) retrieves and (count Out)/(last Out) just work — shell results numbered too. Errors in the REPL get the full Elm
+    history (ipython-style); !cmd shell mode ({:exit :out} into *1+Out, red exit notice); MISMATCH detection: pairs type-check — ( closed by ] renders both in red reverse, orphan closers (no opener) red alone. ABSOLUTE history: prompt is cljc[N]>, results print as dim [N], and *out* is a literal vector so (*out* 3) retrieves and (count *out*)/(last *out*) just work — shell results numbered too. Errors in the REPL get the full Elm
     treatment minus source excerpts. Also column-precise carets landed
     this session (form {:line :col} meta; token search anchored at
     col; fallback caret at the form's paren).

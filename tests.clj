@@ -909,4 +909,23 @@
 (assert= "\f" \formfeed)
 (assert= 11 (int \o013))
 
+; ── lazy-tail truncation bug (the reify reproducer, now fixed) ──
+(defmacro lt-do [& forms]
+  (cons 'do (concat (list (first forms)) (rest forms))))   ; lazy-tailed expansion
+(def lt-probe (atom []))
+(lt-do (swap! lt-probe conj 1) (swap! lt-probe conj 2) (swap! lt-probe conj 3))
+(assert= [1 2 3] @lt-probe)                                ; was [] — silent truncation
+(defmacro lt-reify [& clauses]                             ; the original lazy reify shape
+  (let [t (keyword (str (gensym)))
+        impls (filter list? clauses)]
+    `(do ~@(map (fn [[m params & body]]
+                  `(defmethod ~m ~t ~(vec params) ~@body))
+                impls)
+         {:cljc/type ~t})))
+(defprotocol LTP (lt-go [x]) (lt-go2 [x]))
+(def lt-obj (lt-reify LTP (lt-go [_] :a) (lt-go2 [_] :b)))
+(assert= :a (lt-go lt-obj))
+(assert= :b (lt-go2 lt-obj))
+(assert= 6 (eval (cons '+ (map inc [0 1 2]))))             ; lazy call form
+
 (println "tests complete")

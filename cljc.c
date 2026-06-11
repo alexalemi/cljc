@@ -2053,6 +2053,14 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
             cljc_error("unable to resolve symbol: %s", name);
         }
         case CLJC_LIST: {
+            /* Macro expansions built with lazy concat/map can carry LAZY
+             * tails mid-chain; every special-form walker iterates raw cons
+             * tails and would silently truncate. Realize once, up front. */
+            {
+                Cljc *l = form;
+                while (l->tag == CLJC_LIST) l = l->as.cons.tail;
+                if (l != NIL && l->tag == CLJC_LAZY) form = to_seq(form);
+            }
             Cljc *head = form->as.cons.head;
             Cljc *rest = form->as.cons.tail;
 

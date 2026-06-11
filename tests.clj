@@ -743,4 +743,18 @@
 (assert= 7 (abs -7))
 (assert= true (string? (getenv "HOME")))
 
+; ── libc.clj batteries + FFI :pointer/caching/NULL safety ──
+(load-file "libc.clj")
+(assert= true (> (getpid) 0))
+(assert= true (file-exists? "cljc.c"))
+(assert= false (file-exists? "/no/such/path"))
+(assert= nil (getenv "CLJC_DEFINITELY_UNSET"))      ; NULL char* => nil
+(assert= "fb" (env "CLJC_DEFINITELY_UNSET" "fb"))
+(setenv "CLJC_T" "v" 1)
+(assert= "v" (getenv "CLJC_T"))
+(assert= true (> (now-epoch) 1700000000))           ; :pointer arg (NULL) + ret
+(assert= true (string? (cwd)))
+(load-file "libc.clj")                              ; reload: cached, idempotent
+(assert= true (> (getpid) 0))
+
 (println "tests complete")

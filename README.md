@@ -39,7 +39,7 @@ make test       # 380+ assertions, run twice: normal + GC-stress mode
 | **Regex** | self-contained backtracking engine: `\d \w \s`, classes, groups, `(?:…)`, alternation, lazy quantifiers; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (with `$1` refs) `re-split`; guarded against catastrophic backtracking |
 | **Library** | ~150 core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops (`str/split str/join str/trim …`), `format`, `slurp`/`spit`, `Math/*`, `sort`/`compare`, `read-string`/`eval` |
 | **Memory** | mark-and-sweep GC over pooled cells, conservative C-stack scanning (interpreter C code needs no root registration), structural sharing throughout |
-| **FFI** | s7/cload-style: `(ffi/define [[:double cos [:double]]] {:headers ["math.h"] :libs "-lm"})` declares C signatures as data, generates glue, compiles a .so at runtime, dlopens it — `cos` becomes a cljc fn. Plus `(sh "cmd")` → `{:exit :out}` |
+| **FFI** | s7/cload-style: `(ffi/define [[:double cos [:double]]] {:headers ["math.h"] :libs "-lm"})` declares C signatures as data, generates glue, compiles a .so at runtime, dlopens it — `cos` becomes a cljc fn. Modules cache by content hash; `libc.clj` ships the libc surface (`(load-file "libc.clj")` → `getpid`, `file-exists?`, `cwd`, `env`…). Plus `(sh "cmd")` → `{:exit :out}` |
 | **Modes** | REPL, script file, piped stdin, embedded, **nREPL server** |
 
 ## Editor integration (nREPL)

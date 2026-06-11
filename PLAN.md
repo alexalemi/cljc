@@ -205,7 +205,12 @@ required by conservative stack scanning, same as Boehm GC).
     prelude generator emits glue C marshalling through a CljcFfiApi
     VTABLE (append-only struct — modules need no cljc symbols/headers),
     (sh ...) compiles it -shared -fPIC, ffi-load* dlopens and calls
-    cljc_module_init(env, api). Types: :int :double :string :void.
+    cljc_module_init(env, api). Types: :int :double :string :void
+    :pointer (as int64; NULL<->nil for strings). Modules are cached
+    content-addressed in /tmp (hash of code+libs) — reload is a dlopen.
+    libc.clj ships in-repo (load-file): process/env/fs/time surface +
+    friendly wrappers (file-exists? cwd env mkdir-p now-epoch).
+    Generator emits _GNU_SOURCE (get_current_dir_name needs it).
     Also: sh native (popen, {:exit :out}). Requires cc at runtime
     (the s7 trade). Future: :pointer type, struct support, a libc.clj
     batteries module, caching compiled modules by signature hash.

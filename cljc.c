@@ -3357,6 +3357,11 @@ static Cljc *prim_disj(CljcEnv *env, Cljc *args) {
     return s;
 }
 
+static Cljc *prim_hash(CljcEnv *env, Cljc *args) {
+    (void)env;
+    return mk_int((int64_t)cljc_hash(args->as.cons.head));
+}
+
 static Cljc *prim_type(CljcEnv *env, Cljc *args) {
     (void)env;
     Cljc *v = args->as.cons.head;
@@ -4070,7 +4075,7 @@ typedef struct {
 
 static void *fa_mk_int(long long i) { return mk_int((int64_t)i); }
 static void *fa_mk_double(double d) { return mk_double(d); }
-static void *fa_mk_str(const char *s) { return mk_str(s, strlen(s)); }
+static void *fa_mk_str(const char *s) { return s ? mk_str(s, strlen(s)) : NIL; }  /* NULL => nil */
 static void *fa_nil(void) { return NIL; }
 static long long fa_as_int(void *v) { return (long long)as_int((Cljc *)v, "ffi"); }
 static double fa_as_double(void *v) { return as_num((Cljc *)v); }
@@ -4438,6 +4443,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "seq?",    prim_seq_p);
     cljc_define_native(e, "type",    prim_type);
     cljc_define_native(e, "sh",        prim_sh);
+    cljc_define_native(e, "hash",      prim_hash);
     cljc_define_native(e, "ffi-load*", prim_ffi_load);
     cljc_define_native(e, "hash-map",  prim_hash_map);
     cljc_define_native(e, "get",       prim_get);
@@ -4626,12 +4632,14 @@ CljcEnv *cljc_new_env(void) {
         "    :int (str \"return api->mk_int(\" expr \");\")\n"
         "    :double (str \"return api->mk_double(\" expr \");\")\n"
         "    :string (str \"return api->mk_str(\" expr \");\")\n"
+        "    :pointer (str \"return api->mk_int((long long)(\" expr \"));\")\n"
         "    :void (str expr \"; return api->nil();\")))\n"
         "(defn cljc/ffi-arg [t i]\n"
         "  (case t\n"
         "    :int (str \"api->as_int(api->nth_arg(args, \" i \"))\")\n"
         "    :double (str \"api->as_double(api->nth_arg(args, \" i \"))\")\n"
-        "    :string (str \"api->as_str(api->nth_arg(args, \" i \"))\")))\n"
+        "    :string (str \"api->as_str(api->nth_arg(args, \" i \"))\")\n"
+        "    :pointer (str \"(void*)api->as_int(api->nth_arg(args, \" i \"))\")))\n"
         "(defn cljc/ffi-wrapper [[ret cname argts]]\n"
         "  (str \"static void *w_\" cname \"(void *env, void *args) { (void)env; \"\n"
         "       (cljc/ffi-ret ret (str cname \"(\"\n"
@@ -4641,8 +4649,7 @@ CljcEnv *cljc_new_env(void) {
         "(defn ffi/define*\n"
         "  ([sigs] (ffi/define* sigs {}))\n"
         "  ([sigs {:keys [headers libs prefix] :or {headers [] libs \"\" prefix \"\"}}]\n"
-        "   (let [n (swap! cljc/ffi-counter inc)\n"
-        "         base (str \"/tmp/cljc-ffi-\" n)\n"
+        "   (let [base (atom nil)\n"
         "         api-decl (str \"typedef struct { void*(*mk_int)(long long);\"\n"
         "                       \" void*(*mk_double)(double); void*(*mk_str)(const char*);\"\n"
         "                       \" void*(*nil)(void); long long(*as_int)(void*);\"\n"
@@ -4651,7 +4658,8 @@ CljcEnv *cljc_new_env(void) {
         "                       \" void(*def_native)(void*,const char*,void*(*)(void*,void*));\"\n"
         "                       \" void(*error)(const char*); } CljcFfiApi;\\n\"\n"
         "                       \"static CljcFfiApi *api;\\n\")\n"
-        "         code (str (str/join \"\" (map (fn [h] (str \"#include <\" h \">\\n\")) headers))\n"
+        "         code (str \"#define _GNU_SOURCE\\n\"\n"
+        "                   (str/join \"\" (map (fn [h] (str \"#include <\" h \">\\n\")) headers))\n"
         "                   api-decl\n"
         "                   (str/join \"\" (map cljc/ffi-wrapper sigs))\n"
         "                   \"void cljc_module_init(void *env, CljcFfiApi *a) { api = a;\\n\"\n"
@@ -4659,13 +4667,16 @@ CljcEnv *cljc_new_env(void) {
         "                                        (str \"  api->def_native(env, \\\"\" prefix cname \"\\\", w_\" cname \");\\n\"))\n"
         "                                      sigs))\n"
         "                   \"}\\n\")]\n"
-        "     (spit (str base \".c\") code)\n"
-        "     (let [r (sh (str \"cc -shared -fPIC -O2 -o \" base \".so \" base \".c \" libs))]\n"
-        "       (when-not (zero? (:exit r))\n"
-        "         (throw (ex-info (str \"ffi/define: compile failed:\\n\" (:out r)) {})))\n"
-        "       (ffi-load* (str base \".so\"))))))\n"
+        "     (reset! base (str \"/tmp/cljc-ffi-\" (Math/abs (hash (str code libs)))))\n"
+        "     (when-not (zero? (:exit (sh (str \"test -f \" @base \".so\"))))\n"
+        "       (spit (str @base \".c\") code)\n"
+        "       (let [r (sh (str \"cc -shared -fPIC -O2 -o \" @base \".so \" @base \".c \" libs))]\n"
+        "         (when-not (zero? (:exit r))\n"
+        "           (throw (ex-info (str \"ffi/define: compile failed:\\n\" (:out r)) {})))))\n"
+        "     (ffi-load* (str @base \".so\")))))\n"
         "(defmacro ffi/define [sigs & opts]\n"
-        "  `(ffi/define* '~sigs ~@opts))\n");
+        "  `(ffi/define* '~sigs ~@opts))\n"
+        "(defn load-file [path] (eval (read-string (str \"(do \" (slurp path) \")\"))))\n");
     return e;
 }
 

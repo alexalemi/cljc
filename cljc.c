@@ -172,7 +172,18 @@ static Cljc *alloc(CljcTag t) {
     return v;
 }
 
-static Cljc *mk_int(int64_t i)       { Cljc *v = alloc(CLJC_INT);    v->as.i = i; return v; }
+/* Small ints are preallocated outside the GC pools (immortal, childless,
+ * never swept) — loop counters and small arithmetic allocate nothing. */
+#define SMALLINT_MIN (-128)
+#define SMALLINT_MAX 1023
+static Cljc smallints[SMALLINT_MAX - SMALLINT_MIN + 1];
+
+static Cljc *mk_int(int64_t i) {
+    if (i >= SMALLINT_MIN && i <= SMALLINT_MAX) return &smallints[i - SMALLINT_MIN];
+    Cljc *v = alloc(CLJC_INT);
+    v->as.i = i;
+    return v;
+}
 static Cljc *mk_double(double d)     { Cljc *v = alloc(CLJC_DOUBLE); v->as.d = d; return v; }
 static Cljc *mk_bool(bool b)         { return b ? TRUE : FALSE; }
 static Cljc *mk_sym(const char *s)   { Cljc *v = alloc(CLJC_SYMBOL); v->as.sym = s; return v; }
@@ -3903,6 +3914,11 @@ CljcEnv *cljc_new_env(void) {
     if (!NIL) {
         gc_stress = getenv("CLJC_GC_STRESS") != NULL;
         srand((unsigned)time(NULL));
+        for (int64_t i = SMALLINT_MIN; i <= SMALLINT_MAX; i++) {
+            smallints[i - SMALLINT_MIN].tag = CLJC_INT;
+            smallints[i - SMALLINT_MIN].gcmark = 1;  /* permanently marked */
+            smallints[i - SMALLINT_MIN].as.i = i;
+        }
         NIL = alloc(CLJC_NIL);
         /* Self-referential cons fields: walking off the end of any form
          * (e.g. (def) with no args) yields NIL instead of reading

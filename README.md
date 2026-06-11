@@ -74,6 +74,32 @@ Embedding rules:
   C globals.
 - One interpreter per process (global state); single-threaded.
 
+## Performance
+
+Benchmarks in `benchmarks/` run unmodified on cljc, [babashka](https://babashka.org/),
+and JVM Clojure, producing identical output (mean wall time, hyperfine, one machine —
+treat as orders of magnitude):
+
+| benchmark | cljc | babashka 1.12 | Clojure / JDK 21 |
+|---|---|---|---|
+| startup (hello world) | **2 ms** | 10 ms | 440 ms |
+| fib(27), interpreted recursion | 88 ms | **56 ms** | 563 ms |
+| 5M-iteration loop/recur | 578 ms | **239 ms** | 563 ms |
+| seq pipeline (1M: filter→map→reduce) | 321 ms | **58 ms** | 488 ms |
+| build+read 100k-entry map | 231 ms | **107 ms** | 699 ms |
+| build 1M-element vector | 223 ms | **107 ms** | 542 ms |
+| sort 200k | **126 ms** | 185 ms | 641 ms |
+| regex word-frequency | **23 ms** | 23 ms | 632 ms |
+| fib(32), ~1 s of compute | 1.00 s | **0.54 s** | 0.63 s |
+
+Honest reading: babashka wins most compute because its `clojure.core` is
+AOT-compiled native code — SCI only interprets your glue, while cljc interprets
+*everything*. That cljc stays within ~1.5–4× of bb with a 4,000-line tree-walker
+(and beats it on sort and startup) is the trade we wanted. JVM Clojure pays
+~440 ms of startup, which dominates at script scale; for long-running compute
+the JIT inverts everything. Use cljc where its 2 ms startup, ~100 KB binary,
+and zero dependencies matter; use bb/JVM where throughput does.
+
 ## Deliberate divergences from Clojure
 
 - `()` ≡ `nil`; no Ratio type (`(/ 7 2)` ⇒ `3.5`); no lazy seqs (eager,

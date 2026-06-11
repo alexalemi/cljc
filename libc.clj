@@ -7,7 +7,7 @@
 
 (declare getpid getppid getenv setenv unsetenv system
          mkdir rmdir unlink rename chdir access get_current_dir_name
-         sleep usleep time)
+         sleep usleep)
 
 (ffi/define
   [;; process & environment
@@ -25,11 +25,10 @@
    [:int chdir [:string]]
    [:int access [:string :int]]
    [:string get_current_dir_name []]
-   ;; time & sleep
+   ;; sleep — NOTE: no `time` binding: it would shadow the core time macro
    [:int sleep [:int]]
-   [:int usleep [:int]]
-   [:pointer time [:pointer]]]
-  {:headers ["unistd.h" "stdlib.h" "sys/stat.h" "stdio.h" "time.h"]})
+   [:int usleep [:int]]]
+  {:headers ["unistd.h" "stdlib.h" "sys/stat.h" "stdio.h"]})
 
 ;; ── friendly wrappers ──
 
@@ -40,7 +39,7 @@
 
 (defn file-exists? [path] (zero? (access path F_OK)))
 (defn cwd [] (get_current_dir_name))
-(defn now-epoch [] (time 0))
+(defn now-epoch [] (cljc/epoch*))
 (defn mkdir-p [path] (mkdir path 493))   ; 0755
 (defn env
   "Environment variable as string, or default."

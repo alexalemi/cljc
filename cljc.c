@@ -4505,6 +4505,21 @@ static Cljc *prim_mtime(CljcEnv *env, Cljc **argv, int nargs) {
                   + st.st_mtim.tv_nsec / 1000000);
 }
 
+/* (cljc/now-ms*) → monotonic milliseconds as a double (for `time`). */
+static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return mk_double((double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6);
+}
+
+/* (cljc/epoch*) → unix seconds (libc.clj's now-epoch; the C time symbol
+ * must not be FFI-bound by name — it would shadow the core time macro). */
+static Cljc *prim_epoch(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    return mk_int((int64_t)time(NULL));
+}
+
 /* (cljc/dir?* path) → true if path exists and is a directory. */
 static Cljc *prim_dir_p(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -5388,6 +5403,21 @@ static const char *PRELUDE =
     /* defonce: evaluating a bare unbound symbol throws — catch it and def.
      * Keeps atoms etc. alive across re-evaluation (notebook saves, reloads). */
     "(defmacro defonce [n e] `(try ~n (catch Exception ex# (def ~n ~e))))\n"
+    "(defmacro time [expr]\n"
+    "  `(let [t0# (cljc/now-ms*) v# ~expr]\n"
+    "     (println (str \"Elapsed time: \" (- (cljc/now-ms*) t0#) \" msecs\"))\n"
+    "     v#))\n"
+    "(def == =)\n"                       /* = already numeric cross-type */
+    "(defn distinct? [& xs] (= (count xs) (count (set xs))))\n"
+    /* deftype, tolerated: defines a Name. constructor returning a plain map
+     * of fields; interface method bodies are ignored. Enough for files that
+     * define a type they rarely use to still load. */
+    "(defmacro deftype [tname fields & _]\n"
+    "  `(defn ~(symbol (str tname \".\")) [~@fields]\n"
+    "     ~(zipmap (map keyword fields) fields)))\n"
+    /* PersistentQueue, as a vector: conj at back; peek/pop on vectors act
+     * at the back too (LIFO not FIFO — divergence, noted in PLAN). */
+    "(def clojure.lang.PersistentQueue/EMPTY [])\n"
     "(def *load-path*\n"
     "  (vec (concat [\".\" \"vendor\"]\n"
     "               (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
@@ -5674,6 +5704,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "slurp",   prim_slurp);
     cljc_define_native(e, "spit",    prim_spit);
     cljc_define_native(e, "cljc/mtime*", prim_mtime);
+    cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
+    cljc_define_native(e, "cljc/epoch*", prim_epoch);
     cljc_define_native(e, "cljc/dir?*",  prim_dir_p);
     cljc_define_native(e, "cljc/list-dir*", prim_list_dir);
     cljc_define_native(e, "tcp/listen", prim_tcp_listen);
@@ -5974,7 +6006,19 @@ CljcEnv *cljc_new_env(void) {
         "  ([n] (take-nth-xf n))\n"
         "  ([n coll] (lazy-seq (when-let [s (seq coll)]\n"
         "                        (cons (first s) (take-nth n (drop n s)))))))\n"
-        "(def pmap map)\n");   /* single-threaded: same results, no parallelism */
+        "(def pmap map)\n"   /* single-threaded: same results, no parallelism */
+        /* peek/pop on maps: priority-map semantics — the entry with the
+         * smallest value. O(n) scan; backs clojure.data.priority-map. */
+        "(def cljc/peek-impl peek)\n"
+        "(defn peek [c]\n"
+        "  (if (map? c)\n"
+        "    (when (seq c) (apply min-key second (seq c)))\n"
+        "    (cljc/peek-impl c)))\n"
+        "(def cljc/pop-impl pop)\n"
+        "(defn pop [c]\n"
+        "  (if (map? c)\n"
+        "    (dissoc c (first (peek c)))\n"
+        "    (cljc/pop-impl c)))\n");
     /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
     cljc_eval_string(e,
         "(def cljc/multi-tables (atom {}))\n"

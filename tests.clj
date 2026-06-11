@@ -1162,4 +1162,30 @@
 (assert= :threw (try (assert false "context here") (catch Exception e :threw)))
 (assert= nil (assert true "fine"))
 
+; time / == / distinct? / deftype-stub / queue / priority peek-pop on maps
+(assert= 7 (let [v (time (+ 3 4))] v))
+(assert= true (== 1 1.0))
+(assert= true (distinct? 1 2 3))
+(assert= false (distinct? 1 1))
+(deftype CljcProbeT [a b])
+(assert= {:a 1 :b 2} (CljcProbeT. 1 2))
+(assert= [] clojure.lang.PersistentQueue/EMPTY)
+(assert= [:b 2] (peek {:a 5 :b 2 :c 9}))
+(assert= {:a 5} (pop {:a 5 :b 2}))
+(assert= 3 (peek [1 2 3]))            ; vector peek unchanged
+(assert= [1 2] (pop [1 2 3]))
+(assert= 1 (peek (list 1 2)))
+
+; vendor shims: priority-map, json, combinatorics
+(require '[clojure.data.priority-map :refer [priority-map]])
+(assert= [:y 1] (peek (assoc (priority-map :x 4) :y 1)))
+(require '[clojure.math.combinatorics :as combo])
+(assert= '([1 2] [1 3] [2 3]) (combo/combinations [1 2 3] 2))
+(assert= 6 (count (combo/permutations [1 2 3])))
+(assert= 8 (count (combo/subsets [1 2 3])))
+(assert= '((1 :a) (1 :b) (2 :a) (2 :b)) (combo/cartesian-product [1 2] [:a :b]))
+(require '[clojure.data.json :as cjson])
+(assert= {:a 1} (cjson/read-str "{\"a\": 1}" :key-fn keyword))
+(assert= "{\"a\":1}" (cjson/write-str {:a 1}))
+
 (println "tests complete")

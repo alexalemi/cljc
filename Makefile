@@ -30,6 +30,12 @@ install: cljc
 	install -m 644 cljc.c $(DESTDIR)$(SHAREDIR)/   # `cljc bundle` needs the source
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure
 	install -m 644 vendor/clojure/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/data
+	install -m 644 vendor/clojure/data/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/data/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/math
+	install -m 644 vendor/clojure/math/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/math/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/nextjournal
+	install -m 644 vendor/nextjournal/*.clj $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/medley
 	install -m 644 vendor/medley/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/medley/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals

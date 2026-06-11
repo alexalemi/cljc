@@ -3504,6 +3504,64 @@ static Cljc *prim_rand_int(CljcEnv *env, Cljc *args) {
     return mk_int((int64_t)((double)rand() / ((double)RAND_MAX + 1.0) * (double)n));
 }
 
+
+/* ── read-string / eval / peek / pop / empty ── */
+
+static Cljc *prim_read_string(CljcEnv *env, Cljc *args) {
+    (void)env;
+    const char *p = as_str(args->as.cons.head, "read-string");
+    Cljc *form = read_form(&p);
+    return form ? form : NIL;
+}
+
+static Cljc *prim_eval(CljcEnv *env, Cljc *args) {
+    /* Like Clojure: evaluates with no access to local lexical scope. */
+    return eval(env_root(env), args->as.cons.head);
+}
+
+static Cljc *prim_peek(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *v = args->as.cons.head;
+    if (v == NIL) return NIL;
+    if (v->tag == CLJC_LIST) return v->as.cons.head;          /* list: first */
+    if (v->tag == CLJC_VECTOR)                                 /* vector: last */
+        return vec_len(v) ? vec_nth(v, vec_len(v) - 1) : NIL;
+    cljc_error("peek: not a list or vector");
+    return NIL;
+}
+
+static Cljc *prim_pop(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *v = args->as.cons.head;
+    if (v != NIL && v->tag == CLJC_LIST) return v->as.cons.tail;
+    if (v != NIL && v->tag == CLJC_VECTOR) {
+        uint32_t cnt = v->as.vec.count;
+        if (cnt == 0) cljc_error("pop: empty vector");
+        if (v->as.vec.taillen > 1)  /* fast path: shrink the tail */
+            return vec_cell(v->as.vec.root, v->as.vec.shift, cnt - 1,
+                            v->as.vec.tail, (uint8_t)(v->as.vec.taillen - 1), NULL);
+        /* tail would empty: rebuild (rare — every 32nd pop) */
+        Cljc *nv = mk_empty_vec();
+        for (size_t i = 0; i + 1 < cnt; i++) nv = vec_conj1(nv, vec_nth(v, i));
+        return nv;
+    }
+    cljc_error("pop: not a list or vector");
+    return NIL;
+}
+
+static Cljc *prim_empty(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *v = args->as.cons.head;
+    if (v == NIL) return NIL;
+    switch (v->tag) {
+        case CLJC_LIST:   return NIL;
+        case CLJC_VECTOR: return mk_empty_vec();
+        case CLJC_MAP:    return mk_map();
+        case CLJC_SET:    return mk_set();
+        default:          return NIL;
+    }
+}
+
 /* ───── Public C API ─────────────────────────────────────────────────── */
 
 CljcEnv *cljc_new_env(void);
@@ -3736,6 +3794,36 @@ static const char *PRELUDE =
     "(defn set/union [& sets] (reduce (fn [a s] (reduce conj a (seq s))) #{} sets))\n"
     "(defn set/intersection [s1 s2] (set (filter (fn [x] (contains? s2 x)) (seq s1))))\n"
     "(defn set/difference [s1 s2] (set (remove (fn [x] (contains? s2 x)) (seq s1))))\n"
+    "(defmacro some-> [expr & forms]\n"
+    "  (if (empty? forms)\n"
+    "    expr\n"
+    "    (let [g (gensym \"t\")]\n"
+    "      `(some-> (let [~g ~expr] (if (nil? ~g) nil (-> ~g ~(first forms))))\n"
+    "               ~@(rest forms)))))\n"
+    "(defmacro some->> [expr & forms]\n"
+    "  (if (empty? forms)\n"
+    "    expr\n"
+    "    (let [g (gensym \"t\")]\n"
+    "      `(some->> (let [~g ~expr] (if (nil? ~g) nil (->> ~g ~(first forms))))\n"
+    "                ~@(rest forms)))))\n"
+    "(defmacro cond-> [expr & clauses]\n"
+    "  (if (empty? clauses)\n"
+    "    expr\n"
+    "    `(cond-> (if ~(first clauses) (-> ~expr ~(second clauses)) ~expr)\n"
+    "             ~@(drop 2 clauses))))\n"
+    "(defmacro cond->> [expr & clauses]\n"
+    "  (if (empty? clauses)\n"
+    "    expr\n"
+    "    `(cond->> (if ~(first clauses) (->> ~expr ~(second clauses)) ~expr)\n"
+    "              ~@(drop 2 clauses))))\n"
+    "(defmacro as-> [expr name & forms]\n"
+    "  `(let [~name ~expr ~@(mapcat (fn [f] (list name f)) forms)] ~name))\n"
+    "(defn not-empty [coll] (if (empty? coll) nil coll))\n"
+    "(defn doall [x] x)\n"
+    "(defn dorun [x] nil)\n"
+    "(defn flatten [coll]\n"
+    "  (mapcat (fn [x] (if (or (list? x) (vector? x)) (flatten x) (list x))) coll))\n"
+    "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
     "(defmacro assert [x]\n"
     "  `(when-not ~x\n"
     "     (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"
@@ -3825,6 +3913,11 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "Math/abs",   prim_math_abs);
     cljc_define_native(e, "rand",       prim_rand);
     cljc_define_native(e, "rand-int",   prim_rand_int);
+    cljc_define_native(e, "read-string", prim_read_string);
+    cljc_define_native(e, "eval",        prim_eval);
+    cljc_define_native(e, "peek",        prim_peek);
+    cljc_define_native(e, "pop",         prim_pop);
+    cljc_define_native(e, "empty",       prim_empty);
     cljc_define_native(e, "nil?",    prim_nil_p);
     cljc_define_native(e, "list?",   prim_list_p);
     cljc_define_native(e, "vector?", prim_vector_p);

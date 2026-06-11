@@ -542,4 +542,45 @@
 (assert= 3 (count (max-key count [1] [1 2 3] [1 2])))
 (assert= [1] (min-key count [1] [1 2 3] [1 2]))
 
+; ── threading variants ──
+(assert= 6 (some-> {:a {:b 5}} :a :b inc))
+(assert= nil (some-> {:a 1} :missing inc))           ; short-circuits on nil
+(assert= nil (some-> nil inc))
+(assert= (list 3 4) (some->> [1 2 3] (map inc) (filter (fn [x] (> x 2)))))
+(assert= 11 (cond-> 10 true inc false (* 100)))
+(assert= 1000 (cond-> 10 false inc true (* 100)))
+(assert= 10 (cond-> 10))
+(assert= (list 2 4) (cond->> (range 5) true (map inc) true (filter even?)))
+(assert= 30 (as-> 5 x (* x 2) (+ x 20)))
+
+; ── read-string / eval ──
+(assert= 3 (eval (read-string "(+ 1 2)")))
+(assert= (list '+ 1 2) (read-string "(+ 1 2)"))
+(assert= [1 2] (read-string "[1 2]"))
+(assert= 42 (eval 42))
+(def evaled (eval (read-string "(defn dyn-fn [x] (* x 7))")))
+(assert= 21 (dyn-fn 3))
+
+; ── peek / pop / empty ──
+(assert= 3 (peek [1 2 3]))
+(assert= 1 (peek (list 1 2 3)))                      ; list peeks the front
+(assert= [1 2] (pop [1 2 3]))
+(assert= (list 2 3) (pop (list 1 2 3)))
+(assert= 33 (count (pop (vec (range 34)))))          ; pop across tail boundary
+(assert= 32 (peek (pop (vec (range 34)))))
+(assert= [] (empty [1 2]))
+(assert= {} (empty {:a 1}))
+(assert= #{} (empty #{1}))
+(assert= nil (empty nil))
+
+; ── utilities ──
+(assert= nil (not-empty []))
+(assert= [1] (not-empty [1]))
+(assert= (list 1 2 3 4) (flatten [1 [2 [3 4]]]))
+(assert= 1 ((fnil inc 0) nil))
+(assert= 6 ((fnil inc 0) 5))
+(assert= 3 ((fnil + 0) nil 3))
+(assert= [1 2 3] (doall [1 2 3]))
+(assert= nil (dorun [1 2 3]))
+
 (println "tests complete")

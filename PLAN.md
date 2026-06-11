@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~4,000 lines, zero warnings, 340 assertions in `tests.clj`, ASan/UBSan clean
+~4,090 lines, zero warnings, 372 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -103,9 +103,12 @@ required by conservative stack scanning, same as Boehm GC).
    Math/{sqrt,pow,floor,ceil,round,abs}, rand, rand-int, rand-nth,
    max-key, min-key. Makefile links -lm. Skipped: `..` (no interop),
    iterate (no lazy seqs).
-9. **Surface still open**: `peek/pop`, `keep` exists, `dorun/doall`
-   n/a (eager), `juxt` exists, `some->`/`some->>`/`cond->` threading
-   variants, `string?`-family complete, `read-string`/`eval` exposure?
+9. ~~Threading variants + reflection~~ ✅ done 2026-06-10 — some->
+   some->> cond-> cond->> as-> (recursive expansions; some-> gensyms
+   against double-eval), read-string + eval natives (eval runs in the
+   root env, no lexical capture, like Clojure), peek/pop (vector pop
+   has an O(1) tail fast path, O(n) rebuild every 32nd), empty,
+   not-empty, doall/dorun (eager no-ops), flatten, fnil.
 10. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
    bytecode VM. Not before semantics are broader.
 

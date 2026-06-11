@@ -1236,6 +1236,91 @@ static Cljc *read_form(const char **p) {
             v = vec_conj1(v, l->as.cons.head);
         return v;
     }
+    if (c == '^') {  /* metadata: parse and discard (^:kw, ^{...}, ^Tag) */
+        (*p)++;
+        read_form(p);          /* the metadata itself */
+        return read_form(p);   /* the annotated form */
+    }
+    if (c == '\\') {  /* char literal => 1-char string (no char type) */
+        (*p)++;
+        const char *start = *p;
+        while (is_sym_char((unsigned char)**p)) (*p)++;
+        size_t n = (size_t)(*p - start);
+        if (n == 0) { (*p)++; return mk_str(*p - 1, 1); }  /* \( etc */
+        if (n == 1) return mk_str(start, 1);
+        if (n == 5 && !memcmp(start, "space", 5)) return mk_str(" ", 1);
+        if (n == 7 && !memcmp(start, "newline", 7)) return mk_str("\n", 1);
+        if (n == 3 && !memcmp(start, "tab", 3)) return mk_str("\t", 1);
+        if (n == 6 && !memcmp(start, "return", 6)) return mk_str("\r", 1);
+        cljc_error("unsupported char literal");
+    }
+    if (c == '#' && (*p)[1] == '?') {
+        /* reader conditional: keep the :cljc or :default branch */
+        *p += 2;
+        if (**p == '@') cljc_error("#?@ splicing is not supported");
+        skip_ws(p);
+        if (**p != '(') cljc_error("#? expects a list");
+        Cljc *clauses = read_list(p, ')');
+        static const char *KW_CLJC, *KW_DEFAULT;
+        if (!KW_CLJC) { KW_CLJC = intern("cljc", 4); KW_DEFAULT = intern("default", 7); }
+        for (Cljc *l = clauses; l && l->tag == CLJC_LIST && l->as.cons.tail != NIL;
+             l = l->as.cons.tail->as.cons.tail) {
+            Cljc *k = l->as.cons.head;
+            if (k->tag == CLJC_KEYWORD && (k->as.kw == KW_CLJC || k->as.kw == KW_DEFAULT))
+                return l->as.cons.tail->as.cons.head;
+            if (l->as.cons.tail == NIL) break;
+        }
+        return NIL;  /* no matching branch (divergence: nil, not nothing) */
+    }
+    if (c == '#' && (*p)[1] == '(') {
+        /* #(...) => (fn [%1 ...] (...)); % aliases %1, %& is the rest arg */
+        (*p)++;
+        Cljc *body = read_form(p);
+        int maxn = 0;
+        bool pct = false, pctn = false, variadic = false;
+        /* scan for %-symbols (iterative worklist over nested collections) */
+        Cljc *work[64]; int wn = 0;
+        work[wn++] = body;
+        while (wn > 0) {
+            Cljc *f = work[--wn];
+            if (!f || f == NIL) continue;
+            if (f->tag == CLJC_SYMBOL && f->as.sym[0] == '%') {
+                const char *s = f->as.sym;
+                if (s[1] == '\0') { pct = true; if (maxn < 1) maxn = 1; }
+                else if (s[1] == '&' && s[2] == '\0') variadic = true;
+                else if (s[1] >= '1' && s[1] <= '9' && s[2] == '\0') {
+                    pctn = true;
+                    if (s[1] - '0' > maxn) maxn = s[1] - '0';
+                }
+            } else if (f->tag == CLJC_LIST) {
+                for (Cljc *l = f; l && l->tag == CLJC_LIST && wn < 62; l = l->as.cons.tail)
+                    work[wn++] = l->as.cons.head;
+            } else if (f->tag == CLJC_VECTOR) {
+                for (size_t i = 0; i < vec_len(f) && wn < 62; i++)
+                    work[wn++] = vec_nth(f, i);
+            } else if (f->tag == CLJC_MAP) {
+                for (Cljc *e = map_entry_list(f); e && e->tag == CLJC_LIST && wn < 61;
+                     e = e->as.cons.tail) {
+                    work[wn++] = e->as.cons.head->as.cons.head;
+                    work[wn++] = e->as.cons.head->as.cons.tail;
+                }
+            }
+        }
+        if (pct && pctn) cljc_error("#(): use %% or %%1, not both");
+        Cljc *items[11];
+        size_t ni = 0;
+        for (int i = 1; i <= maxn; i++) {
+            char nm[4] = {'%', (char)('0' + i), 0, 0};
+            items[ni++] = mk_sym(intern(i == 1 && pct ? "%" : nm, i == 1 && pct ? 1 : 2));
+        }
+        if (variadic) {
+            items[ni++] = mk_sym(intern("&", 1));
+            items[ni++] = mk_sym(intern("%&", 2));
+        }
+        Cljc *params = mk_vector(items, ni);
+        return mk_cons(mk_sym(intern("fn", 2)),
+                       mk_cons(params, mk_cons(body, NIL)));
+    }
     if (c == '#' && (*p)[1] == '"') {
         /* Raw string for regex patterns: backslashes pass through verbatim;
          * \" is the only escape (yields a quote char in the pattern). */
@@ -1778,13 +1863,30 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     if (pending) cljc_raise();
                     return result;
                 }
+                {
+                    static const char *SYM_NS, *SYM_REQUIRE, *SYM_USE, *SYM_IMPORT;
+                    if (!SYM_NS) {
+                        SYM_NS = intern("ns", 2);
+                        SYM_REQUIRE = intern("require", 7);
+                        SYM_USE = intern("use", 3);
+                        SYM_IMPORT = intern("import", 6);
+                    }
+                    /* compat no-ops: flat globals already match the universal
+                     * (:require [clojure.string :as str]) alias convention */
+                    if (s == SYM_NS || s == SYM_REQUIRE || s == SYM_USE || s == SYM_IMPORT)
+                        return NIL;
+                }
                 if (s == SYM_QUASIQUOTE) return qq_expand(env, rest->as.cons.head);
                 if (s == SYM_DEFMACRO) {
                     /* (defmacro name [params] body...) — a fn flagged so that
                      * eval calls it on unevaluated forms and re-evals the result. */
                     need_args(rest, 2, "defmacro");
                     const char *name = sym_name(rest->as.cons.head, "defmacro");
-                    Cljc *m = make_fn(env, rest->as.cons.tail, true);
+                    Cljc *mbody = rest->as.cons.tail;
+                    if (mbody->as.cons.head->tag == CLJC_STRING &&
+                        mbody->as.cons.tail != NIL)
+                        mbody = mbody->as.cons.tail;  /* skip docstring */
+                    Cljc *m = make_fn(env, mbody, true);
                     env_define_root(env_root(env), name, m);
                     return m;
                 }
@@ -1792,7 +1894,11 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     /* (defn name [params] body...) ≡ (def name (fn [params] body...)) */
                     need_args(rest, 2, "defn");
                     Cljc *name = rest->as.cons.head;
-                    Cljc *fn_form = mk_cons(mk_sym(SYM_FN), rest->as.cons.tail);
+                    Cljc *fbody = rest->as.cons.tail;
+                    if (fbody->as.cons.head->tag == CLJC_STRING &&
+                        fbody->as.cons.tail != NIL)
+                        fbody = fbody->as.cons.tail;  /* skip docstring */
+                    Cljc *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
                     Cljc *def_form = mk_cons(mk_sym(SYM_DEF),
                                        mk_cons(name, mk_cons(fn_form, NIL)));
                     return eval(env, def_form);
@@ -1892,6 +1998,32 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                         vec_len(binds_vec) % 2 != 0)
                         cljc_error("loop needs an even-sized binding vector");
                     size_t nparams = vec_len(binds_vec) / 2;
+                    /* Destructuring patterns: rewrite to gensym bindings with
+                     * an inner let, so recur rebinds the gensyms and the
+                     * patterns re-destructure each iteration (Clojure does
+                     * the same rewrite). */
+                    bool plain = true;
+                    for (size_t i = 0; i < nparams; i++)
+                        if (vec_nth(binds_vec, i * 2)->tag != CLJC_SYMBOL) plain = false;
+                    if (!plain) {
+                        static int loopg;
+                        Cljc *gb[64], *lb[64];   /* new loop binds / let binds */
+                        if (nparams > 32) cljc_error("loop: too many bindings");
+                        for (size_t i = 0; i < nparams; i++) {
+                            char nm[24];
+                            snprintf(nm, sizeof nm, "loop__%d", ++loopg);
+                            Cljc *g = mk_sym(intern(nm, strlen(nm)));
+                            gb[i * 2] = g;
+                            gb[i * 2 + 1] = vec_nth(binds_vec, i * 2 + 1);
+                            lb[i * 2] = vec_nth(binds_vec, i * 2);
+                            lb[i * 2 + 1] = g;
+                        }
+                        Cljc *letform = mk_cons(mk_sym(SYM_LET),
+                            mk_cons(mk_vector(lb, nparams * 2), rest->as.cons.tail));
+                        Cljc *newform = mk_cons(mk_sym(SYM_LOOP),
+                            mk_cons(mk_vector(gb, nparams * 2), mk_cons(letform, NIL)));
+                        return eval(env, newform);
+                    }
                     const char **names = xmalloc(sizeof(char *) * (nparams ? nparams : 1));
                     CljcEnv *scope = env_new(env);
                     for (size_t i = 0; i < nparams; i++) {
@@ -3918,6 +4050,7 @@ static const char *PRELUDE =
     "        (= k :let)  `(let ~v (for ~more ~body))\n"
     "        :else       `(mapcat (fn [~k] (for ~more ~body)) ~v)))))\n"
     /* batch 5-lite */
+    "(defmacro comment [& _] nil)\n"
     "(defn boolean [x] (if x true false))\n"
     "(defn true? [x] (= x true))\n"
     "(defn false? [x] (= x false))\n"

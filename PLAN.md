@@ -146,7 +146,16 @@ required by conservative stack scanning, same as Boehm GC).
     discovery. Single client, loopback, serial. Verified end-to-end with
     a Python bencode client (sessions, out/err routing, state
     persistence). Untested against real Conjure/CIDER yet — try it!
-13. **Performance later, maybe**: args-as-array calling convention,
+13. ~~Compat Tier 1~~ ✅ done 2026-06-10 — #(...) shorthand (%, %1-%9,
+    %&; scan via worklist; % and %1 mutually exclusive), ns/require/
+    use/import as no-op special forms (flat globals already match the
+    :as str convention), defn/defmacro docstrings skipped, \a \space
+    char literals (as 1-char strings), ^meta parse-and-discard,
+    #?(:cljc/:default) reader conditionals (no #?@; no-match => nil),
+    comment macro, loop destructuring (gensym rewrite + inner let, the
+    same rewrite Clojure does). Remaining compat tiers: lazy seqs
+    (Tier 2, big), vars/multimethods/protocols (Tier 3, usage-driven).
+14. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

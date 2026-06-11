@@ -132,6 +132,8 @@ and zero dependencies matter; use bb/JVM where throughput does.
 - Patterns are plain strings (`#"…"` is raw-string sugar); `{n,m}` braces are
   literals; `str/replace` is literal — regex replace is spelled `re-replace`
 - Quasiquote: no auto-gensym `x#`, no nesting levels
+- `ns`/`require` are tolerated no-ops; `#?(:cljc …)` reader conditionals;
+  `#(…)`, `\a` char literals (1-char strings), `^meta` (discarded) supported
 
 The full list, the roadmap, and the GC invariants live in [PLAN.md](PLAN.md).
 

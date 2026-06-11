@@ -639,4 +639,27 @@
   (if (< a 1000) (recur (inc a) b c d e) (+ a b c d e)))
 (assert= 1014 (five-recur 1 2 3 4 5))
 
+; ── Tier 1 compat batch ──
+(assert= (list 2 4 6) (map #(* % 2) [1 2 3]))
+(assert= 7 (#(+ %1 %2) 3 4))
+(assert= 6 (#(apply + %&) 1 2 3))
+(assert= (list 2 3) (filter #(> % 1) [0 1 2 3]))
+(assert= nil (ns my.ns (:require [clojure.string :as str])))
+(assert= nil (require '[clojure.string :as str]))
+(defn docd "has a docstring" [x] (* x 2))
+(assert= 42 (docd 21))
+(defmacro docd-m "macro docstring" [x] `(+ ~x 1))
+(assert= 4 (docd-m 3))
+(assert= "a" \a)
+(assert= " " \space)
+(assert= "\n" \newline)
+(assert= 3 (count (filter #(= % \a) (seq "banana"))))
+(assert= 3 ^:private (+ 1 2))
+(assert= :ours #?(:clj :jvm :cljc :ours :default :other))
+(assert= :fallback #?(:clj :jvm :default :fallback))
+(assert= nil (comment (this is ignored)))
+(assert= 11 (loop [[a b] [1 10] acc 0] (if a (recur [b nil] (+ acc a)) acc)))
+(assert= 6 (loop [{:keys [n total]} {:n 3 :total 0}]
+             (if (zero? n) total (recur {:n (dec n) :total (+ total n)}))))
+
 (println "tests complete")

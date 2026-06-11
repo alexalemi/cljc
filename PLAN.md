@@ -415,13 +415,39 @@ required by conservative stack scanning, same as Boehm GC).
     cljc.c in the share dir (installed by make install) so it works
     outside the checkout. WISHED-FOR LATER (user): `doc`, `fmt`,
     `docgen`, `lsp` subcommands.
-34. NEXT: JUDGE CLONE (user request) — inline snapshot testing à la
+34. AOC CORPUS as the compat suite (user request, in progress
+    2026-06-11) — run all 167 of their advent solutions
+    (~/projects/advent/*/clojure/p*.clj, self-asserting). Sweep script:
+    /tmp/aoc-sweep.sh (60s timeout, TSV per file). Baseline 16/167 →
+    fix in batches. Landed so far: transducer arities; case list-branch
+    + no-match-throws fix (was silently nil — broke grid parsers);
+    cons-onto-lazy-seq truncation fixed in print/=/nth (seq1 stepping);
+    read-string saves line tracking (nested requires poisoned caret
+    lines); regex-tagged #\"...\" (meta {:regex true}, strings can carry
+    meta now) with regex-aware str/split; ns vector clauses; clojure.test
+    + clojure.string vendor shims (are/use-fixtures added to battery);
+    bit ops; ##Inf/##-Inf/##NaN; (def ^:dynamic ...); assert-with-msg;
+    time macro (+ cljc/now-ms*, cljc/epoch*; libc.clj must NOT bind C
+    time() — it shadowed the macro and SEGV'd); == distinct? char class
+    re-pattern reductions every-pred some-fn memoize take-last drop-last
+    take-nth update-keys update-vals boolean? nat-int? isa? pmap(serial)
+    str/replace-first str/index-of sequential?; peek/pop on maps =
+    priority-map semantics (O(n)) so clojure.data.priority-map is a
+    hash-map shim — their util.clj a-star runs; deftype tolerated
+    (constructor → field map, methods ignored);
+    clojure.lang.PersistentQueue/EMPTY = [] (LIFO divergence); vendor
+    clojure.data.json + clojure.math.combinatorics + nextjournal.clerk.
+    KNOWN REMAINING: util/md5 (needs MessageDigest interop — consider a
+    C md5 native + shim), java interop (.indexOf, Character/digit),
+    perf timeouts (p22 2022 cube-walk >300s, p23 2023 part-2 ~15min —
+    the corpus is now the benchmark set), Bag deftype methods.
+35. NEXT: JUDGE CLONE (user request) — inline snapshot testing à la
     github.com/ianthehenry/judge (Janet): `(test (+ 1 2))` runs and
     REWRITES the source file inserting/correcting the expected value;
     interactive accept/reject of diffs. Would land as `cljc judge
     [files]`. Study the upstream README/design first.
     (c) numerics/dates/fork-pmap menu from the bb-gap analysis.
-35. **Performance later, maybe**: args-as-array calling convention,
+36. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

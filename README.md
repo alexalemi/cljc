@@ -100,8 +100,8 @@ treat as orders of magnitude):
 |---|---|---|---|
 | startup (hello world) | **2 ms** | 10 ms | 440 ms |
 | fib(27), interpreted recursion | 88 ms | **56 ms** | 563 ms |
-| 5M-iteration loop/recur | 578 ms | **239 ms** | 563 ms |
-| seq pipeline (1M: filter→map→reduce) | 443 ms¹ | **58 ms** | 488 ms |
+| 5M-iteration loop/recur | 439 ms | **239 ms** | 563 ms |
+| seq pipeline (1M: filter→map→reduce) | 332 ms¹ | **58 ms** | 488 ms |
 | build+read 100k-entry map | 231 ms | **107 ms** | 699 ms |
 | build 1M-element vector | 223 ms | **107 ms** | 542 ms |
 | sort 200k | **126 ms** | 185 ms | 641 ms |

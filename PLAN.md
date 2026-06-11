@@ -227,7 +227,19 @@ required by conservative stack scanning, same as Boehm GC).
     2.9s -> 443ms (eager baseline was 321ms). Chunked semantics are
     Clojure-faithful: side effects realize <=32 at a time (tests pin
     exactly-one-chunk behavior). 2-coll map stays unchunked.
-18. **Performance later, maybe**: args-as-array calling convention,
+18. ~~Args-as-array calling convention~~ ✅ merged 2026-06-11 — natives
+    take (env, argv, nargs); args live on a GC-rooted value stack
+    (vstack, vsp saved/restored through ErrFrames and top-level
+    unwinds); & rest is the only remaining arg-list construction;
+    fn recur swaps argv to the sentinel's array (with a VOLATILE
+    keep-alive — the optimizer otherwise elides the cell's only root:
+    crashes at -O1+, invisible at -O0/ASan). FFI ABI bumped (ffi3
+    cache prefix, 3-arg wrappers with arity guards). Verdict: pipeline
+    -25%, loop -13%, day5 0% — its real bottleneck is vec_assoc
+    path-copy memcpy (~15GB/25M iters). NEXT PERF LEVER IF NEEDED:
+    transients (mutate-in-place vectors/maps behind transient!/
+    persistent!, Clojure's own answer for hot assoc loops).
+19. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

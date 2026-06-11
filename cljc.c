@@ -80,7 +80,9 @@ struct Cljc {
         struct { Cljc *arities; CljcEnv *env; bool is_macro; } fn;
         CljcNativeFn native;
         struct { Cljc *value; } atom;
-        struct { Cljc **vals; size_t n; } recur;
+        /* recur sentinel: up to 3 values inline (covers real loops);
+         * wider recurs spill to a heap array stored in iv[0]. */
+        struct { Cljc *iv[3]; uint8_t n; bool spill; } recur;
     } as;
 };
 
@@ -109,8 +111,12 @@ static bool cljc_eq(Cljc *a, Cljc *b);
 static bool map_find(Cljc *m, Cljc *key, Cljc **out);
 static double as_num(Cljc *v);
 static Cljc *to_seq(Cljc *v);
-static Cljc *cell_alloc(void);
+static Cljc *cell_alloc(bool zero);
 static CljcEnv *env_alloc(void);
+static Cljc **chunk32_alloc(void);
+static void chunk32_free(Cljc **p);
+static Cljc **tail_alloc(uint8_t n);
+static void tail_free(Cljc **p, uint8_t n);
 static size_t vec_len(Cljc *v);
 static Cljc *vec_nth(Cljc *v, size_t i);
 static char *as_str(Cljc *v, const char *what);
@@ -167,7 +173,7 @@ static void *xmalloc(size_t n) {
 /* ───── Constructors ─────────────────────────────────────────────────── */
 
 static Cljc *alloc(CljcTag t) {
-    Cljc *v = cell_alloc();  /* pooled; may trigger a GC before carving */
+    Cljc *v = cell_alloc(t != CLJC_INT && t != CLJC_DOUBLE);
     v->tag = t;
     return v;
 }
@@ -368,9 +374,11 @@ static void gc_mark(Cljc *v) {
                 for (size_t i = 0; i < v->as.hnode.nkids; i++)
                     gc_mark(v->as.hnode.kids[i]);  /* NULL slots skip in gc_mark */
                 return;
-            case CLJC_RECUR:
-                for (size_t i = 0; i < v->as.recur.n; i++) gc_mark(v->as.recur.vals[i]);
+            case CLJC_RECUR: {
+                Cljc **vals = v->as.recur.spill ? (Cljc **)v->as.recur.iv[0] : v->as.recur.iv;
+                for (size_t i = 0; i < v->as.recur.n; i++) gc_mark(vals[i]);
                 return;
+            }
             case CLJC_FN:
                 gc_mark_env(v->as.fn.env);
                 v = v->as.fn.arities;  /* a list of cons pairs — generic list marking */
@@ -452,9 +460,14 @@ static void gc_collect(void) {
             if (c->tag != CLJC_FREE) {
                 switch (c->tag) {
                     case CLJC_STRING: free(c->as.str); break;
-                    case CLJC_VECTOR: free(c->as.vec.tail); break;
-                    case CLJC_HNODE:  free(c->as.hnode.kids); break;
-                    case CLJC_RECUR:  free(c->as.recur.vals); break;
+                    case CLJC_VECTOR: tail_free(c->as.vec.tail, c->as.vec.taillen); break;
+                    case CLJC_HNODE:
+                        if (c->as.hnode.nkids == 32) chunk32_free(c->as.hnode.kids);
+                        else free(c->as.hnode.kids);
+                        break;
+                    case CLJC_RECUR:
+                        if (c->as.recur.spill) free(c->as.recur.iv[0]);
+                        break;
                     default: break;  /* maps own nothing — their root is a cell */
                 }
                 c->tag = CLJC_FREE;
@@ -564,11 +577,52 @@ static unsigned popcnt32(uint32_t x) {
 #endif
 }
 
+/* Pool of 32-pointer (256 B) chunks for vector tails and 32-slot trie
+ * nodes — both die young, so a free list beats malloc/free churn. The
+ * next-chunk pointer reuses the first slot. */
+static Cljc **chunk32_freelist;
+
+static Cljc **chunk32_alloc(void) {
+    if (chunk32_freelist) {
+        Cljc **p = chunk32_freelist;
+        chunk32_freelist = (Cljc **)p[0];
+        return p;
+    }
+    return xmalloc(sizeof(Cljc *) * 32);
+}
+
+static void chunk32_free(Cljc **p) {
+    p[0] = (Cljc *)chunk32_freelist;
+    chunk32_freelist = p;
+}
+
+/* Size-classed free lists for vector tails (1..32 pointers). Tail sizes
+ * repeat heavily under conj churn, so exact-size recycling avoids both
+ * malloc traffic and the memory inflation of always-32 chunks. */
+static Cljc **tail_freelist[33];
+
+static Cljc **tail_alloc(uint8_t n) {
+    if (n == 0) n = 1;
+    if (tail_freelist[n]) {
+        Cljc **p = tail_freelist[n];
+        tail_freelist[n] = (Cljc **)p[0];
+        return p;
+    }
+    return xmalloc(sizeof(Cljc *) * n);
+}
+
+static void tail_free(Cljc **p, uint8_t n) {
+    if (n == 0) n = 1;
+    p[0] = (Cljc *)tail_freelist[n];
+    tail_freelist[n] = p;
+}
+
 /* Allocate a node with zeroed kid slots. Callers fill the slots immediately
  * (no allocation in between), so a mid-fill GC can never trace garbage. */
 static Cljc *mk_hnode(uint32_t bitmap, uint16_t nkids, bool collision, uint32_t chash) {
     Cljc *n = alloc(CLJC_HNODE);
-    n->as.hnode.kids = xmalloc(sizeof(Cljc *) * (nkids ? nkids : 1));
+    n->as.hnode.kids = nkids == 32 ? chunk32_alloc()
+                                   : xmalloc(sizeof(Cljc *) * (nkids ? nkids : 1));
     memset(n->as.hnode.kids, 0, sizeof(Cljc *) * (nkids ? nkids : 1));
     n->as.hnode.bitmap = bitmap;
     n->as.hnode.nkids = nkids;
@@ -881,7 +935,7 @@ static Cljc *vec_cell(Cljc *root, uint8_t shift, uint32_t count,
                       Cljc **tail_src, uint8_t taillen, Cljc *append) {
     Cljc *nv = alloc(CLJC_VECTOR);  /* union zeroed: safe if GC fires below */
     uint8_t n = (uint8_t)(taillen + (append ? 1 : 0));
-    nv->as.vec.tail = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    nv->as.vec.tail = tail_alloc(n);
     if (taillen) memcpy(nv->as.vec.tail, tail_src, sizeof(Cljc *) * taillen);
     if (append) nv->as.vec.tail[taillen] = append;
     nv->as.vec.taillen = n;
@@ -982,7 +1036,7 @@ static Cljc *mk_vector(Cljc **items, size_t n) {
     return v;
 }
 
-static Cljc *cell_alloc(void) {
+static Cljc *cell_alloc(bool zero) {
     maybe_gc();
     Cljc *c;
     if (cell_freelist) {
@@ -998,7 +1052,10 @@ static Cljc *cell_alloc(void) {
         }
         c = &cell_blocks->cells[cell_blocks->used++];
     }
-    memset(&c->as, 0, sizeof c->as);  /* half-built cells are always safe to mark/sweep */
+    /* Zeroing keeps half-built cells safe to mark/sweep. Leaf tags (ints,
+     * doubles) have no owned pointers and no children, so their callers
+     * skip it — they overwrite the value slot immediately. */
+    if (zero) memset(&c->as, 0, sizeof c->as);
     c->gcmark = 0;
     return c;
 }
@@ -1403,9 +1460,11 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc *args) {
             Cljc *result = eval_body(call, chosen->as.cons.tail);
             if (!(result && result->tag == CLJC_RECUR)) return result;
             /* (recur ...) in fn tail position: rebuild the arg list and loop. */
+            Cljc **rvals = result->as.recur.spill
+                ? (Cljc **)result->as.recur.iv[0] : result->as.recur.iv;
             Cljc *newargs = NIL, **t = &newargs;
             for (size_t i = 0; i < result->as.recur.n; i++) {
-                *t = mk_cons(result->as.recur.vals[i], NIL);
+                *t = mk_cons(rvals[i], NIL);
                 t = &(*t)->as.cons.tail;
             }
             args = newargs;
@@ -1804,13 +1863,18 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                      * arm of its tag-switch and error out — that's our
                      * runtime tail-position check. */
                     size_t n = list_len(rest);
+                    if (n > 255) cljc_error("recur: too many arguments");
                     Cljc *r = alloc(CLJC_RECUR);
-                    r->as.recur.vals = xmalloc(sizeof(Cljc *) * (n ? n : 1));
-                    r->as.recur.n = 0;  /* grows as slots fill — GC safety */
-                    size_t i = 0;
+                    Cljc **vals = r->as.recur.iv;
+                    if (n > 3) {  /* spill flag set before any slot fills */
+                        vals = xmalloc(sizeof(Cljc *) * n);
+                        r->as.recur.iv[0] = (Cljc *)vals;
+                        r->as.recur.spill = true;
+                    }
+                    size_t i = 0;  /* n grows as slots fill — GC safety */
                     for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
-                        r->as.recur.vals[i++] = eval(env, a->as.cons.head);
-                        r->as.recur.n = i;
+                        vals[i++] = eval(env, a->as.cons.head);
+                        r->as.recur.n = (uint8_t)i;
                     }
                     return r;
                 }
@@ -1837,11 +1901,13 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                         /* Rebind in place: loop slots are mutable locals that get
                          * fresh values each pass (Clojure semantics). */
                         if (r->as.recur.n != nparams)
-                            cljc_error("recur arity mismatch: expected %zu, got %zu",
-                                       nparams, r->as.recur.n);
+                            cljc_error("recur arity mismatch: expected %zu, got %d",
+                                       nparams, (int)r->as.recur.n);
+                        Cljc **rvals = r->as.recur.spill
+                            ? (Cljc **)r->as.recur.iv[0] : r->as.recur.iv;
                         for (size_t i = 0; i < nparams; i++) {
                             for (Binding *b = scope->bindings; b; b = b->next) {
-                                if (b->name == names[i]) { b->value = r->as.recur.vals[i]; break; }
+                                if (b->name == names[i]) { b->value = rvals[i]; break; }
                             }
                         }
                     }

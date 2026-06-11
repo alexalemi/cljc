@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~4,170 lines, zero warnings, 388 assertions in `tests.clj`, ASan/UBSan clean
+~4,300 lines, zero warnings, 408 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -125,8 +125,22 @@ required by conservative stack scanning, same as Boehm GC).
     like cells/envs (a fn call allocates one per param), recycled at
     env sweep. CAVEAT: the cache assumes a single root env per
     process (already documented in the README embedding rules).
-11. **Performance later, maybe**: NaN-boxing, bytecode VM, arity-info
-    precomputation. Only if a real workload demands it.
+11. ~~Performance round 2~~ ✅ done 2026-06-10 — allocation reduction,
+    driven by the AoC day-5 profile (25M vector assocs): (a) recur
+    sentinels store up to 3 values inline in the cell union (covers
+    real loops; wider recurs spill to a flagged heap array); (b) the
+    32-byte union memset is skipped for INT/DOUBLE allocs (leaf tags,
+    no owned pointers/children); (c) 256B chunk pool for 32-slot trie
+    nodes + size-classed free lists for vector tails (1..32 ptrs).
+    Always-32 tail chunks were tried and REVERTED — they inflated
+    memory between GCs and regressed page-fault-bound vector builds.
+    Results: day5 17.0s→12.5s (-26%), 5M loop 578→504ms (-13%),
+    others neutral. Next bottleneck identified and deferred: argument
+    CONS LISTS — every native call allocates its arg list (~12 conses
+    per day5 iteration); fixing it means a calling-convention overhaul
+    touching all ~150 natives.
+12. **Performance later, maybe**: args-as-array calling convention,
+    NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

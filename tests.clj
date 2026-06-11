@@ -632,4 +632,11 @@
 (assert= :b (min-key (constantly 1) :a :b))
 (assert= {"l" 2 "h" 1 "e" 1 "o" 1} (frequencies (seq "hello")))
 
+; ── perf round 2: recur spill path (>3 args goes to the heap) ──
+(assert= 100014 (loop [a 1 b 2 c 3 d 4 e 5]
+                  (if (< a 100000) (recur (inc a) b c d e) (+ a b c d e))))
+(defn five-recur [a b c d e]
+  (if (< a 1000) (recur (inc a) b c d e) (+ a b c d e)))
+(assert= 1014 (five-recur 1 2 3 4 5))
+
 (println "tests complete")

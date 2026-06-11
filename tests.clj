@@ -507,4 +507,39 @@
 (assert= ["key=val" "key" "val"] (re-matches #"(\w+)=(\w+)" "key=val"))
 (assert= "no space" (re-find #"\S+\s\S+" "no space"))
 
+; ── format / replace / split ──
+(assert= "cart has 3 items (99.50%)" (format "%s has %d items (%.2f%%)" "cart" 3 99.5))
+(assert= "x=  5;" (format "x=%3d;" 5))
+(assert= "ff" (format "%x" 255))
+(assert= "a-b-c" (str/replace "a.b.c" "." "-"))          ; literal, not regex
+(assert= "a<1>b<22>c" (re-replace "a1b22c" #"\d+" "<$0>"))
+(assert= "smith, john" (re-replace "john smith" #"(\w+) (\w+)" "$2, $1"))
+(assert= "cost: $5" (re-replace "cost: 5" #"(\d+)" "$$$1"))
+(assert= ["a" "b" "c" "d"] (re-split "a1b22c333d" #"\d+"))
+(assert= ["a" "b"] (re-split "a,b,," ","))               ; trailing empties dropped
+(assert= ["" "a" "b"] (re-split ",a,b" ","))             ; leading empty kept
+
+; ── condp / for modifiers ──
+(assert= :three (condp = 3 1 :one 3 :three :other))
+(assert= :other (condp = 9 1 :one :other))
+(assert= :big (condp < 5 10 :small 3 :big :other))       ; (pred test expr)
+(assert= :no-clause (try (condp = 9 1 :one) (catch Exception e :no-clause)))
+(assert= (list 0 20) (for [x (range 4) :when (even? x) :let [y (* x 10)]] y))
+(assert= (list [1 10] [1 20] [2 10] [2 20]) (for [x [1 2] y [10 20]] [x y]))
+(assert= (list 3) (for [x [1 2 3] y [3] :when (= x y)] x))
+
+; ── math / random ──
+(assert= 4.0 (Math/sqrt 16))
+(assert= 1024.0 (Math/pow 2 10))
+(assert= 3.0 (Math/floor 3.7))
+(assert= 4.0 (Math/ceil 3.2))
+(assert= 4 (Math/round 3.6))
+(assert= 5 (Math/abs -5))
+(assert= 2.5 (Math/abs -2.5))
+(assert= true (and (<= 0 (rand)) (< (rand) 1)))
+(assert= true (every? (fn [_] (<= 0 (rand-int 10) 9)) (range 50)))
+(assert= true (contains? #{1 2 3} (rand-nth [1 2 3])))
+(assert= 3 (count (max-key count [1] [1 2 3] [1 2])))
+(assert= [1] (min-key count [1] [1 2 3] [1 2]))
+
 (println "tests complete")

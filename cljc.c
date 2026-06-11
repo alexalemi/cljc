@@ -20,6 +20,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <setjmp.h>
+#include <math.h>
+#include <time.h>
 #ifndef CLJC_NO_MAIN
 #include <unistd.h>  /* isatty — REPL vs script-mode detection */
 #endif
@@ -3302,6 +3304,206 @@ static Cljc *prim_pr(CljcEnv *env, Cljc *args)    { (void)env; return print_args
 static Cljc *prim_prn(CljcEnv *env, Cljc *args)   { (void)env; return print_args(args, true, true); }
 static Cljc *prim_print(CljcEnv *env, Cljc *args) { (void)env; return print_args(args, false, false); }
 
+
+/* ── format / string-replace / regex string ops ── */
+
+static Cljc *prim_format(CljcEnv *env, Cljc *args) {
+    (void)env;
+    char *fmt = as_str(args->as.cons.head, "format");
+    Cljc *a = args->as.cons.tail;
+    SBuf out = {0};
+    sb_grow(&out, 1); out.data[0] = '\0';
+    for (const char *f = fmt; *f; ) {
+        if (*f != '%') { sb_putc(&out, *f++); continue; }
+        f++;
+        if (*f == '%') { sb_putc(&out, '%'); f++; continue; }
+        char spec[20]; int si = 0;
+        while (*f && strchr("-+ 0#.0123456789", *f) && si < 16) spec[si++] = *f++;
+        spec[si] = '\0';
+        char conv = *f++;
+        if (!conv) cljc_error("format: dangling %%");
+        if (a == NIL || a->tag != CLJC_LIST) cljc_error("format: not enough arguments");
+        Cljc *v = a->as.cons.head;
+        a = a->as.cons.tail;
+        char cfmt[32], tmp[512];
+        switch (conv) {
+            case 's': {
+                SBuf t = {0};
+                print_to(&t, v, false);
+                snprintf(cfmt, sizeof cfmt, "%%%ss", spec);
+                snprintf(tmp, sizeof tmp, cfmt, t.data ? t.data : "");
+                free(t.data);
+                sb_puts(&out, tmp);
+                break;
+            }
+            case 'd': case 'x': case 'X': case 'o':
+                snprintf(cfmt, sizeof cfmt, "%%%sll%c", spec, conv);
+                snprintf(tmp, sizeof tmp, cfmt, (long long)as_int(v, "format"));
+                sb_puts(&out, tmp);
+                break;
+            case 'f': case 'e': case 'g':
+                snprintf(cfmt, sizeof cfmt, "%%%s%c", spec, conv);
+                snprintf(tmp, sizeof tmp, cfmt, as_num(v));
+                sb_puts(&out, tmp);
+                break;
+            default:
+                cljc_error("format: unsupported conversion %%%c", conv);
+        }
+    }
+    Cljc *r = mk_str(out.data, out.len);
+    free(out.data);
+    return r;
+}
+
+static Cljc *prim_str_replace(CljcEnv *env, Cljc *args) {
+    /* (str/replace s match replacement) — match is a LITERAL substring.
+     * For regex replacement with $1 refs, use re-replace. */
+    (void)env;
+    char *s = as_str(args->as.cons.head, "replace");
+    char *m = as_str(args->as.cons.tail->as.cons.head, "replace");
+    char *r = as_str(args->as.cons.tail->as.cons.tail->as.cons.head, "replace");
+    size_t mlen = strlen(m);
+    if (mlen == 0) cljc_error("replace: empty match string");
+    SBuf out = {0};
+    sb_grow(&out, 1); out.data[0] = '\0';
+    const char *p = s;
+    for (;;) {
+        const char *hit = strstr(p, m);
+        if (!hit) { sb_puts(&out, p); break; }
+        while (p < hit) sb_putc(&out, *p++);
+        sb_puts(&out, r);
+        p += mlen;
+    }
+    Cljc *res = mk_str(out.data, out.len);
+    free(out.data);
+    return res;
+}
+
+/* Append replacement text, expanding $0..$9 to capture groups; $$ => $. */
+static void rx_subst(SBuf *out, const char *repl) {
+    for (const char *r = repl; *r; r++) {
+        if (*r == '$' && r[1] == '$') { sb_putc(out, '$'); r++; continue; }
+        if (*r == '$' && isdigit((unsigned char)r[1])) {
+            int g = r[1] - '0';
+            r++;
+            if (rx_cap_s[g] && rx_cap_e[g] && rx_cap_e[g] >= rx_cap_s[g])
+                for (const char *c = rx_cap_s[g]; c < rx_cap_e[g]; c++) sb_putc(out, *c);
+            continue;
+        }
+        sb_putc(out, *r);
+    }
+}
+
+static Cljc *prim_re_replace(CljcEnv *env, Cljc *args) {
+    /* (re-replace s pattern replacement) — all matches; $1..$9 in repl. */
+    (void)env;
+    char *s = as_str(args->as.cons.head, "re-replace");
+    char *pat = as_str(args->as.cons.tail->as.cons.head, "re-replace");
+    char *repl = as_str(args->as.cons.tail->as.cons.tail->as.cons.head, "re-replace");
+    Rx *pool; int ngroups;
+    Rx *prog = rx_compile(pat, &pool, &ngroups);
+    rx_str_begin = s;
+    SBuf out = {0};
+    sb_grow(&out, 1); out.data[0] = '\0';
+    const char *p = s;
+    while (*p) {
+        rx_reset_caps();
+        rx_cap_s[0] = p;
+        if (rx_m(prog, p)) {
+            rx_cap_e[0] = rx_match_end;
+            rx_subst(&out, repl);
+            if (rx_match_end > p) { p = rx_match_end; continue; }
+            /* empty match: emit one char and advance to avoid looping */
+            sb_putc(&out, *p);
+        } else {
+            sb_putc(&out, *p);
+        }
+        p++;
+    }
+    free(pool);
+    Cljc *res = mk_str(out.data, out.len);
+    free(out.data);
+    return res;
+}
+
+static Cljc *prim_re_split(CljcEnv *env, Cljc *args) {
+    /* (re-split s pattern) => vector of segments; trailing empties dropped. */
+    (void)env;
+    char *s = as_str(args->as.cons.head, "re-split");
+    char *pat = as_str(args->as.cons.tail->as.cons.head, "re-split");
+    Rx *pool; int ngroups;
+    Rx *prog = rx_compile(pat, &pool, &ngroups);
+    rx_str_begin = s;
+    Cljc *segs = NIL, **t = &segs;  /* list of segment strings, in order */
+    size_t nsegs = 0, last_nonempty = 0;
+    const char *seg = s, *p = s;
+    while (*p) {
+        rx_reset_caps();
+        if (rx_m(prog, p) && rx_match_end > p) {
+            *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL);
+            t = &(*t)->as.cons.tail;
+            nsegs++;
+            if (p > seg) last_nonempty = nsegs;
+            p = rx_match_end;
+            seg = p;
+        } else p++;
+    }
+    *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL);
+    nsegs++;
+    if (p > seg) last_nonempty = nsegs;
+    free(pool);
+    Cljc *v = mk_empty_vec();
+    size_t i = 0;
+    for (Cljc *l = segs; l && l->tag == CLJC_LIST && i < last_nonempty; l = l->as.cons.tail, i++)
+        v = vec_conj1(v, l->as.cons.head);
+    return v;
+}
+
+/* ── math / random ── */
+
+#define MATH1(NAME, FN) \
+    static Cljc *prim_##NAME(CljcEnv *env, Cljc *args) { \
+        (void)env; \
+        return mk_double(FN(as_num(args->as.cons.head))); \
+    }
+
+MATH1(sqrt, sqrt)
+MATH1(floor, floor)
+MATH1(ceil, ceil)
+
+static Cljc *prim_pow(CljcEnv *env, Cljc *args) {
+    (void)env;
+    return mk_double(pow(as_num(args->as.cons.head),
+                         as_num(args->as.cons.tail->as.cons.head)));
+}
+
+static Cljc *prim_round(CljcEnv *env, Cljc *args) {
+    (void)env;
+    return mk_int((int64_t)llround(as_num(args->as.cons.head)));
+}
+
+static Cljc *prim_math_abs(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *v = args->as.cons.head;
+    if (v != NIL && v->tag == CLJC_DOUBLE) return mk_double(fabs(v->as.d));
+    return mk_int(v->as.i < 0 ? -v->as.i : v->as.i);
+}
+
+static Cljc *prim_rand(CljcEnv *env, Cljc *args) {
+    (void)env;
+    double r = (double)rand() / ((double)RAND_MAX + 1.0);
+    if (args != NIL && args->tag == CLJC_LIST)
+        return mk_double(r * as_num(args->as.cons.head));
+    return mk_double(r);
+}
+
+static Cljc *prim_rand_int(CljcEnv *env, Cljc *args) {
+    (void)env;
+    int64_t n = as_int(args->as.cons.head, "rand-int");
+    if (n <= 0) return mk_int(0);
+    return mk_int((int64_t)((double)rand() / ((double)RAND_MAX + 1.0) * (double)n));
+}
+
 /* ───── Public C API ─────────────────────────────────────────────────── */
 
 CljcEnv *cljc_new_env(void);
@@ -3466,10 +3668,13 @@ static const char *PRELUDE =
     "                     (cons (first (rest cs))\n"
     "                           (cons (list '= g (list 'quote (first cs))) acc))))))))))\n"
     "(defmacro for [bindings body]\n"
-    "  (if (= 2 (count bindings))\n"
-    "    `(map (fn [~(nth bindings 0)] ~body) ~(nth bindings 1))\n"
-    "    `(mapcat (fn [~(nth bindings 0)] (for ~(vec (drop 2 bindings)) ~body))\n"
-    "             ~(nth bindings 1))))\n"
+    "  (if (empty? bindings)\n"
+    "    `(list ~body)\n"
+    "    (let [k (nth bindings 0) v (nth bindings 1) more (vec (drop 2 bindings))]\n"
+    "      (cond\n"
+    "        (= k :when) `(if ~v (for ~more ~body) (list))\n"
+    "        (= k :let)  `(let ~v (for ~more ~body))\n"
+    "        :else       `(mapcat (fn [~k] (for ~more ~body)) ~v)))))\n"
     /* batch 5-lite */
     "(defn boolean [x] (if x true false))\n"
     "(defn true? [x] (= x true))\n"
@@ -3514,6 +3719,20 @@ static const char *PRELUDE =
     "  `(let [~@(mapcat (fn [spec] (list (first spec) (cons 'fn (rest spec))))\n"
     "                   fnspecs)]\n"
     "     ~@body))\n"
+    "(defmacro condp [pred expr & clauses]\n"
+    "  (let [p (gensym \"p\") e (gensym \"e\")]\n"
+    "    (list 'let [p pred e expr]\n"
+    "      (cons 'cond\n"
+    "        (loop [cs clauses acc (list)]\n"
+    "          (if (empty? cs)\n"
+    "            (reverse (cons '(throw (ex-info \"condp: no matching clause\" {})) (cons :else acc)))\n"
+    "            (if (empty? (rest cs))\n"
+    "              (reverse (cons (first cs) (cons :else acc)))\n"
+    "              (recur (rest (rest cs))\n"
+    "                     (cons (first (rest cs)) (cons (list p (first cs) e) acc))))))))))\n"
+    "(defn rand-nth [coll] (nth (vec coll) (rand-int (count coll))))\n"
+    "(defn max-key [f x & xs] (reduce (fn [a b] (if (>= (f a) (f b)) a b)) x xs))\n"
+    "(defn min-key [f x & xs] (reduce (fn [a b] (if (<= (f a) (f b)) a b)) x xs))\n"
     "(defn set/union [& sets] (reduce (fn [a s] (reduce conj a (seq s))) #{} sets))\n"
     "(defn set/intersection [s1 s2] (set (filter (fn [x] (contains? s2 x)) (seq s1))))\n"
     "(defn set/difference [s1 s2] (set (remove (fn [x] (contains? s2 x)) (seq s1))))\n"
@@ -3525,6 +3744,7 @@ static const char *PRELUDE =
 CljcEnv *cljc_new_env(void) {
     if (!NIL) {
         gc_stress = getenv("CLJC_GC_STRESS") != NULL;
+        srand((unsigned)time(NULL));
         NIL = alloc(CLJC_NIL);
         /* Self-referential cons fields: walking off the end of any form
          * (e.g. (def) with no args) yields NIL instead of reading
@@ -3593,6 +3813,18 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "re-find",    prim_re_find);
     cljc_define_native(e, "re-matches", prim_re_matches);
     cljc_define_native(e, "re-seq",     prim_re_seq);
+    cljc_define_native(e, "re-replace",  prim_re_replace);
+    cljc_define_native(e, "re-split",    prim_re_split);
+    cljc_define_native(e, "format",      prim_format);
+    cljc_define_native(e, "str/replace", prim_str_replace);
+    cljc_define_native(e, "Math/sqrt",  prim_sqrt);
+    cljc_define_native(e, "Math/pow",   prim_pow);
+    cljc_define_native(e, "Math/floor", prim_floor);
+    cljc_define_native(e, "Math/ceil",  prim_ceil);
+    cljc_define_native(e, "Math/round", prim_round);
+    cljc_define_native(e, "Math/abs",   prim_math_abs);
+    cljc_define_native(e, "rand",       prim_rand);
+    cljc_define_native(e, "rand-int",   prim_rand_int);
     cljc_define_native(e, "nil?",    prim_nil_p);
     cljc_define_native(e, "list?",   prim_list_p);
     cljc_define_native(e, "vector?", prim_vector_p);

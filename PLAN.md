@@ -6,7 +6,7 @@ suite twice — normal and `CLJC_GC_STRESS=1`).
 
 ## Status (as of 2026-06-10)
 
-~3,760 lines, zero warnings, 311 assertions in `tests.clj`, ASan/UBSan clean
+~4,000 lines, zero warnings, 340 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -94,10 +94,19 @@ required by conservative stack scanning, same as Boehm GC).
    #"..." reader literal = raw string (only \" escape). re-find/
    re-matches/re-seq; patterns are plain strings (no regex value type).
    NOT supported: {n,m}, backrefs, lookaround (braces are literals).
-8. **More surface**: `condp`, `for` :when/:let modifiers, `..`,
-   `iterate` (eager n-limited?), `format`, str/replace with regex,
-   str/split with regex?
-9. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
+8. ~~Scripting surface~~ ✅ done 2026-06-10 — format (printf subset:
+   %s %d %x %o %f %e %g with flags/width/precision), str/replace
+   (LITERAL match — regex variants are explicitly named), re-replace
+   (all matches, $0-$9 group refs, $$ escape), re-split (trailing
+   empties dropped), condp (with thrown no-match), for rewritten with
+   :when/:let modifiers (classic recursive mapcat expansion),
+   Math/{sqrt,pow,floor,ceil,round,abs}, rand, rand-int, rand-nth,
+   max-key, min-key. Makefile links -lm. Skipped: `..` (no interop),
+   iterate (no lazy seqs).
+9. **Surface still open**: `peek/pop`, `keep` exists, `dorun/doall`
+   n/a (eager), `juxt` exists, `some->`/`some->>`/`cond->` threading
+   variants, `string?`-family complete, `read-string`/`eval` exposure?
+10. **Performance later, maybe**: NaN-boxing, symbol→binding caching,
    bytecode VM. Not before semantics are broader.
 
 ## Known divergences from Clojure (deliberate, v0)

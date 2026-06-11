@@ -834,4 +834,23 @@
 (assert= :unsupported (try (jit/compile! 'jit-no) (catch Exception e :unsupported)))
 (assert= "still works!" (jit-no "still works"))     ; interpreted version intact
 
+; ── library survey: upstream clojure.set via loading require ──
+(require 'clojure.set)
+(assert= #{1 2 3} (union #{1 2} #{2 3}))
+(assert= #{2 3} (intersection #{1 2 3} #{2 3 4}))
+(assert= #{1 3} (difference #{1 2 3} #{2}))
+(assert= {:x 1 :b 2} (rename-keys {:a 1 :b 2} {:a :x}))
+(assert= {1 :a 2 :b} (map-invert {:a 1 :b 2}))
+(assert= #{{:a 1} {:a 3}} (project #{{:a 1 :b 2} {:a 3 :b 4}} [:a]))
+(assert= #{{:id 1 :name :ann :age 30}}
+         (join #{{:id 1 :name :ann}} #{{:id 1 :age 30}}))
+(assert= #{1 3 5} (select odd? #{1 2 3 4 5}))
+(assert= true (subset? #{1} #{1 2}))
+(require 'clojure.set)                               ; idempotent reload
+(assert= #{1 2} (union #{1} #{2}))
+(assert= true (identical? :a :a))
+(assert= false (identical? [1] [1]))
+(assert= {:a 1} (persistent! (assoc! (transient {}) :a 1)))   ; map shim
+(assert= #{:x} (persistent! (conj! (transient #{}) :x)))      ; set shim
+
 (println "tests complete")

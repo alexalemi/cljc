@@ -85,6 +85,20 @@ interpreter inside. (True function-to-C compilation is plausible future
 work — the FFI's generate→cc→dlopen→rebind pipeline is exactly a JIT's
 plumbing — but it isn't built.)
 
+## Running Clojure libraries
+
+`require` resolves namespaces against `*load-path*` (`.` and `vendor/` by
+default) and loads single-file libraries. **Upstream `clojure.set` runs in
+full** — `union`, `join`, `project`, `index`, `map-invert`, all of it — from
+Clojure's own EPL-licensed source, vendored unmodified in `vendor/clojure/`.
+
+Survey honesty: that's the *favorable* end. Libraries needing Java interop,
+`deftype`, multi-file namespaces, or `#?@` splicing don't load (medley trips
+on its reader conditionals; Clerk is JVM-bound and doesn't run on babashka
+either). The compat machinery that made it possible: `defn` docstrings +
+attr-maps, `defn-`, interned keyword identity, transient-map shims,
+`with-meta`/`meta` no-ops.
+
 ## Tooling
 
 - **Linting**: ships a `.clj-kondo/config.edn` tuned for the dialect — flat

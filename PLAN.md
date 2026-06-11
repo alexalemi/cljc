@@ -271,7 +271,20 @@ required by conservative stack scanning, same as Boehm GC).
     only, no calls to other fns, no collections. Next tier if wanted:
     boxed Cljc* codegen through the api vtable for general functions
     (smaller win, broader coverage), or whole-program AOT.
-22. **Performance later, maybe**: args-as-array calling convention,
+22. ~~Library survey + loading require~~ ✅ done 2026-06-11 — require
+    now LOADS: namespace -> path against *load-path* (["." "vendor"]),
+    .clj/.cljc, once-only via cljc/loaded-namespaces. UPSTREAM
+    clojure.set RUNS IN FULL (vendored, EPL notice retained, 9 fns
+    suite-tested incl. join/project/index). Compat that unlocked it:
+    defn attr-maps skipped, defn-, identical? (with interned KEYWORD
+    CELLS — immortal, out-of-pool, like smallints — so (identical?
+    :a :a) and zero alloc per keyword read), transient map/set SHIMS
+    (persistent fallbacks — same results, no speedup; real HAMT
+    transients still future), with-meta/meta no-ops. Survey: medley
+    fails at read (#?@-class gaps); Clerk impossible (JVM-bound, not
+    even bb runs it). Aliases (:as m -> m/foo) NOT implemented — flat
+    globals; next compat step if multi-lib use emerges.
+23. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

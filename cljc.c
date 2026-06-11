@@ -127,6 +127,10 @@ static double as_num(Cljc *v);
 static Cljc *to_seq(Cljc *v);
 static Cljc *seq1(Cljc *v);
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs);
+static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs);
+static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs);
+static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs);
+static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs);
 /* GC-rooted value stack: call arguments live here (heap argv buffers would
  * be invisible to the conservative stack scan). Frames push, call, restore. */
 #define VSTACK_CAP (1u << 20)
@@ -222,7 +226,26 @@ static Cljc *mk_int(int64_t i) {
 static Cljc *mk_double(double d)     { Cljc *v = alloc(CLJC_DOUBLE); v->as.d = d; return v; }
 static Cljc *mk_bool(bool b)         { return b ? TRUE : FALSE; }
 static Cljc *mk_sym(const char *s)   { Cljc *v = alloc(CLJC_SYMBOL); v->as.sym = s; return v; }
-static Cljc *mk_kw(const char *s)    { Cljc *v = alloc(CLJC_KEYWORD); v->as.kw = s; return v; }
+/* Keyword CELLS are interned too (like Clojure): one immortal cell per
+ * name, allocated outside the GC pools — so (identical? :a :a) holds and
+ * keyword-heavy code allocates nothing per read. */
+typedef struct KwNode { const char *name; Cljc *cell; struct KwNode *next; } KwNode;
+static KwNode *kw_table[256];
+
+static Cljc *mk_kw(const char *s) {   /* s is already interned */
+    uint32_t h = (uint32_t)((uintptr_t)s >> 4) & 255u;
+    for (KwNode *n = kw_table[h]; n; n = n->next)
+        if (n->name == s) return n->cell;
+    Cljc *v = xmalloc(sizeof *v);     /* immortal: never in a pool, never swept */
+    memset(v, 0, sizeof *v);
+    v->tag = CLJC_KEYWORD;
+    v->gcmark = 1;
+    v->as.kw = s;
+    KwNode *n = xmalloc(sizeof *n);
+    n->name = s; n->cell = v; n->next = kw_table[h];
+    kw_table[h] = n;
+    return v;
+}
 static Cljc *mk_str(const char *s, size_t n) {
     Cljc *v = alloc(CLJC_STRING);
     v->as.str = xmalloc(n + 1);
@@ -1091,8 +1114,12 @@ static Cljc *as_tvec(Cljc *v, const char *what) {
 static Cljc *prim_transient(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *v = argv[0];
+    /* Maps/sets: persistent-fallback shim — transient ops delegate to the
+     * persistent versions (same results, no speedup; real HAMT transients
+     * are future work). Vectors get the true in-place implementation. */
+    if (v != NIL && (v->tag == CLJC_MAP || v->tag == CLJC_SET)) return v;
     if (v == NIL || v->tag != CLJC_VECTOR)
-        cljc_error("transient: only vectors are supported (yet)");
+        cljc_error("transient: unsupported collection");
     Cljc *t = alloc(CLJC_TVEC);
     t->as.vec.tail = chunk32_alloc();   /* private, mutable, full capacity */
     memset(t->as.vec.tail, 0, sizeof(Cljc *) * 32);
@@ -1109,6 +1136,8 @@ static Cljc *prim_transient(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_persistent_bang(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
+    if (argv[0] != NIL && (argv[0]->tag == CLJC_MAP || argv[0]->tag == CLJC_SET))
+        return argv[0];                       /* shim passthrough */
     Cljc *t = as_tvec(argv[0], "persistent!");
     t->as.vec.alive = false;            /* invalidate further edits */
     return vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
@@ -1132,6 +1161,8 @@ static Cljc *tvec_pushtail(int level, Cljc *parent, Cljc *tailnode,
 
 static Cljc *prim_conj_bang(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
+    if (argv[0] != NIL && (argv[0]->tag == CLJC_MAP || argv[0]->tag == CLJC_SET))
+        return prim_conj(env, argv, nargs);   /* shim: persistent conj */
     Cljc *t = as_tvec(argv[0], "conj!");
     Cljc *x = argv[1];
     uint32_t cnt = t->as.vec.count;
@@ -1166,6 +1197,8 @@ static Cljc *prim_conj_bang(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
+    if (argv[0] != NIL && argv[0]->tag == CLJC_MAP)
+        return prim_assoc(env, argv, nargs);  /* shim: persistent assoc */
     Cljc *t = as_tvec(argv[0], "assoc!");
     size_t i = (size_t)as_int(argv[1], "assoc!");
     Cljc *x = argv[2];
@@ -2037,8 +2070,9 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     }
                     /* compat no-ops: flat globals already match the universal
                      * (:require [clojure.string :as str]) alias convention */
-                    if (s == SYM_NS || s == SYM_REQUIRE || s == SYM_USE || s == SYM_IMPORT)
+                    if (s == SYM_NS || s == SYM_USE || s == SYM_IMPORT)
                         return NIL;
+                    (void)SYM_REQUIRE;
                 }
                 {
                     static const char *SYM_BINDING, *SYM_WITH_REDEFS;
@@ -2097,6 +2131,9 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     if (mbody->as.cons.head->tag == CLJC_STRING &&
                         mbody->as.cons.tail != NIL)
                         mbody = mbody->as.cons.tail;  /* skip docstring */
+                    if (mbody->as.cons.head->tag == CLJC_MAP &&
+                        mbody->as.cons.tail != NIL)
+                        mbody = mbody->as.cons.tail;  /* skip attr-map */
                     Cljc *m = make_fn(env, mbody, true);
                     env_define_root(env_root(env), name, m);
                     return m;
@@ -2109,6 +2146,9 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     if (fbody->as.cons.head->tag == CLJC_STRING &&
                         fbody->as.cons.tail != NIL)
                         fbody = fbody->as.cons.tail;  /* skip docstring */
+                    if (fbody->as.cons.head->tag == CLJC_MAP &&
+                        fbody->as.cons.tail != NIL)
+                        fbody = fbody->as.cons.tail;  /* skip attr-map */
                     Cljc *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
                     Cljc *def_form = mk_cons(mk_sym(SYM_DEF),
                                        mk_cons(name, mk_cons(fn_form, NIL)));
@@ -3520,6 +3560,13 @@ static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs) {
     return s;
 }
 
+static Cljc *prim_identical(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    return mk_bool(argv[0] == argv[1] ||
+                   (argv[0]->tag == CLJC_INT && argv[1]->tag == CLJC_INT &&
+                    argv[0]->as.i == argv[1]->as.i));  /* small-int cache parity */
+}
+
 static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *v = argv[0];
@@ -4511,6 +4558,26 @@ static const char *PRELUDE =
     "        :else       `(mapcat (fn [~k] (for ~more ~body)) ~v)))))\n"
     /* batch 5-lite */
     "(defmacro comment [& _] nil)\n"
+    "(defmacro defn- [name & body] `(defn ~name ~@body))\n"
+    "(defn with-meta [x m] x)\n"
+    "(defn meta [x] nil)\n"
+    "(defn vary-meta [x & _] x)\n"
+    "(def *load-path* [\".\" \"vendor\"])\n"
+    "(def cljc/loaded-namespaces (atom #{}))\n"
+    "(defn cljc/require-one [spec]\n"
+    "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
+    "    (when-not (contains? @cljc/loaded-namespaces nsname)\n"
+    "      (let [rel (str/replace (str nsname) \".\" \"/\")\n"
+    "            paths (mapcat (fn [d] [(str d \"/\" rel \".clj\")\n"
+    "                                   (str d \"/\" rel \".cljc\")])\n"
+    "                          *load-path*)\n"
+    "            hit (some (fn [p] (try (do (slurp p) p) (catch Exception e nil)))\n"
+    "                      paths)]\n"
+    "        (when hit\n"
+    "          (swap! cljc/loaded-namespaces conj nsname)\n"
+    "          (load-file hit))))))\n"
+    "(defmacro require [& specs]\n"
+    "  `(do ~@(map (fn [s] `(cljc/require-one ~s)) specs) nil))\n"
     "(defmacro declare [& names]\n"
     "  `(do ~@(map (fn [n] `(def ~n nil)) names)))\n"
     "(defn boolean [x] (if x true false))\n"
@@ -4675,6 +4742,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "sh",        prim_sh);
     cljc_define_native(e, "hash",      prim_hash);
     cljc_define_native(e, "int",       prim_int);
+    cljc_define_native(e, "identical?", prim_identical);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
     cljc_define_native(e, "cljc/onto",          prim_onto);
@@ -4746,6 +4814,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "persistent!", prim_persistent_bang);
     cljc_define_native(e, "conj!",       prim_conj_bang);
     cljc_define_native(e, "assoc!",      prim_assoc_bang);
+    cljc_define_native(e, "dissoc!",     prim_dissoc);  /* shim: persistent */
+    cljc_define_native(e, "disj!",       prim_disj);    /* shim: persistent */
     cljc_define_native(e, "name",    prim_name);
     cljc_define_native(e, "keyword", prim_keyword);
     cljc_define_native(e, "symbol",  prim_symbol);

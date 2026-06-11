@@ -5971,18 +5971,18 @@ static bool balanced(const char *s) {
     return depth <= 0 && !in_str;
 }
 
-/* Record a result in the absolute history: *out* grows by one; (*out* n)
- * retrieves it because vectors are callable. Index 0 is a nil spacer so
- * numbers match the prompt. (Divergence: Clojure's *out* is the stdout
- * stream var — ours is REPL output history, by choice.) */
+/* Record a result in the absolute history: *results* grows by one and
+ * (*results* n) retrieves by prompt number because vectors are callable.
+ * Index 0 is a nil spacer so numbers match the prompt. (*out* was
+ * deliberately avoided — Clojure reserves it for the stdout stream.) */
 static void repl_record(CljcEnv *env, Cljc *result) {
-    Cljc *outv = env_lookup_maybe(env, "*out*");
+    Cljc *outv = env_lookup_maybe(env, "*results*");
     if (!outv || outv->tag != CLJC_VECTOR) {
         outv = mk_empty_vec();
         outv = vec_conj1(outv, NIL);
     }
     outv = vec_conj1(outv, result);
-    env_define_root(env_root(env), intern("*out*", 5), outv);
+    env_define_root(env_root(env), intern("*results*", 9), outv);
     Cljc *star2 = env_lookup_maybe(env, "*1");
     Cljc *star3 = env_lookup_maybe(env, "*2");
     if (star3) env_define_root(env_root(env), intern("*3", 2), star3);
@@ -5992,7 +5992,7 @@ static void repl_record(CljcEnv *env, Cljc *result) {
 
 static int run_repl(CljcEnv *env) {
     hist_load();
-    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 / (*out* n) hold results, !cmd shells out\n",
+    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 / (*results* n) hold results, !cmd shells out\n",
            CLJC_VERSION);
     char form[RL_MAX * 4];
     char line[RL_MAX];
@@ -6016,6 +6016,11 @@ static int run_repl(CljcEnv *env) {
             eval_sp = 0;
             continue;
         }
+        /* the entered form is the error-excerpt source for this input */
+        err_src_text = form;
+        err_src_name = "<repl>";
+        rd_line = 1;
+        rd_line_start = form;
         if (form[0] == '!') {                  /* shell mode: !ls -la */
             const char *cmd = form + 1;
             while (*cmd == ' ') cmd++;
@@ -6045,6 +6050,7 @@ static int run_repl(CljcEnv *env) {
             putchar('\n');
             out_n++;
         }
+        rd_line = 0;
     }
     return 0;
 }

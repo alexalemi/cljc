@@ -1889,6 +1889,51 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
                     if (s == SYM_NS || s == SYM_REQUIRE || s == SYM_USE || s == SYM_IMPORT)
                         return NIL;
                 }
+                {
+                    static const char *SYM_BINDING, *SYM_WITH_REDEFS;
+                    if (!SYM_BINDING) {
+                        SYM_BINDING = intern("binding", 7);
+                        SYM_WITH_REDEFS = intern("with-redefs", 11);
+                    }
+                    if (s == SYM_BINDING || s == SYM_WITH_REDEFS) {
+                        /* (binding [*v* val ...] body) — root bindings mutate
+                         * in place (single-threaded), restored on every exit
+                         * path via a handler frame. with-redefs is identical. */
+                        Cljc *bv = rest->as.cons.head;
+                        if (bv == NIL || bv->tag != CLJC_VECTOR || vec_len(bv) % 2 != 0)
+                            cljc_error("binding needs an even-sized vector");
+                        size_t n = vec_len(bv) / 2;
+                        if (n > 16) cljc_error("binding: too many vars");
+                        Binding *slots[16];
+                        Cljc *saved[16];
+                        CljcEnv *root = env_root(env);
+                        for (size_t i = 0; i < n; i++) {
+                            const char *nm = sym_name(vec_nth(bv, i * 2), "binding");
+                            Binding *b = NULL;
+                            for (Binding *x = root->bindings; x; x = x->next)
+                                if (x->name == nm) { b = x; break; }
+                            if (!b) cljc_error("binding: unable to resolve %s", nm);
+                            slots[i] = b;
+                            saved[i] = b->value;
+                            b->value = eval(env, vec_nth(bv, i * 2 + 1));
+                        }
+                        ErrFrame frame;
+                        frame.prev = err_top;
+                        err_top = &frame;
+                        Cljc * volatile result = NIL;
+                        volatile bool threw = false;
+                        if (setjmp(frame.jb) == 0) {
+                            result = eval_body(env, rest->as.cons.tail);
+                            err_top = frame.prev;
+                        } else {
+                            err_top = frame.prev;
+                            threw = true;
+                        }
+                        for (size_t i = 0; i < n; i++) slots[i]->value = saved[i];
+                        if (threw) cljc_raise();
+                        return result;
+                    }
+                }
                 if (s == SYM_QUASIQUOTE) return qq_expand(env, rest->as.cons.head);
                 if (s == SYM_DEFMACRO) {
                     /* (defmacro name [params] body...) — a fn flagged so that
@@ -3309,6 +3354,34 @@ static Cljc *prim_disj(CljcEnv *env, Cljc *args) {
     return s;
 }
 
+static Cljc *prim_type(CljcEnv *env, Cljc *args) {
+    (void)env;
+    Cljc *v = args->as.cons.head;
+    if (v == NIL) return NIL;
+    if (v->tag == CLJC_MAP) {  /* records are maps tagged with :cljc/type */
+        Cljc *t;
+        if (map_find(v, mk_kw(intern("cljc/type", 9)), &t)) return t;
+        return mk_kw(intern("map", 3));
+    }
+    const char *n;
+    switch (v->tag) {
+        case CLJC_BOOL: n = "boolean"; break;
+        case CLJC_INT: n = "int"; break;
+        case CLJC_DOUBLE: n = "double"; break;
+        case CLJC_STRING: n = "string"; break;
+        case CLJC_KEYWORD: n = "keyword"; break;
+        case CLJC_SYMBOL: n = "symbol"; break;
+        case CLJC_LIST: n = "list"; break;
+        case CLJC_LAZY: n = "lazy-seq"; break;
+        case CLJC_VECTOR: n = "vector"; break;
+        case CLJC_SET: n = "set"; break;
+        case CLJC_ATOM: n = "atom"; break;
+        case CLJC_FN: case CLJC_NATIVE: n = "fn"; break;
+        default: n = "unknown"; break;
+    }
+    return mk_kw(intern(n, strlen(n)));
+}
+
 static Cljc *prim_gc(CljcEnv *env, Cljc *args) {
     (void)env; (void)args;
     gc_collect();
@@ -4278,6 +4351,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "last",    prim_last);
     cljc_define_native(e, "seq",     prim_seq);
     cljc_define_native(e, "seq?",    prim_seq_p);
+    cljc_define_native(e, "type",    prim_type);
     cljc_define_native(e, "hash-map",  prim_hash_map);
     cljc_define_native(e, "get",       prim_get);
     cljc_define_native(e, "assoc",     prim_assoc);
@@ -4403,6 +4477,46 @@ CljcEnv *cljc_new_env(void) {
         "(defn repeatedly\n"
         "  ([f] (lazy-seq (cons (f) (repeatedly f))))\n"
         "  ([n f] (take n (repeatedly f))))\n");
+    /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
+    cljc_eval_string(e,
+        "(def cljc/multi-tables (atom {}))\n"
+        "(defmacro defmulti [name dispatch]\n"
+        "  `(do (swap! cljc/multi-tables assoc '~name {})\n"
+        "       (def ~name\n"
+        "         (let [d# ~dispatch]\n"
+        "           (fn [& args#]\n"
+        "             (let [t# (get @cljc/multi-tables '~name)\n"
+        "                   dv# (apply d# args#)\n"
+        "                   m# (get t# dv# (get t# :default))]\n"
+        "               (if m#\n"
+        "                 (apply m# args#)\n"
+        "                 (throw (ex-info (str \"No method in \" '~name\n"
+        "                                      \" for \" (pr-str dv#)) {})))))))))\n"
+        "(defmacro defmethod [name dval params & body]\n"
+        "  `(do (swap! cljc/multi-tables update '~name assoc ~dval\n"
+        "              (fn ~params ~@body))\n"
+        "       '~name))\n"
+        /* protocols: each method dispatches on (type (first args)) */
+        "(defmacro defprotocol [pname & sigs]\n"
+        "  `(do ~@(map (fn [sig]\n"
+        "                (let [m (first sig)]\n"
+        "                  `(defmulti ~m (fn [& args#] (type (first args#))))))\n"
+        "              sigs)\n"
+        "       (def ~pname '~(mapv first sigs))))\n"
+        "(defmacro extend-type [t & impls]\n"
+        "  `(do ~@(map (fn [[m params & body]]\n"
+        "                `(defmethod ~m ~t ~(vec params) ~@body))\n"
+        "              impls)))\n"
+        "(defn satisfies? [proto x]\n"
+        "  (every? (fn [m] (contains? (get @cljc/multi-tables m) (type x))) proto))\n"
+        /* records: maps tagged with :cljc/type */
+        "(defmacro defrecord [rname fields]\n"
+        "  (let [kw (keyword (str rname))]\n"
+        "    `(defn ~(symbol (str \"->\" rname)) ~fields\n"
+        "       (assoc (zipmap ~(mapv keyword (map str fields))\n"
+        "                      ~fields)\n"
+        "              :cljc/type ~kw))))\n"
+        "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\n");
     return e;
 }
 

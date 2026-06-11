@@ -188,7 +188,18 @@ required by conservative stack scanning, same as Boehm GC).
     Risks: every `->as.cons.tail` walk in primitives is a potential
     eager-forcing bug; introduce `static Cljc *seq_first/seq_next` and
     convert callers mechanically.
-15. **Performance later, maybe**: args-as-array calling convention,
+15. ~~Compat Tier 3~~ ✅ done 2026-06-10 — binding/with-redefs as a
+    special form (mutates root bindings in place — sound because root
+    def mutates, single-threaded; restored on every exit via an
+    ErrFrame), type native (keyword per tag; record maps carry
+    :cljc/type), defmulti/defmethod (pure prelude: global registry
+    atom, :default fallback), defprotocol/extend-type/satisfies?
+    (methods are multimethods dispatching on (type (first args))),
+    defrecord (->Ctor building :cljc/type-tagged maps, so records ARE
+    maps and participate in protocols). Divergences: type returns
+    keywords not classes; no defrecord positional equality semantics
+    beyond map equality; extend-type takes type KEYWORDS.
+16. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.
 
 ## Known divergences from Clojure (deliberate, v0)

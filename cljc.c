@@ -4671,6 +4671,29 @@ static Cljc *prim_md5(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(hex, 32);
 }
 
+/* (flush) → flush the interpreter's stdout. */
+static Cljc *prim_flush(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    fflush(COUT);
+    return NIL;
+}
+
+/* (read-line) → next line from stdin (no trailing newline), nil at EOF. */
+static Cljc *prim_read_line(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    char buf[4096];
+    if (!fgets(buf, sizeof buf, stdin)) return NIL;
+    size_t len = strlen(buf);
+    if (len && buf[len - 1] == '\n') len--;
+    return mk_str(buf, len);
+}
+
+/* (cljc/isatty*) → true when stdout is a terminal (color/prompt gating). */
+static Cljc *prim_isatty(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    return mk_bool(isatty(1));
+}
+
 /* (cljc/now-ms*) → monotonic milliseconds as a double (for `time`). */
 static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
@@ -5924,6 +5947,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
     cljc_define_native(e, "cljc/epoch*", prim_epoch);
     cljc_define_native(e, "cljc/md5*", prim_md5);
+    cljc_define_native(e, "read-line", prim_read_line);
+    cljc_define_native(e, "flush", prim_flush);
+    cljc_define_native(e, "cljc/isatty*", prim_isatty);
     cljc_define_native(e, "cljc/dir?*",  prim_dir_p);
     cljc_define_native(e, "cljc/list-dir*", prim_list_dir);
     cljc_define_native(e, "tcp/listen", prim_tcp_listen);
@@ -7060,6 +7086,8 @@ static void usage(FILE *f) {
         "                             dir: any .clj saved in the tree is shown\n"
         "  notebook <file> -o <html>  static notebook build\n"
         "  test [files...]            load files, run deftests, exit 1 on failure\n"
+        "  judge [-a|-i] <files...>   inline snapshot tests: fill in/verify\n"
+        "                             (test expr) results; -a apply, -i review\n"
         "  lint [files...]            reader syntax check, full error rendering\n"
         "  bundle <file> <out>        script + runtime → one native binary\n"
         "  version                    print version\n"
@@ -7194,6 +7222,22 @@ int main(int argc, char **argv) {
         for (int i = 2; i < argc; i++) bad += lint_file(env, argv[i]);
         if (!bad) printf("%d file%s, no reader errors\n", argc - 2, argc == 3 ? "" : "s");
         return bad ? 1 : 0;
+    }
+    if (!strcmp(cmd, "judge")) {
+        /* inline snapshot tests; judge/main returns the exit code (2 on
+         * load errors so editors can tell them from test failures) */
+        set_args(env, argc, argv, 2);
+        if (setjmp(err_jmp) != 0) { print_error(); return 2; }
+        const char *prog = "(load-file \"judge.clj\") (judge/main)";
+        Cljc *last = NIL;
+        while (*prog) {
+            skip_ws(&prog);
+            if (!*prog) break;
+            Cljc *f2 = read_form(&prog);
+            if (!f2) break;
+            last = eval(env, f2);
+        }
+        return (last != NIL && last->tag == CLJC_INT) ? (int)last->as.i : 0;
     }
     if (!strcmp(cmd, "bundle")) {
         if (argc != 4) { fputs("usage: cljc bundle <script.clj> <output>\n", stderr); return 1; }

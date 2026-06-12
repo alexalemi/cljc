@@ -461,11 +461,23 @@ required by conservative stack scanning, same as Boehm GC).
     2023 p18 keyword-coercion, 2016 p19 pop-empty-vector, 2017 p16
     dumped-core under timeout, 2 huge-apply value-stack overflows
     (apply str on multi-million-char seqs).
-35. NEXT: JUDGE CLONE (user request) — inline snapshot testing à la
-    github.com/ianthehenry/judge (Janet): `(test (+ 1 2))` runs and
-    REWRITES the source file inserting/correcting the expected value;
-    interactive accept/reject of diffs. Would land as `cljc judge
-    [files]`. Study the upstream README/design first.
+35. ~~Judge clone~~ ✅ done 2026-06-11 — `cljc judge [-a|-i] <files...>`,
+    judge.clj battery (~290 lines). Macros test / test-error /
+    test-stdout / trust are NO-OPS in normal runs (files need
+    (require '[judge :refer [test ...]]) and carry zero runtime cost);
+    the runner reads the source itself, tracks each top-level form's
+    char extents (string/comment-aware scanner) plus depth-1 element
+    extents inside judge forms, evals everything in order, and splices
+    corrected snapshots into the ORIGINAL text — formatting never
+    reflows, only the expected value is replaced (upstream's minimal-
+    rewrite rule). Seq snapshots are quoted ('(1 2 3)) so they read
+    back as data. Default mode writes file.clj.tested + a red/green
+    diff; -a applies in place; -i prompts y/n/q per correction (y
+    default). trust never re-evals once filled. Exit 0 green / 1
+    corrections / 2 load error (editor-distinguishable, like upstream).
+    New natives: read-line, flush, cljc/isatty*.
+    LATER MAYBE: deftest grouping, test-macro with gensym
+    stabilization, FILE:LINE targets, --name filters.
     (c) numerics/dates/fork-pmap menu from the bb-gap analysis.
 36. **Performance later, maybe**: args-as-array calling convention,
     NaN-boxing, bytecode VM. Only if a real workload demands it.

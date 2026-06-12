@@ -2108,6 +2108,7 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
  * compiled bodies are coarser (no per-subform eval_stack frames). */
 
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro);
+static void print_to(SBuf *sb, Cljc *v, bool readably);
 
 enum {
     VOP_NIL, VOP_TRUE, VOP_FALSE, VOP_CONST, VOP_SYM,
@@ -2192,15 +2193,73 @@ static bool vm_special_name(const char *s) {
     return false;
 }
 
-/* resolve without erroring (compile-time macro lookup) */
+/* Compile-time macro lookup: NULL when the head is shadowed by any
+ * local in the compile env's chain (closure captures included — the
+ * lexical shadow structure is identical for every closure sharing the
+ * arities), else the full root resolution (home_ns + alias paths, the
+ * same ones resolve_symbol takes) without erroring. */
 static Cljc *vm_resolve_maybe(CljcEnv *env, Cljc *sym) {
+    const char *name = sym->as.symc.name;
+    CljcEnv *e = env;
+    for (; e->parent; e = e->parent)
+        if (env_local_find(e, name)) return NULL;     /* local shadows */
     Binding *cb = sym->as.symc.root_cache;
     if (cb) return cb->value;
-    CljcEnv *root = env;
-    while (root->parent) root = root->parent;
-    for (Binding *b = root->bindings; b; b = b->next)
-        if (b->name == sym->as.symc.name) return b->value;
+    if (sym->as.symc.home_ns) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s/%s", sym->as.symc.home_ns, name);
+        const char *qual = intern(buf, strlen(buf));
+        for (Binding *b = e->bindings; b; b = b->next)
+            if (b->name == qual) return b->value;
+    }
+    for (Binding *b = e->bindings; b; b = b->next)
+        if (b->name == name) return b->value;
+    {
+        const char *slash = strchr(name, '/');
+        if (slash && slash != name) {
+            const char *pre = intern(name, (size_t)(slash - name));
+            for (int i = 0; i < n_aliases; i++) {
+                if (alias_table[i] == pre) {
+                    char buf[256];
+                    snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
+                    const char *qual = intern(buf, strlen(buf));
+                    const char *bare = intern(slash + 1, strlen(slash + 1));
+                    for (Binding *b = e->bindings; b; b = b->next)
+                        if (b->name == qual) return b->value;
+                    for (Binding *b = e->bindings; b; b = b->next)
+                        if (b->name == bare) return b->value;
+                    break;
+                }
+            }
+        }
+    }
     return NULL;
+}
+
+/* Does this form contain a (recur ...) that would belong to the
+ * enclosing loop? Skips nested fn/loop/lazy-seq (they own their recur).
+ * Compile-time only — guards VOP_EVAL emission inside compiled loops. */
+static bool vmc_contains_recur(Cljc *form) {
+    static const char *S_R, *S_F, *S_L, *S_LZ;
+    if (!S_R) {
+        S_R = intern("recur", 5); S_F = intern("fn", 2);
+        S_L = intern("loop", 4);  S_LZ = intern("lazy-seq", 8);
+    }
+    if (form == NIL || form == NULL) return false;
+    if (form->tag == CLJC_SYMBOL) return form->as.sym == S_R;
+    if (form->tag == CLJC_VECTOR) {
+        for (size_t i = 0; i < vec_len(form); i++)
+            if (vmc_contains_recur(vec_nth(form, i))) return true;
+        return false;
+    }
+    if (form->tag != CLJC_LIST) return false;
+    Cljc *h = form->as.cons.head;
+    if (h != NIL && h->tag == CLJC_SYMBOL &&
+        (h->as.sym == S_F || h->as.sym == S_L || h->as.sym == S_LZ))
+        return false;
+    for (Cljc *l = form; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+        if (vmc_contains_recur(l->as.cons.head)) return true;
+    return false;
 }
 
 static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form);
@@ -2259,7 +2318,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
     }
     Cljc *head = form->as.cons.head;
     Cljc *rest = form->as.cons.tail;
-    if (head != NIL && head->tag == CLJC_SYMBOL && !vmc_local_p(c, head->as.sym)) {
+    if (head != NIL && head->tag == CLJC_SYMBOL) {
         const char *s = head->as.sym;
         static const char *S_QUOTE, *S_IF, *S_DO, *S_LET, *S_FN, *S_LOOP,
                           *S_RECUR, *S_AND, *S_OR, *S_WHEN, *S_COND, *S_LAZY;
@@ -2276,6 +2335,8 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             return;
         }
         if (s == S_IF) {
+            if (rest == NIL || rest->tag != CLJC_LIST ||
+                rest->as.cons.tail == NIL) { c->ok = false; return; }
             Cljc *cond = rest->as.cons.head;
             Cljc *then = rest->as.cons.tail != NIL ? rest->as.cons.tail->as.cons.head : NIL;
             Cljc *els = rest->as.cons.tail != NIL && rest->as.cons.tail->as.cons.tail != NIL
@@ -2291,6 +2352,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
         }
         if (s == S_DO) { vmc_body(c, cenv, rest); return; }
         if (s == S_WHEN) {
+            if (rest == NIL || rest->tag != CLJC_LIST) { c->ok = false; return; }
             vmc_form(c, cenv, rest->as.cons.head);
             uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
             vmc_body(c, cenv, rest->as.cons.tail);
@@ -2332,7 +2394,8 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
                 c->code[jf] = VOP_JMPF | (c->ncode << 8);
                 a = a->as.cons.tail->as.cons.tail;
             }
-            vmc_emit(c, VOP_NIL, 0);
+            if (a != NIL && a->tag == CLJC_LIST) { c->ok = false; return; }
+            vmc_emit(c, VOP_NIL, 0);                /* odd clause: eval errors */
             for (int i = 0; i < ne; i++)
                 c->code[ends[i]] = VOP_JMP | (c->ncode << 8);
             return;
@@ -2411,7 +2474,6 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
                 if (c->loop_depth > 0xff) { c->ok = false; return; }
                 vmc_emit(c, VOP_REBIND,
                          vmc_const(c, c->loop_names) | ((uint32_t)c->loop_depth << 16));
-                c->code[c->ncode - 1] |= 0;   /* arg layout: k | depth<<16 */
                 vmc_emit(c, VOP_JMP, (uint32_t)c->loop_pc);
             } else {
                 vmc_emit(c, VOP_RECURFN, n);
@@ -2434,11 +2496,18 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             return;
         }
         if (vm_special_name(s)) {            /* def/try/quasiquote/ns/... */
+            /* a recur for OUR loop inside a tree-walked subform would
+             * surface as a sentinel value and rebind the fn params —
+             * tree-walk the whole body instead (rare; (try (recur))
+             * is illegal in JVM Clojure anyway) */
+            if (c->loop_pc >= 0 && vmc_contains_recur(form)) { c->ok = false; return; }
             vmc_emit(c, VOP_EVAL, vmc_const(c, form));
             return;
         }
-        /* compile-time macro expansion, spliced like eval does */
-        Cljc *mfn = vm_resolve_maybe(cenv, head);
+        /* compile-time macro expansion, spliced like eval does;
+         * any local shadowing the name suppresses it (vm_resolve_maybe
+         * scans the compile env chain AND c's own body locals below) */
+        Cljc *mfn = vmc_local_p(c, s) ? NULL : vm_resolve_maybe(cenv, head);
         if (mfn && mfn->tag == CLJC_FN && mfn->as.fn.is_macro) {
             size_t base = vsp;
             for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
@@ -2454,7 +2523,9 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             return;
         }
     }
-    /* ordinary call: head expr, args, CALL n */
+    /* ordinary call: head expr, args, CALL n. The arg also carries the
+     * call-site form's const index so a callee that turns out to be a
+     * macro at runtime (forward ref, fn->macro redef) deopts to eval. */
     {
         uint32_t n = 0;
         vmc_form(c, cenv, head);
@@ -2462,7 +2533,8 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             vmc_form(c, cenv, a->as.cons.head);
             n++;
         }
-        vmc_emit(c, VOP_CALL, n);
+        if (n > 0xff) { c->ok = false; return; }
+        vmc_emit(c, VOP_CALL, n | (vmc_const(c, form) << 8));
     }
 }
 
@@ -2482,6 +2554,16 @@ static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
     vmc_body(&c, cenv, body);
     vmc_emit(&c, VOP_RET, 0);
     if (!c.ok || c.nlocals > 256 || c.ncode > 0xffffff || c.nconst > 0xffff) {
+        if (getenv("CLJC_VM_LOG")) {
+            fprintf(stderr, "[vm] compile bail: ");
+            for (Cljc *b = body; b && b->tag == CLJC_LIST; b = b->as.cons.tail) {
+                SBuf sb = {0};
+                print_to(&sb, b->as.cons.head, true);
+                if (sb.data) { fwrite(sb.data, 1, sb.len > 80 ? 80 : sb.len, stderr); free(sb.data); }
+                break;
+            }
+            fputc('\n', stderr);
+        }
         free(c.code); free(c.consts);
         vsp = base;
         return NULL;
@@ -2500,7 +2582,11 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
     Cljc **K = chunk->as.chunk.consts;
     uint32_t pc = 0;
     size_t base = vsp;
-    /* volatile: env must stay visible to the conservative GC scan */
+    /* volatile: env and the chunk itself must stay visible to the
+     * conservative GC scan — code/K are interior malloc pointers the
+     * scan can't see, so the chunk cell is their only root here. */
+    Cljc * volatile chunk_keep = chunk;
+    (void)chunk_keep;
     CljcEnv * volatile env_keep = env_in;
     CljcEnv *env = env_in;
     for (;;) {
@@ -2524,9 +2610,24 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
             case VOP_POPENV: env = env->parent; env_keep = env; break;
             case VOP_POP:    vsp--; break;
             case VOP_CALL: {
-                Cljc *f = vstack[vsp - a - 1];
-                Cljc *r = apply(env, f, &vstack[vsp - a], (int)a);
-                vsp -= a + 1;
+                uint32_t n = a & 0xff;
+                Cljc *f = vstack[vsp - n - 1];
+                Cljc *r;
+                if (f != NIL && f->tag == CLJC_FN && f->as.fn.is_macro) {
+                    /* late-resolved macro: deopt to eval of the source
+                     * form (expands + splices, same as the tree-walk) */
+                    if (getenv("CLJC_VM_LOG")) {
+                        SBuf sb = {0};
+                        print_to(&sb, K[a >> 8], true);
+                        fprintf(stderr, "[vm] macro deopt: %.60s\n", sb.data ? sb.data : "");
+                        free(sb.data);
+                    }
+                    vsp -= n + 1;
+                    r = eval(env, K[a >> 8]);
+                } else {
+                    r = apply(env, f, &vstack[vsp - n], (int)n);
+                    vsp -= n + 1;
+                }
                 vpush(r);
                 break;
             }
@@ -2614,11 +2715,15 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
             if (!chosen) cljc_error("no matching arity for %d args", nargs);
             CljcEnv *call = env_new(fn->as.fn.env);
             bind_params(call, chosen->as.cons.head, argv, nargs);
-            /* first call compiles the body; failures pin TRUE = tree-walk */
+            /* first call compiles the body; failures pin TRUE = tree-walk.
+             * TRUE is pinned BEFORE compiling: a throw mid-compilation
+             * (macro expander erroring) must not retry-and-leak the
+             * compiler's buffers on every subsequent call. */
             if (chosen->meta == NULL) {
+                chosen->meta = TRUE;
                 Cljc *ch = vm_compile(call, chosen->as.cons.head,
                                       chosen->as.cons.tail);
-                chosen->meta = ch ? ch : TRUE;
+                if (ch) chosen->meta = ch;
             }
             Cljc *result = chosen->meta->tag == CLJC_CHUNK
                 ? vm_run(call, chosen->meta)
@@ -3859,7 +3964,14 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
         if (r == NIL || r->tag == CLJC_LIST || r->tag == CLJC_LAZY) {
             Cljc *prev = r;                         /* lazy: cons keeps it lazy */
             r = mk_cons(x, r);                      /* lists grow at the front */
-            if (prev != NIL && prev->tag == CLJC_LIST) r->meta = prev->meta;
+            if (prev != NIL && prev->tag == CLJC_LIST && prev->meta != NULL) {
+                /* never propagate the internal **arities** cache marker */
+                Cljc *m = prev->meta;
+                bool arities = m->tag == CLJC_LIST &&
+                               m->as.cons.head->tag == CLJC_SYMBOL &&
+                               strcmp(m->as.cons.head->as.sym, "**arities**") == 0;
+                if (!arities) r->meta = m;
+            }
         } else if (r->tag == CLJC_VECTOR) {
             Cljc *prev = r;
             r = vec_conj1(r, x);                    /* vectors grow at the back */

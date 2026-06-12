@@ -550,6 +550,30 @@ required by conservative stack scanning, same as Boehm GC).
     dance file that once SEGV'd the GC) now PASSES inside 60s.
     Error-trace granularity inside compiled bodies is coarser (no
     per-subform frames) — documented divergence.
+    BUGHUNT PASS (2026-06-12, two adversarial review agents + manual):
+    six real bugs fixed before merge — (1) loop-recur escaping through a
+    VOP_EVAL'd try/binding rebound the FN params (silent wrong loop or
+    infinite loop; compiler now tree-walks loops containing such forms
+    via vmc_contains_recur); (2) vm_resolve_maybe missed home_ns/alias
+    macro resolution AND closure-captured locals shadowing macros — the
+    misfired expansion was even spliced into shared source (now full
+    resolution + cenv local scan); (3) late-resolved macros (forward
+    refs, fn→macro redefs) were applied as plain fns — VOP_CALL carries
+    the call-site form const and deopts to eval when the callee is a
+    macro; (4) compile-error retry leak (meta=TRUE pinned before
+    compiling); (5) locals shadowing special forms diverged from eval
+    (compiler now matches eval: specials win); (6) malformed if/when/
+    cond compiled to silent nil (now bail to eval's errors). Plus
+    chunk_keep volatile (chunk's only root could be optimized away) and
+    conj no longer propagates the **arities** marker. The bughunt also
+    exposed that the PRE-fix VM mis-compiled 2017 d10's knot-hash
+    (unresolved symbol, test silently failed) — its "1.6s" was broken-
+    fast; the honest VM time is 3.7s vs 6.3s tree-walk.
+    KNOWN GAP: deftest failures don't fail script exit codes, so sweep
+    PASS counts can hide deftest regressions — sweep should also grep
+    "0 failed". Non-tail recur in compiled loops leaks a vstack slot
+    per iteration (degenerate programs only; eval treats it as an inert
+    value — divergence).
     Next perf ideas if ever needed: compile-time local slot indices
     (skip env scan), direct-threaded dispatch, apply fast path.
 

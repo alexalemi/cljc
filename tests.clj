@@ -1364,4 +1364,23 @@
 (assert= '(2 3 4) (map inc (byte-array [1 2 3])))
 (assert= [7 8] (vec (int-array [7 8])))
 
+; VM bughunt regressions (vm branch review, 2026-06-12)
+(defmacro cljc-vmtest-mym [a] :macro)
+(def cljc-vmtest-f (let [cljc-vmtest-mym (fn [a] :local)] (fn [] (cljc-vmtest-mym 1))))
+(assert= :local (cljc-vmtest-f))                       ; closure local shadows macro
+(defn cljc-vmtest-g [] (loop [x 0] (if (< x 3) (try (recur (inc x)) (catch Exception e :c)) x)))
+(assert= 3 (cljc-vmtest-g))                            ; recur through try in loop
+(defn cljc-vmtest-h [a] (loop [x 0] (if (< x 3) (try (recur (inc x))) [a x])))
+(assert= [5 3] (cljc-vmtest-h 5))
+(defn cljc-vmtest-fwd [x] (if x (cljc-vmtest-mm 1 2) :no))
+(assert= :no (cljc-vmtest-fwd false))                  ; compiles the chunk
+(defmacro cljc-vmtest-mm [a b] (list '+ a b 100))
+(assert= 103 (cljc-vmtest-fwd true))                   ; late macro deopts to eval
+(def cljc-vmtest-r1 (let [cljc-vmtest-twice (fn [x] (* 10 x))] (fn [y] (cljc-vmtest-twice y))))
+(defmacro cljc-vmtest-twice [x] (list '* 5 x))
+(assert= 50 (cljc-vmtest-r1 5))                        ; captured local beats root macro
+(defn cljc-vmtest-or [or] (or 1 2))
+(assert= 1 (cljc-vmtest-or (fn [a b] :param)))         ; special form beats param (eval parity)
+(assert= :threw (try (do ((fn [] (cond :x)))) (catch Exception e :threw)))  ; odd cond errors
+
 (println "tests complete")

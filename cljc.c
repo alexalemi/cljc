@@ -484,7 +484,10 @@ typedef struct EnvBlock { struct EnvBlock *next; size_t used; CljcEnv envs[ENV_B
 static EnvBlock *env_blocks;
 static CljcEnv *env_freelist;      /* linked through ->parent */
 
-#define GC_MIN_THRESHOLD 65536
+/* Floor on allocations between collections. Tight loops with small live
+ * sets are collection-bound: at 64k this was thousands of collections on
+ * AoC hot loops (~38% of runtime). ~1M cells ≈ tens of MB of slack. */
+#define GC_MIN_THRESHOLD (1u << 20)
 static size_t gc_allocs, gc_threshold = GC_MIN_THRESHOLD;
 static size_t gc_freed_last;
 static bool gc_stress;             /* CLJC_GC_STRESS=1: collect every 512 allocs */
@@ -574,9 +577,30 @@ static void gc_mark_env(CljcEnv *e) {
     gc_drain();
 }
 
+/* Global pool address range, refreshed at the start of each collection:
+ * an O(1) reject for the conservative scan — most stack words are not
+ * pool pointers, and the per-word block walk was ~13% of runtime. */
+static uintptr_t gc_pool_lo = UINTPTR_MAX, gc_pool_hi;
+
+static void gc_refresh_bounds(void) {
+    gc_pool_lo = UINTPTR_MAX;
+    gc_pool_hi = 0;
+    for (CellBlock *b = cell_blocks; b; b = b->next) {
+        uintptr_t lo = (uintptr_t)b->cells, hi = (uintptr_t)(b->cells + b->used);
+        if (lo < gc_pool_lo) gc_pool_lo = lo;
+        if (hi > gc_pool_hi) gc_pool_hi = hi;
+    }
+    for (EnvBlock *b = env_blocks; b; b = b->next) {
+        uintptr_t lo = (uintptr_t)b->envs, hi = (uintptr_t)(b->envs + b->used);
+        if (lo < gc_pool_lo) gc_pool_lo = lo;
+        if (hi > gc_pool_hi) gc_pool_hi = hi;
+    }
+}
+
 /* If w points into a pool block (interior pointers included), mark the
  * containing object. */
 static void gc_mark_conservative(uintptr_t w) {
+    if (w < gc_pool_lo || w >= gc_pool_hi) return;
     for (CellBlock *b = cell_blocks; b; b = b->next) {
         uintptr_t lo = (uintptr_t)b->cells, hi = (uintptr_t)(b->cells + b->used);
         if (w >= lo && w < hi) { gc_mark(&b->cells[(w - lo) / sizeof(Cljc)]); return; }
@@ -607,6 +631,7 @@ static void gc_scan_range(void *lo_, void *hi_) {
 
 static void gc_collect(void) {
     gc_allocs = 0;
+    gc_refresh_bounds();   /* O(1) reject range for the conservative scan */
 
     /* Flush callee-saved registers onto the stack so the scan sees them. */
     jmp_buf regs;
@@ -677,7 +702,10 @@ static void gc_collect(void) {
     }
 
     gc_freed_last = freed;
-    gc_threshold = live * 2 > GC_MIN_THRESHOLD ? live * 2 : GC_MIN_THRESHOLD;
+    /* 4x headroom: GC was ~60% of runtime on allocation-heavy workloads
+     * at 2x (AoC profile, 2026-06). Mark cost scales with live data, so
+     * collecting half as often nearly halves GC time for 2x peak waste. */
+    gc_threshold = live * 4 > GC_MIN_THRESHOLD ? live * 4 : GC_MIN_THRESHOLD;
 }
 
 static void maybe_gc(void) {
@@ -2714,6 +2742,18 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     vpush(a->as.cons.head);    /* unevaluated forms */
                 Cljc *expansion = apply(env, fn, &vstack[base], (int)(vsp - base));
                 vsp = base;
+                /* Splice the expansion into the call site: each macro use
+                 * expands ONCE (like compiled Clojure — re-expansion was
+                 * ~5%+ of hot loops). Redefining a macro doesn't reach
+                 * already-spliced sites, matching JVM compiled code. */
+                if (expansion != NIL && expansion->tag == CLJC_LIST) {
+                    form->as.cons.head = expansion->as.cons.head;
+                    form->as.cons.tail = expansion->as.cons.tail;
+                } else {
+                    Cljc *one = mk_cons(expansion, NIL);  /* (do <atom>) */
+                    form->as.cons.head = mk_sym(intern("do", 2));
+                    form->as.cons.tail = one;
+                }
                 return eval(env, expansion);
             }
             for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)

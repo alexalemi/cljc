@@ -450,9 +450,19 @@ required by conservative stack scanning, same as Boehm GC).
     SWEEP with the 3.2x binary (2026-06-12): **99 pass / 12 fail /
     40 timeout** — measured, matching the estimate. The 40 remaining
     timeouts are brute-force minute+ puzzles needing >>3x (bytecode VM
-    territory). NOTE: 2015 d20 and 2017 d22 now FAIL with no error
-    output (were timeouts) — likely OOM-killed under the 4x/1M GC
-    headroom on those workloads; investigate when doing GC work next.
+    territory). The 2015 d20 / 2017 d22 "OOM" investigation
+    (2026-06-12) found a REAL BUG, not GC policy: vector-pattern
+    DESTRUCTURING called to_seq, fully realizing the value — a
+    self-recursive sieve over (range) ran away to 17GB before ever
+    returning. destructure now steps with the seq1 cursor; lazy/
+    infinite seqs destructure one element per binding. 2015 d20 passes
+    both parts at 2.2GB. Also: gc_extra_bytes counter (string buffers,
+    HAMT kid arrays, vector tails) with a 256MB cap backs up the
+    cell-count threshold; CLJC_GC_LOG=1 prints live/freed + tag
+    histogram per collection. MUTABLE ARRAYS: int-array/byte-array/
+    long-array/object-array are transient vectors (assoc! mutates in
+    place), aget/aset/alength on top; TVECs are seqable. 2017 d5 and
+    2021 d16 pass. → 102 passing.
     (Previous tally after batch 7, 2026-06-11: 83/28/40.)
     Batch 5 added MD5 native + interop shims (MessageDigest idiom runs
     verbatim, .indexOf, Integer/parseInt radix, Character/digit). Batch 6:

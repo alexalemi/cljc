@@ -1349,4 +1349,19 @@
 (assert= "42" (Integer/toString 42))
 (assert= "0" (Integer/toString 0 2))
 
+; lazy param destructuring (was: to_seq realized infinite seqs — 17GB)
+(defn cljc-lazy-destructure-probe [[x & xs]] (cons x (lazy-seq (cljc-lazy-destructure-probe xs))))
+(assert= '(0 1 2) (take 3 (cljc-lazy-destructure-probe (range))))
+(assert= [1 2 '(3 4)] (let [[a b & c] [1 2 3 4]] [a b c]))
+(assert= [1 nil] (let [[a b] [1]] [a b]))
+
+; mutable arrays as transients
+(def cljc-arr (int-array 5))
+(assert= 0 (aget cljc-arr 3))
+(assert= 99 (aset cljc-arr 2 99))
+(assert= 99 (aget cljc-arr 2))
+(assert= 5 (alength cljc-arr))
+(assert= '(2 3 4) (map inc (byte-array [1 2 3])))
+(assert= [7 8] (vec (int-array [7 8])))
+
 (println "tests complete")

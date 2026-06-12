@@ -291,8 +291,14 @@ static Cljc *mk_kw(const char *s) {   /* s is already interned */
     kw_table[h] = n;
     return v;
 }
+static size_t gc_extra_bytes;   /* string buffer bytes since last GC —
+                                 * a 1MB string is ONE gc_allocs tick, so
+                                 * string churn must trigger by bytes too
+                                 * (a 17GB runaway found the gap) */
+
 static Cljc *mk_str(const char *s, size_t n) {
     Cljc *v = alloc(CLJC_STRING);
+    gc_extra_bytes += n;
     v->as.str = xmalloc(n + 1);
     memcpy(v->as.str, s, n);
     v->as.str[n] = '\0';
@@ -659,6 +665,7 @@ static void gc_scan_range(void *lo_, void *hi_) {
 
 static void gc_collect(void) {
     gc_allocs = 0;
+    gc_extra_bytes = 0;
     gc_refresh_bounds();   /* O(1) reject range for the conservative scan */
 
     /* Flush callee-saved registers onto the stack so the scan sees them. */
@@ -731,14 +738,29 @@ static void gc_collect(void) {
     }
 
     gc_freed_last = freed;
+    if (getenv("CLJC_GC_LOG")) {
+        size_t tagn[24] = {0};
+        for (CellBlock *b = cell_blocks; b; b = b->next)
+            for (size_t i = 0; i < b->used; i++)
+                if (b->cells[i].tag != CLJC_FREE && b->cells[i].tag < 24)
+                    tagn[b->cells[i].tag]++;
+        fprintf(stderr, "[gc] live=%zu freed=%zu", live, freed);
+        for (int t = 0; t < 24; t++)
+            if (tagn[t] > 100000) fprintf(stderr, " tag%d=%zu", t, tagn[t]);
+        fprintf(stderr, "\n");
+    }
     /* 4x headroom: GC was ~60% of runtime on allocation-heavy workloads
      * at 2x (AoC profile, 2026-06). Mark cost scales with live data, so
      * collecting half as often nearly halves GC time for 2x peak waste. */
     gc_threshold = live * 4 > GC_MIN_THRESHOLD ? live * 4 : GC_MIN_THRESHOLD;
 }
 
+#define GC_BYTES_CAP (256u << 20)   /* string-churn slack ceiling: 256MB */
+
 static void maybe_gc(void) {
-    if (++gc_allocs >= (gc_stress ? 512 : gc_threshold)) gc_collect();
+    if (++gc_allocs >= (gc_stress ? 512 : gc_threshold) ||
+        gc_extra_bytes >= GC_BYTES_CAP)
+        gc_collect();
 }
 
 /* ───── Hashing ──────────────────────────────────────────────────────── */
@@ -838,6 +860,7 @@ static Cljc **tail_freelist[33];
 
 static Cljc **tail_alloc(uint8_t n) {
     if (n == 0) n = 1;
+    gc_extra_bytes += sizeof(Cljc *) * n;   /* counted toward the byte cap */
     if (tail_freelist[n]) {
         Cljc **p = tail_freelist[n];
         tail_freelist[n] = (Cljc **)p[0];
@@ -856,6 +879,8 @@ static void tail_free(Cljc **p, uint8_t n) {
  * (no allocation in between), so a mid-fill GC can never trace garbage. */
 static Cljc *mk_hnode(uint32_t bitmap, uint16_t nkids, bool collision, uint32_t chash) {
     Cljc *n = alloc(CLJC_HNODE);
+    gc_extra_bytes += sizeof(Cljc *) * (nkids ? nkids : 1);  /* kid arrays
+        dodge gc_allocs ticks — HAMT churn built 17GB of slack unseen */
     n->as.hnode.kids = nkids == 32 ? chunk32_alloc()
                                    : xmalloc(sizeof(Cljc *) * (nkids ? nkids : 1));
     memset(n->as.hnode.kids, 0, sizeof(Cljc *) * (nkids ? nkids : 1));
@@ -1889,7 +1914,10 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
     if (pattern != NIL && pattern->tag == CLJC_VECTOR) {
         static const char *KW_AS;
         if (!KW_AS) KW_AS = intern("as", 2);
-        Cljc *s = value == NIL ? NIL : to_seq(value);
+        /* seq1 cursor, NOT to_seq: [[x & xs]] on an infinite lazy seq must
+         * realize one element per binding — to_seq realized the whole seq
+         * (a self-recursive sieve def ran away to 17GB). */
+        Cljc *s = value == NIL ? NIL : seq1(value);
         for (size_t i = 0; i < vec_len(pattern); i++) {
             Cljc *pe = vec_nth(pattern, i);
             if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) {
@@ -1905,7 +1933,7 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
                 continue;
             }
             destructure(scope, pe, s == NIL ? NIL : s->as.cons.head);
-            if (s != NIL) s = s->as.cons.tail;
+            if (s != NIL) s = seq1(s->as.cons.tail);
         }
         return;
     }
@@ -3593,7 +3621,7 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
-    if (v->tag == CLJC_VECTOR) {
+    if (v->tag == CLJC_VECTOR || v->tag == CLJC_TVEC) {  /* arrays seq too */
         Cljc *out = NIL, **t = &out;
         for (size_t i = 0; i < vec_len(v); i++) {
             *t = mk_cons(vec_nth(v, i), NIL);
@@ -5860,6 +5888,14 @@ static const char *PRELUDE =
     "(def Long/toString Integer/toString)\n"
     "(defn Integer/toBinaryString [n] (Integer/toString n 2))\n"
     "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
+    /* mutable arrays, as transient vectors (assoc! mutates in place) */
+    "(defn int-array [x] (transient (vec (if (int? x) (repeat x 0) x))))\n"
+    "(def byte-array int-array)\n"
+    "(def long-array int-array)\n"
+    "(def object-array int-array)\n"
+    "(defn aget [a i] (a i))\n"
+    "(defn aset [a i v] (assoc! a i v) v)\n"
+    "(defn alength [a] (count a))\n"
     /* image-writing stubs: visualization code runs, no PNGs produced */
     "(def BufferedImage/TYPE_3BYTE_BGR 5)\n"
     "(def BufferedImage/TYPE_INT_RGB 1)\n"

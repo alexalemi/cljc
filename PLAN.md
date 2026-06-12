@@ -479,8 +479,24 @@ required by conservative stack scanning, same as Boehm GC).
     LATER MAYBE: deftest grouping, test-macro with gensym
     stabilization, FILE:LINE targets, --name filters.
     (c) numerics/dates/fork-pmap menu from the bb-gap analysis.
-36. **Performance later, maybe**: args-as-array calling convention,
-    NaN-boxing, bytecode VM. Only if a real workload demands it.
+36. PERFORMANCE (in progress 2026-06-12; benchmark set = the AoC corpus
+    timeouts). ROUND 1 ✅ ~2.7x: gprof showed GC at 40-64% of runtime —
+    (a) gc threshold 2x→4x live and floor 64k→1M allocs (tight loops
+    were collection-bound), (b) O(1) global-bounds reject in the
+    conservative scan (the per-stack-word block walk was ~13%),
+    (c) MACRO EXPANSION SPLICING: call sites mutate into their expansion
+    on first eval — re-expansion (qq_expand) ran millions of times in
+    hot loops; divergence: redefining a macro doesn't reach
+    already-evaluated sites (same as JVM compiled code).
+    2015 d9 12.8→4.7s, d13 12.6→4.3s, 2017 d10 18.5→7.1s.
+    FAILED EXPERIMENT (do not retry naively): classify-once
+    special-form byte on symbol cells was 5-8% SLOWER than the plain
+    23-pointer-compare chain — the branch predictor already eats it.
+    ROUND 2 candidates (post-splice profile: eval_inner 31%,
+    binding_alloc 18% at 68M calls, apply 7%, env_alloc+destructure 6%):
+    the args-as-array calling convention / inline env slots is now the
+    clear next cut — every call allocates env + one Binding node per
+    param. Then NaN-boxing / bytecode VM if still needed.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

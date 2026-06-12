@@ -1298,4 +1298,22 @@
 (assert= 0 (:exit (sh "./cljc /tmp/cljc-judge-e2e.clj")))
 (sh "rm -f /tmp/cljc-judge-e2e.clj /tmp/cljc-judge-e2e.clj.tested")
 
+; def docstrings, get-on-string, FIFO queue, lazy n-coll mapcat
+(def cljc-doc-probe "the docstring" 42)
+(assert= 42 cljc-doc-probe)
+(def cljc-str-probe "just-a-value")
+(assert= "just-a-value" cljc-str-probe)
+(assert= "b" (get "abc" 1))
+(assert= nil (get "abc" 9))
+(assert= :d (get "abc" 9 :d))
+(assert= 1 (peek (conj clojure.lang.PersistentQueue/EMPTY 1 2 3)))     ; FIFO front
+(assert= 2 (peek (pop (conj clojure.lang.PersistentQueue/EMPTY 1 2 3))))
+(assert= 3 (count (conj clojure.lang.PersistentQueue/EMPTY 1 2 3)))
+(assert= '(:a 1 :b 2) (mapcat (fn [a b] [a b]) [:a :b] [1 2]))
+(assert= '(:r :u) (take 2 (mapcat (fn [a b] (repeat b a)) (cycle [:r :u]) (range 1 99))))
+; deep structures must not crash the GC mark (worklist, not recursion)
+(assert= 20000 (count (reduce (fn [acc i] (cons i (lazy-seq acc))) nil (range 20000))))
+(gc)
+(assert= true (vector? (vec (range 3))))
+
 (println "tests complete")

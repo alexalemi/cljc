@@ -28,6 +28,7 @@
 #include <sys/socket.h>  /* tcp primitives (clerk notebook server) */
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/resource.h>  /* setrlimit — main() raises the stack ceiling */
 
 #define CLJC_VERSION "0.1.0"
 #ifndef CLJC_SHAREDIR
@@ -493,57 +494,84 @@ static int gc_n_root_envs;
 
 static void gc_mark_env(CljcEnv *e);
 
-static void gc_mark(Cljc *v) {
-    while (v && !v->gcmark) {
-        if (v->tag == CLJC_FREE) return;
-        v->gcmark = 1;
-        if (v->meta) gc_mark(v->meta);
+/* Marking uses an explicit worklist, not C-stack recursion: a 10k-deep
+ * closure/env chain (long reduce over lazy pipelines) overflowed the C
+ * stack when gc_mark recursed (found by 2017 d16). Cells are marked when
+ * PUSHED, so each enters the worklist at most once. */
+static Cljc **mark_stack;
+static size_t mark_sp, mark_cap;
+
+static void mark_push(Cljc *v) {
+    if (!v || v->gcmark || v->tag == CLJC_FREE) return;
+    v->gcmark = 1;
+    if (mark_sp >= mark_cap) {
+        mark_cap = mark_cap ? mark_cap * 2 : 4096;
+        mark_stack = realloc(mark_stack, sizeof(Cljc *) * mark_cap);
+        if (!mark_stack) { fputs("gc: out of memory\n", stderr); exit(1); }
+    }
+    mark_stack[mark_sp++] = v;
+}
+
+static void mark_env_chain(CljcEnv *e) {
+    while (e && !e->gcmark && !e->gcfree) {
+        e->gcmark = 1;
+        for (Binding *b = e->bindings; b; b = b->next) mark_push(b->value);
+        e = e->parent;
+    }
+}
+
+static void gc_drain(void) {
+    while (mark_sp) {
+        Cljc *v = mark_stack[--mark_sp];
+        if (v->meta) mark_push(v->meta);
         switch (v->tag) {
             case CLJC_LIST:
-                gc_mark(v->as.cons.head);
-                v = v->as.cons.tail;      /* iterate tails: lists can be huge */
+                mark_push(v->as.cons.head);
+                mark_push(v->as.cons.tail);
                 break;
             case CLJC_VECTOR:
             case CLJC_TVEC:
-                for (size_t i = 0; i < v->as.vec.taillen; i++) gc_mark(v->as.vec.tail[i]);
-                v = v->as.vec.root;  /* NULL-safe */
+                for (size_t i = 0; i < v->as.vec.taillen; i++) mark_push(v->as.vec.tail[i]);
+                mark_push(v->as.vec.root);          /* NULL-safe */
                 break;
             case CLJC_MAP:
             case CLJC_SET:
-                v = v->as.map.root;  /* NULL-safe: loop condition handles it */
+                mark_push(v->as.map.root);          /* NULL-safe */
                 break;
             case CLJC_HNODE:
                 for (size_t i = 0; i < v->as.hnode.nkids; i++)
-                    gc_mark(v->as.hnode.kids[i]);  /* NULL slots skip in gc_mark */
-                return;
+                    mark_push(v->as.hnode.kids[i]); /* NULL slots skip */
+                break;
             case CLJC_RECUR: {
                 Cljc **vals = v->as.recur.spill ? (Cljc **)v->as.recur.iv[0] : v->as.recur.iv;
-                for (size_t i = 0; i < v->as.recur.n; i++) gc_mark(vals[i]);
-                return;
+                for (size_t i = 0; i < v->as.recur.n; i++) mark_push(vals[i]);
+                break;
             }
             case CLJC_FN:
-                gc_mark_env(v->as.fn.env);
-                v = v->as.fn.arities;  /* a list of cons pairs — generic list marking */
+                mark_env_chain(v->as.fn.env);
+                mark_push(v->as.fn.arities);
                 break;
             case CLJC_ATOM:
-                v = v->as.atom.value;
+                mark_push(v->as.atom.value);
                 break;
             case CLJC_LAZY:
-                gc_mark(v->as.lazy.thunk);
-                v = v->as.lazy.cached;
+                mark_push(v->as.lazy.thunk);
+                mark_push(v->as.lazy.cached);
                 break;
             default:
-                return;
+                break;
         }
     }
 }
 
+static void gc_mark(Cljc *v) {
+    mark_push(v);
+    gc_drain();
+}
+
 static void gc_mark_env(CljcEnv *e) {
-    while (e && !e->gcmark && !e->gcfree) {
-        e->gcmark = 1;
-        for (Binding *b = e->bindings; b; b = b->next) gc_mark(b->value);
-        e = e->parent;
-    }
+    mark_env_chain(e);
+    gc_drain();
 }
 
 /* If w points into a pool block (interior pointers included), mark the
@@ -2507,7 +2535,14 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         namef->as.cons.tail != NIL)
                         namef = namef->as.cons.tail->as.cons.head;
                     const char *name = sym_name(namef, "def");
-                    Cljc *val = eval(env, rest->as.cons.tail->as.cons.head);
+                    Cljc *valf = rest->as.cons.tail;
+                    /* (def name "docstring" value): skip the docstring */
+                    if (valf->as.cons.tail != NIL &&
+                        valf->as.cons.tail->tag == CLJC_LIST &&
+                        valf->as.cons.head != NIL &&
+                        valf->as.cons.head->tag == CLJC_STRING)
+                        valf = valf->as.cons.tail;
+                    Cljc *val = eval(env, valf->as.cons.head);
                     env_define_root(env_root(env), name, val);  /* def is always global */
                     return val;
                 }
@@ -3177,7 +3212,9 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
             r = mk_cons(x, r);                      /* lists grow at the front */
             if (prev != NIL && prev->tag == CLJC_LIST) r->meta = prev->meta;
         } else if (r->tag == CLJC_VECTOR) {
+            Cljc *prev = r;
             r = vec_conj1(r, x);                    /* vectors grow at the back */
+            if (prev->meta) r->meta = prev->meta;   /* queue tag etc. survive */
         } else if (r->tag == CLJC_SET) {
             r = set_conj(r, x);
         } else if (r->tag == CLJC_MAP) {
@@ -3306,6 +3343,10 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
     } else if (coll != NIL && coll->tag == CLJC_VECTOR && k->tag == CLJC_INT) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
             return vec_nth(coll, (size_t)k->as.i);
+    } else if (coll != NIL && coll->tag == CLJC_STRING && k->tag == CLJC_INT) {
+        size_t len = strlen(coll->as.str);   /* (get s i) => 1-char string */
+        if (k->as.i >= 0 && (size_t)k->as.i < len)
+            return mk_str(coll->as.str + k->as.i, 1);
     }
     return dflt;
 }
@@ -5622,9 +5663,11 @@ static const char *PRELUDE =
     "(defmacro deftype [tname fields & _]\n"
     "  `(defn ~(symbol (str tname \".\")) [~@fields]\n"
     "     ~(zipmap (map keyword fields) fields)))\n"
-    /* PersistentQueue, as a vector: conj at back; peek/pop on vectors act
-     * at the back too (LIFO not FIFO — divergence, noted in PLAN). */
-    "(def clojure.lang.PersistentQueue/EMPTY [])\n"
+    /* PersistentQueue: a vector tagged {:cljc/queue true} — conj at the
+     * back (meta survives), peek/pop at the FRONT (true FIFO; pop is
+     * O(n), fine at puzzle scale). */
+    "(def clojure.lang.PersistentQueue/EMPTY (with-meta [] {:cljc/queue true}))\n"
+    "(defn cljc/queue? [x] (and (vector? x) (get (meta x) :cljc/queue)))\n"
     /* Java-interop shims: enough for the canonical md5 idiom and common
      * static calls to run verbatim. Method symbols (.foo) are plain
      * globals here. */
@@ -6216,7 +6259,14 @@ CljcEnv *cljc_new_env(void) {
         "(def cljc/keep-impl keep)\n"
         "(defn keep ([f] (keep-xf f)) ([f c] (cljc/keep-impl f c)))\n"
         "(def cljc/mapcat-impl mapcat)\n"
-        "(defn mapcat ([f] (mapcat-xf f)) ([f c] (cljc/mapcat-impl f c)))\n"
+        "(defn mapcat\n"
+        "  ([f] (mapcat-xf f))\n"
+        "  ([f c] (cljc/mapcat-impl f c))\n"
+        "  ([f c1 c2 & more]\n"        /* lazy: works on infinite colls */
+        "   (let [cs (cons c1 (cons c2 more))]\n"
+        "     (lazy-seq (when (every? seq cs)\n"
+        "                 (concat (apply f (map first cs))\n"
+        "                         (apply mapcat f (map rest cs))))))))\n"
         "(def cljc/map-indexed-impl map-indexed)\n"
         "(defn map-indexed ([f] (map-indexed-xf f)) ([f c] (cljc/map-indexed-impl f c)))\n"
         "(def cljc/keep-indexed-impl keep-indexed)\n"
@@ -6260,14 +6310,16 @@ CljcEnv *cljc_new_env(void) {
          * smallest value. O(n) scan; backs clojure.data.priority-map. */
         "(def cljc/peek-impl peek)\n"
         "(defn peek [c]\n"
-        "  (if (map? c)\n"
-        "    (when (seq c) (apply min-key second (seq c)))\n"
-        "    (cljc/peek-impl c)))\n"
+        "  (cond\n"
+        "    (map? c) (when (seq c) (apply min-key second (seq c)))\n"
+        "    (cljc/queue? c) (first c)\n"            /* queue: FIFO front */
+        "    :else (cljc/peek-impl c)))\n"
         "(def cljc/pop-impl pop)\n"
         "(defn pop [c]\n"
-        "  (if (map? c)\n"
-        "    (dissoc c (first (peek c)))\n"
-        "    (cljc/pop-impl c)))\n");
+        "  (cond\n"
+        "    (map? c) (dissoc c (first (peek c)))\n"
+        "    (cljc/queue? c) (with-meta (vec (rest c)) {:cljc/queue true})\n"
+        "    :else (cljc/pop-impl c)))\n");
     /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
     cljc_eval_string(e,
         "(def cljc/multi-tables (atom {}))\n"
@@ -7156,6 +7208,16 @@ static int run_script(CljcEnv *env, const char *path) {
 }
 
 int main(int argc, char **argv) {
+    /* Deep lazy chains recurse eval on the C stack; give it room. The
+     * kernel grows the main stack on demand up to the soft limit, and
+     * the conservative GC only scans the used portion. (The iterative
+     * eval that removes this need is future bytecode-VM work.) */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+        rlim_t want = 1024ul * 1024 * 1024;   /* 1 GB */
+        if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) want = rl.rlim_max;
+        if (want > rl.rlim_cur) { rl.rlim_cur = want; setrlimit(RLIMIT_STACK, &rl); }
+    }
     cljc_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
     CljcEnv *env = cljc_new_env();
     const char *cmd = argc > 1 ? argv[1] : NULL;

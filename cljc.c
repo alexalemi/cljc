@@ -244,6 +244,11 @@ static void *xmalloc(size_t n) {
     if (!p) cljc_error("out of memory");
     return p;
 }
+static void *xrealloc(void *p, size_t n) {
+    void *q = realloc(p, n);   /* old block survives an OOM longjmp */
+    if (!q) { free(p); cljc_error("out of memory"); }
+    return q;
+}
 
 /* ───── Constructors ─────────────────────────────────────────────────── */
 
@@ -2039,6 +2044,44 @@ static void arity_info(Cljc *params, size_t *fixed, bool *variadic) {
 /* Symbol resolution with per-cell caching: locals (slot envs) shadow;
  * root hits memoize a stable Binding* on the symbol cell. Shared by the
  * tree-walker and the VM's VOP_SYM. */
+/* Root binding lookup: home-ns qualification first (library isolation),
+ * then bare, then the (require :as) alias fallback. Shared by the
+ * tree-walker's resolve_symbol and the compiler's vm_resolve_maybe —
+ * copy-drift between those two paths already shipped one bug. */
+static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) {
+    if (home_ns) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s/%s", home_ns, name);
+        const char *qual = intern(buf, strlen(buf));
+        for (Binding *b = root->bindings; b; b = b->next)
+            if (b->name == qual) return b;
+    }
+    for (Binding *b = root->bindings; b; b = b->next)
+        if (b->name == name) return b;
+    /* alias fallback: m/foo -> <full-ns>/foo -> bare foo; the qualified
+     * def must win over any bare global (two passes) */
+    {
+        const char *slash = strchr(name, '/');
+        if (slash && slash != name) {
+            const char *pre = intern(name, (size_t)(slash - name));
+            for (int i = 0; i < n_aliases; i++) {
+                if (alias_table[i] == pre) {
+                    char buf[256];
+                    snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
+                    const char *qual = intern(buf, strlen(buf));
+                    const char *bare = intern(slash + 1, strlen(slash + 1));
+                    for (Binding *b = root->bindings; b; b = b->next)
+                        if (b->name == qual) return b;
+                    for (Binding *b = root->bindings; b; b = b->next)
+                        if (b->name == bare) return b;
+                    break;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
     const char *name = form->as.symc.name;
     CljcEnv *e = env;
@@ -2048,45 +2091,8 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
     }
     Binding *cb = form->as.symc.root_cache;
     if (cb) return cb->value;
-    if (form->as.symc.home_ns) {   /* library code: own ns wins */
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s/%s", form->as.symc.home_ns, name);
-        const char *qual = intern(buf, strlen(buf));
-        for (Binding *b = e->bindings; b; b = b->next)
-            if (b->name == qual) { form->as.symc.root_cache = b; return b->value; }
-    }
-    for (Binding *b = e->bindings; b; b = b->next)
-        if (b->name == name) { form->as.symc.root_cache = b; return b->value; }
-    /* alias fallback: m/foo -> foo when m is a registered alias */
-    {
-        const char *slash = strchr(name, '/');
-        if (slash && slash != name) {
-            const char *pre = intern(name, (size_t)(slash - name));
-            for (int i = 0; i < n_aliases; i++) {
-                if (alias_table[i] == pre) {
-                    /* m/foo => <full-ns>/foo, falling back to bare foo
-                     * (pre-isolation libs and core shims) */
-                    char buf[256];
-                    snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
-                    const char *qual = intern(buf, strlen(buf));
-                    const char *bare = intern(slash + 1, strlen(slash + 1));
-                    /* the ns-qualified def must win over any bare global
-                     * (two passes — || takes whichever was defined last) */
-                    for (Binding *b = e->bindings; b; b = b->next)
-                        if (b->name == qual) {
-                            form->as.symc.root_cache = b;
-                            return b->value;
-                        }
-                    for (Binding *b = e->bindings; b; b = b->next)
-                        if (b->name == bare) {
-                            form->as.symc.root_cache = b;
-                            return b->value;
-                        }
-                    break;
-                }
-            }
-        }
-    }
+    Binding *b = root_find(e, name, form->as.symc.home_ns);
+    if (b) { form->as.symc.root_cache = b; return b->value; }
     err_token = name;
     cljc_error("I don't know what `%s` refers to.", name);
     return NIL;
@@ -2097,10 +2103,15 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
  * Each interpreted fn arity compiles its body to a chunk on first call
  * (cached in the arity cell's meta slot). The compiler covers the hot
  * forms — if/do/let/loop/recur/and/or/when/cond, calls, literals,
- * closures, lazy-seq — and emits VOP_EVAL (tree-walk this sub-form) for
- * everything else, so the VM is always correct without being complete.
- * Macros expand at compile time through the same apply machinery and the
- * expansion is spliced into the source form, exactly like eval does.
+ * vectors, closures, lazy-seq — and falls back two ways: VOP_EVAL
+ * (tree-walk this sub-form) for rare forms, or c->ok=false (the whole
+ * arity tree-walks forever) for shapes the ops can't express — recur
+ * escaping through a tree-walked subform, malformed if/when/cond,
+ * >255-ary calls. Correct without being complete. Macros expand at
+ * compile time through apply with the expansion spliced into the source
+ * (like eval); a callee that turns out to be a macro only at runtime
+ * (forward ref, fn->macro redef) makes VOP_CALL deopt to eval of the
+ * call-site form.
  *
  * The operand stack is the GC-rooted vstack; locals stay in slot-envs
  * (closures capture them unchanged); VOP_SYM resolves through the same
@@ -2110,6 +2121,9 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro);
 static void print_to(SBuf *sb, Cljc *v, bool readably);
 
+/* Instruction = arg:24 | op:8. Sub-packings: CALL arg = call-site form
+ * const:16 | argc:8; REBIND arg = unwind-depth:8 | names const:16.
+ * Hence vm_compile's bails: ncode <= 0xffffff, nconst <= 0xffff. */
 enum {
     VOP_NIL, VOP_TRUE, VOP_FALSE, VOP_CONST, VOP_SYM,
     VOP_BIND, VOP_DESTRUCT, VOP_NEWENV, VOP_POPENV, VOP_POP,
@@ -2129,22 +2143,28 @@ typedef struct {
     bool ok;
 } VmC;
 
+/* Back-patch a forward jump's 24-bit target to the current pc. */
+static void vmc_patch(VmC *c, uint32_t at) {
+    if (!c->ok) return;
+    c->code[at] = (c->code[at] & 0xff) | (c->ncode << 8);
+}
+
 static void vmc_emit(VmC *c, uint8_t op, uint32_t arg) {
+    if (!c->ok) return;                /* doomed chunk: stop growing it */
     if (c->ncode >= c->ccap) {
         c->ccap = c->ccap ? c->ccap * 2 : 64;
-        c->code = realloc(c->code, sizeof(uint32_t) * c->ccap);
-        if (!c->code) cljc_error("out of memory");
+        c->code = xrealloc(c->code, sizeof(uint32_t) * c->ccap);
     }
     c->code[c->ncode++] = (uint32_t)op | (arg << 8);
 }
 
 static uint32_t vmc_const(VmC *c, Cljc *v) {
+    if (!c->ok) return 0;              /* doomed chunk: no vstack growth */
     for (uint32_t i = 0; i < c->nconst; i++)      /* dedup (small pools) */
         if (c->consts[i] == v) return i;
     if (c->nconst >= c->kcap) {
         c->kcap = c->kcap ? c->kcap * 2 : 16;
-        c->consts = realloc(c->consts, sizeof(Cljc *) * c->kcap);
-        if (!c->consts) cljc_error("out of memory");
+        c->consts = xrealloc(c->consts, sizeof(Cljc *) * c->kcap);
     }
     vpush(v);                  /* GC root until the chunk cell owns them */
     c->consts[c->nconst] = v;
@@ -2158,8 +2178,8 @@ static bool vmc_local_p(VmC *c, const char *name) {
 }
 
 static void vmc_local_push(VmC *c, const char *name) {
-    if (c->nlocals < 256) c->locals[c->nlocals] = name;
-    c->nlocals++;              /* may exceed 256: only tracking matters */
+    if (c->nlocals >= 256) { c->ok = false; return; }   /* chunk bails */
+    c->locals[c->nlocals++] = name;
 }
 
 /* names bound by a destructuring pattern (for shadow tracking) */
@@ -2179,6 +2199,9 @@ static void vmc_pattern_locals(VmC *c, Cljc *pat) {
 }
 
 static bool vm_special_name(const char *s) {
+    /* must stay in sync with eval_inner's special forms (no shared
+     * list); the first 11 are handled explicitly in vmc_form before
+     * this is consulted — listed anyway as drift insurance */
     static const char *names[24];
     if (!names[0]) {
         static const char *txt[24] = {
@@ -2205,35 +2228,8 @@ static Cljc *vm_resolve_maybe(CljcEnv *env, Cljc *sym) {
         if (env_local_find(e, name)) return NULL;     /* local shadows */
     Binding *cb = sym->as.symc.root_cache;
     if (cb) return cb->value;
-    if (sym->as.symc.home_ns) {
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s/%s", sym->as.symc.home_ns, name);
-        const char *qual = intern(buf, strlen(buf));
-        for (Binding *b = e->bindings; b; b = b->next)
-            if (b->name == qual) return b->value;
-    }
-    for (Binding *b = e->bindings; b; b = b->next)
-        if (b->name == name) return b->value;
-    {
-        const char *slash = strchr(name, '/');
-        if (slash && slash != name) {
-            const char *pre = intern(name, (size_t)(slash - name));
-            for (int i = 0; i < n_aliases; i++) {
-                if (alias_table[i] == pre) {
-                    char buf[256];
-                    snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
-                    const char *qual = intern(buf, strlen(buf));
-                    const char *bare = intern(slash + 1, strlen(slash + 1));
-                    for (Binding *b = e->bindings; b; b = b->next)
-                        if (b->name == qual) return b->value;
-                    for (Binding *b = e->bindings; b; b = b->next)
-                        if (b->name == bare) return b->value;
-                    break;
-                }
-            }
-        }
-    }
-    return NULL;
+    Binding *b = root_find(e, name, sym->as.symc.home_ns);
+    return b ? b->value : NULL;
 }
 
 /* Does this form contain a (recur ...) that would belong to the
@@ -2345,9 +2341,9 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
             vmc_form(c, cenv, then);
             uint32_t je = c->ncode; vmc_emit(c, VOP_JMP, 0);
-            c->code[jf] = VOP_JMPF | (c->ncode << 8);
+            vmc_patch(c, jf);
             vmc_form(c, cenv, els);
-            c->code[je] = VOP_JMP | (c->ncode << 8);
+            vmc_patch(c, je);
             return;
         }
         if (s == S_DO) { vmc_body(c, cenv, rest); return; }
@@ -2357,9 +2353,9 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
             vmc_body(c, cenv, rest->as.cons.tail);
             uint32_t je = c->ncode; vmc_emit(c, VOP_JMP, 0);
-            c->code[jf] = VOP_JMPF | (c->ncode << 8);
+            vmc_patch(c, jf);
             vmc_emit(c, VOP_NIL, 0);
-            c->code[je] = VOP_JMP | (c->ncode << 8);
+            vmc_patch(c, je);
             return;
         }
         if (s == S_AND || s == S_OR) {
@@ -2377,8 +2373,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
                     vmc_emit(c, VOP_POP, 0);
                 }
             }
-            for (int i = 0; i < nj; i++)
-                c->code[jumps[i]] = (c->code[jumps[i]] & 0xff) | (c->ncode << 8);
+            for (int i = 0; i < nj; i++) vmc_patch(c, jumps[i]);
             return;
         }
         if (s == S_COND) {
@@ -2391,13 +2386,12 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
                 vmc_form(c, cenv, a->as.cons.tail->as.cons.head);
                 if (ne >= 128) { c->ok = false; return; }
                 ends[ne++] = c->ncode; vmc_emit(c, VOP_JMP, 0);
-                c->code[jf] = VOP_JMPF | (c->ncode << 8);
+                vmc_patch(c, jf);
                 a = a->as.cons.tail->as.cons.tail;
             }
             if (a != NIL && a->tag == CLJC_LIST) { c->ok = false; return; }
-            vmc_emit(c, VOP_NIL, 0);                /* odd clause: eval errors */
-            for (int i = 0; i < ne; i++)
-                c->code[ends[i]] = VOP_JMP | (c->ncode << 8);
+            vmc_emit(c, VOP_NIL, 0);
+            for (int i = 0; i < ne; i++) vmc_patch(c, ends[i]);
             return;
         }
         if (s == S_LET) {
@@ -2476,6 +2470,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
                          vmc_const(c, c->loop_names) | ((uint32_t)c->loop_depth << 16));
                 vmc_emit(c, VOP_JMP, (uint32_t)c->loop_pc);
             } else {
+                if (n > 0xff) { c->ok = false; return; }  /* recur.n is u8 */
                 vmc_emit(c, VOP_RECURFN, n);
                 vmc_emit(c, VOP_RET, 0);
             }
@@ -2553,22 +2548,22 @@ static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
     }
     vmc_body(&c, cenv, body);
     vmc_emit(&c, VOP_RET, 0);
-    if (!c.ok || c.nlocals > 256 || c.ncode > 0xffffff || c.nconst > 0xffff) {
-        if (getenv("CLJC_VM_LOG")) {
-            fprintf(stderr, "[vm] compile bail: ");
-            for (Cljc *b = body; b && b->tag == CLJC_LIST; b = b->as.cons.tail) {
-                SBuf sb = {0};
-                print_to(&sb, b->as.cons.head, true);
-                if (sb.data) { fwrite(sb.data, 1, sb.len > 80 ? 80 : sb.len, stderr); free(sb.data); }
-                break;
-            }
-            fputc('\n', stderr);
+    if (!c.ok || c.ncode > 0xffffff || c.nconst > 0xffff) {
+        if (getenv("CLJC_VM_LOG") && body != NIL && body->tag == CLJC_LIST) {
+            SBuf sb = {0};
+            print_to(&sb, body->as.cons.head, true);
+            fprintf(stderr, "[vm] compile bail: %.80s%s\n",
+                    sb.data ? sb.data : "", sb.len > 80 ? "…" : "");
+            free(sb.data);
         }
         free(c.code); free(c.consts);
         vsp = base;
         return NULL;
     }
     Cljc *chunk = alloc(CLJC_CHUNK);   /* consts still vstack-rooted here */
+    /* counted for byte-pressure consistency with vec tails / HAMT kids,
+     * though chunks are effectively immortal once cached */
+    gc_extra_bytes += sizeof(uint32_t) * c.ncode + sizeof(Cljc *) * c.nconst;
     chunk->as.chunk.code = c.code;
     chunk->as.chunk.consts = c.consts;
     chunk->as.chunk.ncode = c.ncode;
@@ -2675,10 +2670,9 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                     r->as.recur.iv[0] = (Cljc *)vals;
                     r->as.recur.spill = true;
                 }
-                for (uint32_t i = 0; i < a; i++) {
-                    vals[i] = vstack[vsp - a + i];
-                    r->as.recur.n = (uint8_t)(i + 1);
-                }
+                for (uint32_t i = 0; i < a; i++)
+                    vals[i] = vstack[vsp - a + i];   /* no alloc: safe to */
+                r->as.recur.n = (uint8_t)a;          /* set n once after */
                 vsp -= a;
                 vpush(r);
                 break;
@@ -2784,17 +2778,22 @@ static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
 
 /* Build an interpreted fn from the forms after `fn` (or after a defn name):
  * single arity ([params] body...) or multi-arity (([p] b...) ([p q] b...)). */
+/* The **arities** cache marker on fn source spines (see make_fn). */
+static bool is_arities_meta(Cljc *m) {
+    static const char *SYM_ARITIES;
+    if (!SYM_ARITIES) SYM_ARITIES = intern("**arities**", 11);
+    return m != NULL && m != NIL && m->tag == CLJC_LIST &&
+           m->as.cons.head->tag == CLJC_SYMBOL &&
+           m->as.cons.head->as.sym == SYM_ARITIES;
+}
+
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
     /* Arities (and the chunks cached on them) are pure structure: share
      * them across every closure built from the same source forms. A hot
      * loop creating a closure per iteration otherwise RECOMPILES its
      * body each call (5M+ vm_compiles in one profile). */
-    static const char *SYM_ARITIES;
-    if (!SYM_ARITIES) SYM_ARITIES = intern("**arities**", 11);
-    if (forms != NIL && forms->tag == CLJC_LIST && forms->meta != NULL &&
-        forms->meta->tag == CLJC_LIST &&
-        forms->meta->as.cons.head->tag == CLJC_SYMBOL &&
-        forms->meta->as.cons.head->as.sym == SYM_ARITIES) {
+    if (forms != NIL && forms->tag == CLJC_LIST &&
+        is_arities_meta(forms->meta)) {
         Cljc *f = alloc(CLJC_FN);
         f->as.fn.arities = forms->meta->as.cons.tail;
         f->as.fn.env = env;
@@ -2814,8 +2813,15 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
         }
         if (arities == NIL) cljc_error("fn needs at least one arity");
     }
-    if (forms != NIL && forms->tag == CLJC_LIST && forms->meta == NULL)
-        forms->meta = mk_cons(mk_sym(SYM_ARITIES), arities);
+    /* NOTE: cache only engages when the spine carries no other meta —
+     * any foreign meta silently reverts to rebuild-per-closure (the 5M-
+     * compile cliff); log it so the cliff is visible. */
+    if (forms != NIL && forms->tag == CLJC_LIST) {
+        if (forms->meta == NULL)
+            forms->meta = mk_cons(mk_sym(intern("**arities**", 11)), arities);
+        else if (!is_arities_meta(forms->meta) && getenv("CLJC_VM_LOG"))
+            fprintf(stderr, "[vm] arities cache bypassed (foreign meta)\n");
+    }
     Cljc *f = alloc(CLJC_FN);
     f->as.fn.arities = arities;
     f->as.fn.env = env;
@@ -3964,14 +3970,9 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
         if (r == NIL || r->tag == CLJC_LIST || r->tag == CLJC_LAZY) {
             Cljc *prev = r;                         /* lazy: cons keeps it lazy */
             r = mk_cons(x, r);                      /* lists grow at the front */
-            if (prev != NIL && prev->tag == CLJC_LIST && prev->meta != NULL) {
-                /* never propagate the internal **arities** cache marker */
-                Cljc *m = prev->meta;
-                bool arities = m->tag == CLJC_LIST &&
-                               m->as.cons.head->tag == CLJC_SYMBOL &&
-                               strcmp(m->as.cons.head->as.sym, "**arities**") == 0;
-                if (!arities) r->meta = m;
-            }
+            if (prev != NIL && prev->tag == CLJC_LIST &&
+                !is_arities_meta(prev->meta))   /* internal marker stays */
+                r->meta = prev->meta;
         } else if (r->tag == CLJC_VECTOR) {
             Cljc *prev = r;
             r = vec_conj1(r, x);                    /* vectors grow at the back */

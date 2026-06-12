@@ -1371,7 +1371,7 @@
 (defn cljc-vmtest-g [] (loop [x 0] (if (< x 3) (try (recur (inc x)) (catch Exception e :c)) x)))
 (assert= 3 (cljc-vmtest-g))                            ; recur through try in loop
 (defn cljc-vmtest-h [a] (loop [x 0] (if (< x 3) (try (recur (inc x))) [a x])))
-(assert= [5 3] (cljc-vmtest-h 5))
+(assert= [5 3] (cljc-vmtest-h 5))      ; fn params not rebound by escaped recur
 (defn cljc-vmtest-fwd [x] (if x (cljc-vmtest-mm 1 2) :no))
 (assert= :no (cljc-vmtest-fwd false))                  ; compiles the chunk
 (defmacro cljc-vmtest-mm [a b] (list '+ a b 100))

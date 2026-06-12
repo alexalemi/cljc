@@ -544,10 +544,13 @@ required by conservative stack scanning, same as Boehm GC).
     closures of the same source forms (**arities** marker on the forms
     spine meta) — per-iteration closures were recompiling every call
     (5M+ vm_compiles; VM was SLOWER than the tree-walker until this).
-    Numbers: 2017 d10 1.58s (11.7x vs pre-campaign), 2015 d9 1.80s
-    (7.1x), d13 1.85s (6.8x). VM corpus sweep: 102 pass / 9 fail /
-    40 timeout — ZERO regressions vs main, and 2017 d16 (the billion-
-    dance file that once SEGV'd the GC) now PASSES inside 60s.
+    Numbers (post-bughunt, honest): 2015 d9 1.80s (7.1x vs
+    pre-campaign), d13 1.85s (6.8x), 2017 d10 3.7s vs 6.3s tree-walk
+    (the earlier 1.58s figure was a miscompile that skipped work — see
+    bughunt below). VM corpus sweep (run PRE-bughunt, exit-code based —
+    deftest failures invisible, see KNOWN GAP): 102 pass / 9 fail /
+    40 timeout, no exit-code regressions vs main; 2017 d16 (the
+    billion-dance file that once SEGV'd the GC) PASSES inside 60s.
     Error-trace granularity inside compiled bodies is coarser (no
     per-subform frames) — documented divergence.
     BUGHUNT PASS (2026-06-12, two adversarial review agents + manual):

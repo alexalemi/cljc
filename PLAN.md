@@ -530,8 +530,28 @@ required by conservative stack scanning, same as Boehm GC).
     benchmark run. (c) destructuring loop desugar (gensym let rewrite)
     splices into the form — was rebuilt per loop ENTRY.
     Benchmarks now: 2015 d9 3.9s, d13 3.7s, 2017 d10 6.2s (from
-    12.8/12.6/18.5 two days ago). Next: eval_inner 33% + gc_collect 22%
-    remain — bytecode VM territory; profile before believing anything.
+    12.8/12.6/18.5 two days ago).
+    ROUND 3 — BYTECODE VM ✅ (branch vm, 2026-06-12): hybrid stack VM,
+    ~600 lines. Fn arity bodies compile to CLJC_CHUNK cells on first
+    call (cached in arity meta); compiler covers if/do/let/loop/recur/
+    and/or/when/cond/calls/literals/vectors/closures/lazy-seq, VOP_EVAL
+    falls back to the tree-walker per sub-form for the rest (def, try,
+    quasiquote, ns, computed map/set literals, named fns) — correct
+    without being complete. Macros expand at compile time + splice.
+    Operand stack = the GC-rooted vstack; locals stay in slot-envs;
+    VOP_SYM uses resolve_symbol (extracted from eval_inner, root_cache
+    intact). CRITICAL FIX en route: arities + chunks are SHARED across
+    closures of the same source forms (**arities** marker on the forms
+    spine meta) — per-iteration closures were recompiling every call
+    (5M+ vm_compiles; VM was SLOWER than the tree-walker until this).
+    Numbers: 2017 d10 1.58s (11.7x vs pre-campaign), 2015 d9 1.80s
+    (7.1x), d13 1.85s (6.8x). VM corpus sweep: 102 pass / 9 fail /
+    40 timeout — ZERO regressions vs main, and 2017 d16 (the billion-
+    dance file that once SEGV'd the GC) now PASSES inside 60s.
+    Error-trace granularity inside compiled bodies is coarser (no
+    per-subform frames) — documented divergence.
+    Next perf ideas if ever needed: compile-time local slot indices
+    (skip env scan), direct-threaded dispatch, apply fast path.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

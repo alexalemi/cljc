@@ -62,6 +62,7 @@ typedef enum {
     CLJC_SET,       /* persistent set: a HAMT keyed by its elements (uses as.map) */
     CLJC_HNODE,     /* internal: HAMT tree node — never user-visible */
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
+    CLJC_CHUNK,     /* internal: compiled bytecode for one fn arity body */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
 } CljcTag;
 
@@ -107,6 +108,8 @@ struct Cljc {
         /* recur sentinel: up to 3 values inline (covers real loops);
          * wider recurs spill to a heap array stored in iv[0]. */
         struct { Cljc *iv[3]; uint8_t n; bool spill; } recur;
+        struct { uint32_t *code; Cljc **consts;
+                 uint32_t ncode; uint16_t nconst; } chunk;
     } as;
 };
 
@@ -595,6 +598,10 @@ static void gc_drain(void) {
                 mark_push(v->as.lazy.thunk);
                 mark_push(v->as.lazy.cached);
                 break;
+            case CLJC_CHUNK:
+                for (uint16_t i = 0; i < v->as.chunk.nconst; i++)
+                    mark_push(v->as.chunk.consts[i]);
+                break;
             default:
                 break;
         }
@@ -695,6 +702,10 @@ static void gc_collect(void) {
             if (c->tag != CLJC_FREE) {
                 switch (c->tag) {
                     case CLJC_STRING: free(c->as.str); break;
+                    case CLJC_CHUNK:
+                        free(c->as.chunk.code);
+                        free(c->as.chunk.consts);
+                        break;
                     case CLJC_VECTOR: tail_free(c->as.vec.tail, c->as.vec.taillen); break;
                     case CLJC_TVEC:   chunk32_free(c->as.vec.tail); break;
                     case CLJC_HNODE:
@@ -2025,6 +2036,562 @@ static void arity_info(Cljc *params, size_t *fixed, bool *variadic) {
     }
 }
 
+/* Symbol resolution with per-cell caching: locals (slot envs) shadow;
+ * root hits memoize a stable Binding* on the symbol cell. Shared by the
+ * tree-walker and the VM's VOP_SYM. */
+static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
+    const char *name = form->as.symc.name;
+    CljcEnv *e = env;
+    for (; e->parent; e = e->parent) {
+        Cljc **p = env_local_find(e, name);
+        if (p) return *p;
+    }
+    Binding *cb = form->as.symc.root_cache;
+    if (cb) return cb->value;
+    if (form->as.symc.home_ns) {   /* library code: own ns wins */
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s/%s", form->as.symc.home_ns, name);
+        const char *qual = intern(buf, strlen(buf));
+        for (Binding *b = e->bindings; b; b = b->next)
+            if (b->name == qual) { form->as.symc.root_cache = b; return b->value; }
+    }
+    for (Binding *b = e->bindings; b; b = b->next)
+        if (b->name == name) { form->as.symc.root_cache = b; return b->value; }
+    /* alias fallback: m/foo -> foo when m is a registered alias */
+    {
+        const char *slash = strchr(name, '/');
+        if (slash && slash != name) {
+            const char *pre = intern(name, (size_t)(slash - name));
+            for (int i = 0; i < n_aliases; i++) {
+                if (alias_table[i] == pre) {
+                    /* m/foo => <full-ns>/foo, falling back to bare foo
+                     * (pre-isolation libs and core shims) */
+                    char buf[256];
+                    snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
+                    const char *qual = intern(buf, strlen(buf));
+                    const char *bare = intern(slash + 1, strlen(slash + 1));
+                    /* the ns-qualified def must win over any bare global
+                     * (two passes — || takes whichever was defined last) */
+                    for (Binding *b = e->bindings; b; b = b->next)
+                        if (b->name == qual) {
+                            form->as.symc.root_cache = b;
+                            return b->value;
+                        }
+                    for (Binding *b = e->bindings; b; b = b->next)
+                        if (b->name == bare) {
+                            form->as.symc.root_cache = b;
+                            return b->value;
+                        }
+                    break;
+                }
+            }
+        }
+    }
+    err_token = name;
+    cljc_error("I don't know what `%s` refers to.", name);
+    return NIL;
+}
+
+/* ───── Bytecode VM ──────────────────────────────────────────────────────
+ *
+ * Each interpreted fn arity compiles its body to a chunk on first call
+ * (cached in the arity cell's meta slot). The compiler covers the hot
+ * forms — if/do/let/loop/recur/and/or/when/cond, calls, literals,
+ * closures, lazy-seq — and emits VOP_EVAL (tree-walk this sub-form) for
+ * everything else, so the VM is always correct without being complete.
+ * Macros expand at compile time through the same apply machinery and the
+ * expansion is spliced into the source form, exactly like eval does.
+ *
+ * The operand stack is the GC-rooted vstack; locals stay in slot-envs
+ * (closures capture them unchanged); VOP_SYM resolves through the same
+ * symbol cells, so root_cache caching carries over. Error traces inside
+ * compiled bodies are coarser (no per-subform eval_stack frames). */
+
+static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro);
+
+enum {
+    VOP_NIL, VOP_TRUE, VOP_FALSE, VOP_CONST, VOP_SYM,
+    VOP_BIND, VOP_DESTRUCT, VOP_NEWENV, VOP_POPENV, VOP_POP,
+    VOP_CALL, VOP_JMP, VOP_JMPF, VOP_JMPF_KEEP, VOP_JMPT_KEEP,
+    VOP_EVAL, VOP_CLOSURE, VOP_LAZY, VOP_VEC,
+    VOP_REBIND, VOP_RECURFN, VOP_RET
+};
+
+typedef struct {
+    uint32_t *code; uint32_t ncode, ccap;
+    Cljc **consts; uint32_t nconst, kcap;
+    const char *locals[256]; int nlocals;      /* compile-time scope names */
+    int loop_pc;                               /* innermost loop target    */
+    Cljc *loop_names;                          /* its binding symbols      */
+    uint32_t loop_nbind;
+    int loop_depth;                            /* NEWENVs since loop entry */
+    bool ok;
+} VmC;
+
+static void vmc_emit(VmC *c, uint8_t op, uint32_t arg) {
+    if (c->ncode >= c->ccap) {
+        c->ccap = c->ccap ? c->ccap * 2 : 64;
+        c->code = realloc(c->code, sizeof(uint32_t) * c->ccap);
+        if (!c->code) cljc_error("out of memory");
+    }
+    c->code[c->ncode++] = (uint32_t)op | (arg << 8);
+}
+
+static uint32_t vmc_const(VmC *c, Cljc *v) {
+    for (uint32_t i = 0; i < c->nconst; i++)      /* dedup (small pools) */
+        if (c->consts[i] == v) return i;
+    if (c->nconst >= c->kcap) {
+        c->kcap = c->kcap ? c->kcap * 2 : 16;
+        c->consts = realloc(c->consts, sizeof(Cljc *) * c->kcap);
+        if (!c->consts) cljc_error("out of memory");
+    }
+    vpush(v);                  /* GC root until the chunk cell owns them */
+    c->consts[c->nconst] = v;
+    return c->nconst++;
+}
+
+static bool vmc_local_p(VmC *c, const char *name) {
+    for (int i = c->nlocals - 1; i >= 0; i--)
+        if (c->locals[i] == name) return true;
+    return false;
+}
+
+static void vmc_local_push(VmC *c, const char *name) {
+    if (c->nlocals < 256) c->locals[c->nlocals] = name;
+    c->nlocals++;              /* may exceed 256: only tracking matters */
+}
+
+/* names bound by a destructuring pattern (for shadow tracking) */
+static void vmc_pattern_locals(VmC *c, Cljc *pat) {
+    if (pat == NIL) return;
+    if (pat->tag == CLJC_SYMBOL) { vmc_local_push(c, pat->as.sym); return; }
+    if (pat->tag == CLJC_VECTOR)
+        for (size_t i = 0; i < vec_len(pat); i++)
+            vmc_pattern_locals(c, vec_nth(pat, i));
+    if (pat->tag == CLJC_MAP)
+        for (Cljc *e = map_entry_list(pat); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            Cljc *k = e->as.cons.head->as.cons.head;
+            Cljc *v = e->as.cons.head->as.cons.tail;
+            if (k->tag == CLJC_KEYWORD) vmc_pattern_locals(c, v);
+            else vmc_pattern_locals(c, k);     /* {sym :key} */
+        }
+}
+
+static bool vm_special_name(const char *s) {
+    static const char *names[24];
+    if (!names[0]) {
+        static const char *txt[24] = {
+            "quote", "if", "do", "def", "let", "fn", "loop", "recur",
+            "and", "or", "when", "cond", "defn", "defmacro", "quasiquote",
+            "try", "catch", "finally", "ns", "use", "import", "binding",
+            "with-redefs", "**reader-splice**"};
+        for (int i = 0; i < 24; i++) names[i] = intern(txt[i], strlen(txt[i]));
+    }
+    for (int i = 0; i < 24; i++)
+        if (s == names[i]) return true;
+    return false;
+}
+
+/* resolve without erroring (compile-time macro lookup) */
+static Cljc *vm_resolve_maybe(CljcEnv *env, Cljc *sym) {
+    Binding *cb = sym->as.symc.root_cache;
+    if (cb) return cb->value;
+    CljcEnv *root = env;
+    while (root->parent) root = root->parent;
+    for (Binding *b = root->bindings; b; b = b->next)
+        if (b->name == sym->as.symc.name) return b->value;
+    return NULL;
+}
+
+static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form);
+
+static void vmc_body(VmC *c, CljcEnv *cenv, Cljc *body) {  /* do semantics */
+    if (body == NIL || body->tag != CLJC_LIST) { vmc_emit(c, VOP_NIL, 0); return; }
+    for (Cljc *b = body; b && b->tag == CLJC_LIST && c->ok; b = b->as.cons.tail) {
+        vmc_form(c, cenv, b->as.cons.head);
+        if (b->as.cons.tail != NIL && b->as.cons.tail->tag == CLJC_LIST)
+            vmc_emit(c, VOP_POP, 0);
+    }
+}
+
+static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
+    if (!c->ok) return;
+    if (form == NIL) { vmc_emit(c, VOP_NIL, 0); return; }
+    switch (form->tag) {
+        case CLJC_BOOL:
+            vmc_emit(c, form->as.b ? VOP_TRUE : VOP_FALSE, 0);
+            return;
+        case CLJC_INT: case CLJC_DOUBLE: case CLJC_STRING: case CLJC_KEYWORD:
+        case CLJC_FN: case CLJC_NATIVE: case CLJC_MAP: case CLJC_SET:
+            /* map/set literals with computed elements are rare in hot
+             * bodies; constant ones are common — non-constant fall back */
+            if (form->tag == CLJC_MAP || form->tag == CLJC_SET) {
+                vmc_emit(c, VOP_EVAL, vmc_const(c, form));
+                return;
+            }
+            vmc_emit(c, VOP_CONST, vmc_const(c, form));
+            return;
+        case CLJC_SYMBOL:
+            vmc_emit(c, VOP_SYM, vmc_const(c, form));
+            return;
+        case CLJC_VECTOR: {
+            size_t n = vec_len(form);
+            if (n > 0xff) { vmc_emit(c, VOP_EVAL, vmc_const(c, form)); return; }
+            for (size_t i = 0; i < n; i++) vmc_form(c, cenv, vec_nth(form, i));
+            vmc_emit(c, VOP_VEC, (uint32_t)n);
+            return;
+        }
+        case CLJC_LAZY:
+            form = to_seq(form);
+            if (form == NIL || form->tag != CLJC_LIST) { vmc_form(c, cenv, form); return; }
+            break;  /* fall through to list handling */
+        case CLJC_LIST:
+            break;
+        default:
+            vmc_emit(c, VOP_EVAL, vmc_const(c, form));
+            return;
+    }
+    /* list form — realize lazy tails up front, like eval */
+    {
+        Cljc *l = form;
+        while (l->tag == CLJC_LIST) l = l->as.cons.tail;
+        if (l != NIL && l->tag == CLJC_LAZY) form = to_seq(form);
+    }
+    Cljc *head = form->as.cons.head;
+    Cljc *rest = form->as.cons.tail;
+    if (head != NIL && head->tag == CLJC_SYMBOL && !vmc_local_p(c, head->as.sym)) {
+        const char *s = head->as.sym;
+        static const char *S_QUOTE, *S_IF, *S_DO, *S_LET, *S_FN, *S_LOOP,
+                          *S_RECUR, *S_AND, *S_OR, *S_WHEN, *S_COND, *S_LAZY;
+        if (!S_QUOTE) {
+            S_QUOTE = intern("quote", 5); S_IF = intern("if", 2);
+            S_DO = intern("do", 2);       S_LET = intern("let", 3);
+            S_FN = intern("fn", 2);       S_LOOP = intern("loop", 4);
+            S_RECUR = intern("recur", 5); S_AND = intern("and", 3);
+            S_OR = intern("or", 2);       S_WHEN = intern("when", 4);
+            S_COND = intern("cond", 4);   S_LAZY = intern("lazy-seq", 8);
+        }
+        if (s == S_QUOTE) {
+            vmc_emit(c, VOP_CONST, vmc_const(c, rest->as.cons.head));
+            return;
+        }
+        if (s == S_IF) {
+            Cljc *cond = rest->as.cons.head;
+            Cljc *then = rest->as.cons.tail != NIL ? rest->as.cons.tail->as.cons.head : NIL;
+            Cljc *els = rest->as.cons.tail != NIL && rest->as.cons.tail->as.cons.tail != NIL
+                        ? rest->as.cons.tail->as.cons.tail->as.cons.head : NIL;
+            vmc_form(c, cenv, cond);
+            uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
+            vmc_form(c, cenv, then);
+            uint32_t je = c->ncode; vmc_emit(c, VOP_JMP, 0);
+            c->code[jf] = VOP_JMPF | (c->ncode << 8);
+            vmc_form(c, cenv, els);
+            c->code[je] = VOP_JMP | (c->ncode << 8);
+            return;
+        }
+        if (s == S_DO) { vmc_body(c, cenv, rest); return; }
+        if (s == S_WHEN) {
+            vmc_form(c, cenv, rest->as.cons.head);
+            uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
+            vmc_body(c, cenv, rest->as.cons.tail);
+            uint32_t je = c->ncode; vmc_emit(c, VOP_JMP, 0);
+            c->code[jf] = VOP_JMPF | (c->ncode << 8);
+            vmc_emit(c, VOP_NIL, 0);
+            c->code[je] = VOP_JMP | (c->ncode << 8);
+            return;
+        }
+        if (s == S_AND || s == S_OR) {
+            if (rest == NIL || rest->tag != CLJC_LIST) {
+                vmc_emit(c, s == S_AND ? VOP_TRUE : VOP_NIL, 0);
+                return;
+            }
+            uint32_t jumps[128]; int nj = 0;
+            for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+                vmc_form(c, cenv, a->as.cons.head);
+                if (a->as.cons.tail != NIL && a->as.cons.tail->tag == CLJC_LIST) {
+                    if (nj >= 128) { c->ok = false; return; }
+                    jumps[nj++] = c->ncode;
+                    vmc_emit(c, s == S_AND ? VOP_JMPF_KEEP : VOP_JMPT_KEEP, 0);
+                    vmc_emit(c, VOP_POP, 0);
+                }
+            }
+            for (int i = 0; i < nj; i++)
+                c->code[jumps[i]] = (c->code[jumps[i]] & 0xff) | (c->ncode << 8);
+            return;
+        }
+        if (s == S_COND) {
+            uint32_t ends[128]; int ne = 0;
+            Cljc *a = rest;
+            while (a && a->tag == CLJC_LIST && a->as.cons.tail != NIL &&
+                   a->as.cons.tail->tag == CLJC_LIST) {
+                vmc_form(c, cenv, a->as.cons.head);
+                uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
+                vmc_form(c, cenv, a->as.cons.tail->as.cons.head);
+                if (ne >= 128) { c->ok = false; return; }
+                ends[ne++] = c->ncode; vmc_emit(c, VOP_JMP, 0);
+                c->code[jf] = VOP_JMPF | (c->ncode << 8);
+                a = a->as.cons.tail->as.cons.tail;
+            }
+            vmc_emit(c, VOP_NIL, 0);
+            for (int i = 0; i < ne; i++)
+                c->code[ends[i]] = VOP_JMP | (c->ncode << 8);
+            return;
+        }
+        if (s == S_LET) {
+            Cljc *bv = rest->as.cons.head;
+            if (bv == NIL || bv->tag != CLJC_VECTOR || vec_len(bv) % 2 != 0) {
+                c->ok = false; return;
+            }
+            int save_locals = c->nlocals;
+            c->loop_depth++;
+            vmc_emit(c, VOP_NEWENV, 0);
+            for (size_t i = 0; i < vec_len(bv); i += 2) {
+                Cljc *pat = vec_nth(bv, i);
+                vmc_form(c, cenv, vec_nth(bv, i + 1));
+                if (pat != NIL && pat->tag == CLJC_SYMBOL)
+                    vmc_emit(c, VOP_BIND, vmc_const(c, pat));
+                else
+                    vmc_emit(c, VOP_DESTRUCT, vmc_const(c, pat));
+                vmc_pattern_locals(c, pat);
+            }
+            vmc_body(c, cenv, rest->as.cons.tail);
+            vmc_emit(c, VOP_POPENV, 0);
+            c->loop_depth--;
+            c->nlocals = save_locals;
+            return;
+        }
+        if (s == S_LOOP) {
+            Cljc *bv = rest->as.cons.head;
+            if (bv == NIL || bv->tag != CLJC_VECTOR || vec_len(bv) % 2 != 0) {
+                c->ok = false; return;
+            }
+            for (size_t i = 0; i < vec_len(bv); i += 2)
+                if (vec_nth(bv, i)->tag != CLJC_SYMBOL) {
+                    /* pattern loops: let eval desugar+splice at runtime */
+                    vmc_emit(c, VOP_EVAL, vmc_const(c, form));
+                    return;
+                }
+            int save_locals = c->nlocals;
+            int save_pc = c->loop_pc;
+            Cljc *save_names = c->loop_names;
+            uint32_t save_nb = c->loop_nbind;
+            int save_depth = c->loop_depth;
+            vmc_emit(c, VOP_NEWENV, 0);
+            Cljc *names = NIL, **t = &names;
+            for (size_t i = 0; i < vec_len(bv); i += 2) {
+                Cljc *sym = vec_nth(bv, i);
+                vmc_form(c, cenv, vec_nth(bv, i + 1));
+                vmc_emit(c, VOP_BIND, vmc_const(c, sym));
+                vmc_local_push(c, sym->as.sym);
+                *t = mk_cons(sym, NIL);
+                t = &(*t)->as.cons.tail;
+            }
+            c->loop_names = names;
+            vmc_const(c, names);              /* root it on the vstack */
+            c->loop_nbind = (uint32_t)(vec_len(bv) / 2);
+            c->loop_pc = (int)c->ncode;
+            c->loop_depth = 0;
+            vmc_body(c, cenv, rest->as.cons.tail);
+            vmc_emit(c, VOP_POPENV, 0);
+            c->loop_pc = save_pc;
+            c->loop_names = save_names;
+            c->loop_nbind = save_nb;
+            c->loop_depth = save_depth;
+            c->nlocals = save_locals;
+            return;
+        }
+        if (s == S_RECUR) {
+            uint32_t n = 0;
+            for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+                vmc_form(c, cenv, a->as.cons.head);
+                n++;
+            }
+            if (c->loop_pc >= 0) {
+                if (n != c->loop_nbind) { c->ok = false; return; }
+                if (c->loop_depth > 0xff) { c->ok = false; return; }
+                vmc_emit(c, VOP_REBIND,
+                         vmc_const(c, c->loop_names) | ((uint32_t)c->loop_depth << 16));
+                c->code[c->ncode - 1] |= 0;   /* arg layout: k | depth<<16 */
+                vmc_emit(c, VOP_JMP, (uint32_t)c->loop_pc);
+            } else {
+                vmc_emit(c, VOP_RECURFN, n);
+                vmc_emit(c, VOP_RET, 0);
+            }
+            return;
+        }
+        if (s == S_FN) {
+            /* named fns get name-stripping in the tree-walk path */
+            if (rest != NIL && rest->as.cons.head->tag == CLJC_SYMBOL) {
+                vmc_emit(c, VOP_EVAL, vmc_const(c, form));
+                return;
+            }
+            vmc_emit(c, VOP_CLOSURE, vmc_const(c, rest));
+            return;
+        }
+        if (s == S_LAZY) {
+            /* thunk forms = ([] body...) — same shape SYM_LAZY_SEQ builds */
+            vmc_emit(c, VOP_LAZY, vmc_const(c, mk_cons(mk_empty_vec(), rest)));
+            return;
+        }
+        if (vm_special_name(s)) {            /* def/try/quasiquote/ns/... */
+            vmc_emit(c, VOP_EVAL, vmc_const(c, form));
+            return;
+        }
+        /* compile-time macro expansion, spliced like eval does */
+        Cljc *mfn = vm_resolve_maybe(cenv, head);
+        if (mfn && mfn->tag == CLJC_FN && mfn->as.fn.is_macro) {
+            size_t base = vsp;
+            for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+                vpush(a->as.cons.head);
+            Cljc *expansion = apply(cenv, mfn, &vstack[base], (int)(vsp - base));
+            vsp = base;
+            if (expansion != NIL && expansion->tag == CLJC_LIST) {
+                form->as.cons.head = expansion->as.cons.head;
+                form->as.cons.tail = expansion->as.cons.tail;
+            }
+            vmc_const(c, expansion);          /* keep rooted */
+            vmc_form(c, cenv, expansion);
+            return;
+        }
+    }
+    /* ordinary call: head expr, args, CALL n */
+    {
+        uint32_t n = 0;
+        vmc_form(c, cenv, head);
+        for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+            vmc_form(c, cenv, a->as.cons.head);
+            n++;
+        }
+        vmc_emit(c, VOP_CALL, n);
+    }
+}
+
+/* Compile one arity body. Returns a chunk cell, or NULL (caller falls
+ * back to the tree-walker permanently). */
+static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
+    VmC c;
+    memset(&c, 0, sizeof c);
+    c.ok = true;
+    c.loop_pc = -1;
+    size_t base = vsp;                 /* consts rooted here during build */
+    for (Cljc *p = params; p && p->tag == CLJC_LIST; p = p->as.cons.tail) {
+        Cljc *pe = p->as.cons.head;
+        if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) continue;
+        vmc_pattern_locals(&c, pe);
+    }
+    vmc_body(&c, cenv, body);
+    vmc_emit(&c, VOP_RET, 0);
+    if (!c.ok || c.nlocals > 256 || c.ncode > 0xffffff || c.nconst > 0xffff) {
+        free(c.code); free(c.consts);
+        vsp = base;
+        return NULL;
+    }
+    Cljc *chunk = alloc(CLJC_CHUNK);   /* consts still vstack-rooted here */
+    chunk->as.chunk.code = c.code;
+    chunk->as.chunk.consts = c.consts;
+    chunk->as.chunk.ncode = c.ncode;
+    chunk->as.chunk.nconst = (uint16_t)c.nconst;
+    vsp = base;
+    return chunk;
+}
+
+static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
+    uint32_t *code = chunk->as.chunk.code;
+    Cljc **K = chunk->as.chunk.consts;
+    uint32_t pc = 0;
+    size_t base = vsp;
+    /* volatile: env must stay visible to the conservative GC scan */
+    CljcEnv * volatile env_keep = env_in;
+    CljcEnv *env = env_in;
+    for (;;) {
+        uint32_t ins = code[pc++];
+        uint32_t a = ins >> 8;
+        switch (ins & 0xff) {
+            case VOP_NIL:   vpush(NIL); break;
+            case VOP_TRUE:  vpush(TRUE); break;
+            case VOP_FALSE: vpush(FALSE); break;
+            case VOP_CONST: vpush(K[a]); break;
+            case VOP_SYM:   vpush(resolve_symbol(env, K[a])); break;
+            case VOP_BIND:
+                env_define(env, K[a]->as.sym, vstack[vsp - 1]);
+                vsp--;
+                break;
+            case VOP_DESTRUCT:
+                destructure(env, K[a], vstack[vsp - 1]);
+                vsp--;
+                break;
+            case VOP_NEWENV: env = env_new(env); env_keep = env; break;
+            case VOP_POPENV: env = env->parent; env_keep = env; break;
+            case VOP_POP:    vsp--; break;
+            case VOP_CALL: {
+                Cljc *f = vstack[vsp - a - 1];
+                Cljc *r = apply(env, f, &vstack[vsp - a], (int)a);
+                vsp -= a + 1;
+                vpush(r);
+                break;
+            }
+            case VOP_JMP:  pc = a; break;
+            case VOP_JMPF: if (!is_truthy(vstack[--vsp])) pc = a; break;
+            case VOP_JMPF_KEEP: if (!is_truthy(vstack[vsp - 1])) pc = a; break;
+            case VOP_JMPT_KEEP: if (is_truthy(vstack[vsp - 1])) pc = a; break;
+            case VOP_EVAL: vpush(eval(env, K[a])); break;
+            case VOP_CLOSURE: vpush(make_fn(env, K[a], false)); break;
+            case VOP_LAZY: {
+                Cljc *t = make_fn(env, K[a], false);
+                Cljc *l = alloc(CLJC_LAZY);
+                l->as.lazy.thunk = t;
+                vpush(l);
+                break;
+            }
+            case VOP_VEC: {
+                Cljc *v = mk_vector(&vstack[vsp - a], a);
+                vsp -= a;
+                vpush(v);
+                break;
+            }
+            case VOP_REBIND: {
+                /* arg: low 16 = names-list const idx, high 8 = NEWENVs to
+                 * unwind (recur from inside nested lets) */
+                uint32_t k = a & 0xffff, depth = a >> 16;
+                for (uint32_t d = 0; d < depth; d++) env = env->parent;
+                env_keep = env;
+                uint32_t n = 0;
+                for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail) n++;
+                Cljc **vals = &vstack[vsp - n];
+                uint32_t i = 0;
+                for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail, i++) {
+                    Cljc **p = env_local_find(env, nm->as.cons.head->as.sym);
+                    if (p) *p = vals[i];
+                }
+                vsp -= n;
+                break;
+            }
+            case VOP_RECURFN: {
+                Cljc *r = alloc(CLJC_RECUR);
+                Cljc **vals = r->as.recur.iv;
+                if (a > 3) {
+                    vals = xmalloc(sizeof(Cljc *) * a);
+                    r->as.recur.iv[0] = (Cljc *)vals;
+                    r->as.recur.spill = true;
+                }
+                for (uint32_t i = 0; i < a; i++) {
+                    vals[i] = vstack[vsp - a + i];
+                    r->as.recur.n = (uint8_t)(i + 1);
+                }
+                vsp -= a;
+                vpush(r);
+                break;
+            }
+            case VOP_RET: {
+                Cljc *r = vstack[vsp - 1];
+                vsp = base;
+                (void)env_keep;
+                return r;
+            }
+        }
+    }
+}
+
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
     if (fn->tag == CLJC_FN) {
@@ -2047,7 +2614,15 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
             if (!chosen) cljc_error("no matching arity for %d args", nargs);
             CljcEnv *call = env_new(fn->as.fn.env);
             bind_params(call, chosen->as.cons.head, argv, nargs);
-            Cljc *result = eval_body(call, chosen->as.cons.tail);
+            /* first call compiles the body; failures pin TRUE = tree-walk */
+            if (chosen->meta == NULL) {
+                Cljc *ch = vm_compile(call, chosen->as.cons.head,
+                                      chosen->as.cons.tail);
+                chosen->meta = ch ? ch : TRUE;
+            }
+            Cljc *result = chosen->meta->tag == CLJC_CHUNK
+                ? vm_run(call, chosen->meta)
+                : eval_body(call, chosen->as.cons.tail);
             if (!(result && result->tag == CLJC_RECUR)) return result;
             /* recur: the sentinel's value array IS the next argv. */
             recur_keep = result;   /* root the cell across the next iteration */
@@ -2105,6 +2680,22 @@ static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
 /* Build an interpreted fn from the forms after `fn` (or after a defn name):
  * single arity ([params] body...) or multi-arity (([p] b...) ([p q] b...)). */
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
+    /* Arities (and the chunks cached on them) are pure structure: share
+     * them across every closure built from the same source forms. A hot
+     * loop creating a closure per iteration otherwise RECOMPILES its
+     * body each call (5M+ vm_compiles in one profile). */
+    static const char *SYM_ARITIES;
+    if (!SYM_ARITIES) SYM_ARITIES = intern("**arities**", 11);
+    if (forms != NIL && forms->tag == CLJC_LIST && forms->meta != NULL &&
+        forms->meta->tag == CLJC_LIST &&
+        forms->meta->as.cons.head->tag == CLJC_SYMBOL &&
+        forms->meta->as.cons.head->as.sym == SYM_ARITIES) {
+        Cljc *f = alloc(CLJC_FN);
+        f->as.fn.arities = forms->meta->as.cons.tail;
+        f->as.fn.env = env;
+        f->as.fn.is_macro = is_macro;
+        return f;
+    }
     Cljc *arities = NIL, **t = &arities;
     if (forms != NIL && forms->as.cons.head->tag == CLJC_VECTOR) {
         *t = mk_cons(build_arity(forms->as.cons.head, forms->as.cons.tail), NIL);
@@ -2118,6 +2709,8 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
         }
         if (arities == NIL) cljc_error("fn needs at least one arity");
     }
+    if (forms != NIL && forms->tag == CLJC_LIST && forms->meta == NULL)
+        forms->meta = mk_cons(mk_sym(SYM_ARITIES), arities);
     Cljc *f = alloc(CLJC_FN);
     f->as.fn.arities = arities;
     f->as.fn.env = env;
@@ -2234,6 +2827,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
         case CLJC_STRING: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
+        case CLJC_CHUNK:   /* internal; self-evaluates if it ever leaks */
             return form;
         case CLJC_LAZY:
             /* Lazy seqs ARE seqs: in form position (e.g. a macro expansion
@@ -2270,60 +2864,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
         }
         case CLJC_HNODE:
             cljc_error("internal: evaluated a HAMT node");
-        case CLJC_SYMBOL: {
-            /* Locals shadow, so scan non-root frames first (they're tiny);
-             * at the root, hit the per-symbol cache or fill it once. */
-            const char *name = form->as.symc.name;
-            CljcEnv *e = env;
-            for (; e->parent; e = e->parent) {
-                Cljc **p = env_local_find(e, name);
-                if (p) return *p;
-            }
-            Binding *cb = form->as.symc.root_cache;
-            if (cb) return cb->value;
-            if (form->as.symc.home_ns) {   /* library code: own ns wins */
-                char buf[256];
-                snprintf(buf, sizeof buf, "%s/%s", form->as.symc.home_ns, name);
-                const char *qual = intern(buf, strlen(buf));
-                for (Binding *b = e->bindings; b; b = b->next)
-                    if (b->name == qual) { form->as.symc.root_cache = b; return b->value; }
-            }
-            for (Binding *b = e->bindings; b; b = b->next)
-                if (b->name == name) { form->as.symc.root_cache = b; return b->value; }
-            /* alias fallback: m/foo -> foo when m is a registered alias */
-            {
-                const char *slash = strchr(name, '/');
-                if (slash && slash != name) {
-                    const char *pre = intern(name, (size_t)(slash - name));
-                    for (int i = 0; i < n_aliases; i++) {
-                        if (alias_table[i] == pre) {
-                            /* m/foo => <full-ns>/foo, falling back to bare foo
-                             * (pre-isolation libs and core shims) */
-                            char buf[256];
-                            snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
-                            const char *qual = intern(buf, strlen(buf));
-                            const char *bare = intern(slash + 1, strlen(slash + 1));
-                            /* the ns-qualified def must win over any bare
-                             * global of the same name (two passes — a one-
-                             * pass || takes whichever was defined last) */
-                            for (Binding *b = e->bindings; b; b = b->next)
-                                if (b->name == qual) {
-                                    form->as.symc.root_cache = b;
-                                    return b->value;
-                                }
-                            for (Binding *b = e->bindings; b; b = b->next)
-                                if (b->name == bare) {
-                                    form->as.symc.root_cache = b;
-                                    return b->value;
-                                }
-                            break;
-                        }
-                    }
-                }
-            }
-            err_token = name;
-            cljc_error("I don't know what `%s` refers to.", name);
-        }
+        case CLJC_SYMBOL:
+            return resolve_symbol(env, form);
         case CLJC_LIST: {
             /* Macro expansions built with lazy concat/map can carry LAZY
              * tails mid-chain; every special-form walker iterates raw cons
@@ -2925,6 +3467,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             break;
         case CLJC_LAZY:   print_to(sb, to_seq(v), readably); break;  /* realizes! */
         case CLJC_RECUR:  sb_puts(sb, "#<recur>"); break;
+        case CLJC_CHUNK:  sb_puts(sb, "#<chunk>"); break;
         case CLJC_FREE:   sb_puts(sb, "#<freed!>"); break;  /* seeing this is a GC bug */
     }
 }

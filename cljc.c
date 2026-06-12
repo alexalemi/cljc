@@ -3731,8 +3731,9 @@ static Cljc *prim_seq_p(CljcEnv *env, Cljc **argv, int nargs) {
 /* Tiny backtracking matcher. Supported: literals . ^ $ [abc] [a-z] [^...]
  * \d \D \w \W \s \S \n \t \r, ( ) capture groups, (?: ) non-capturing,
  * (?=X) (?!X) lookahead, | alternation, * + ? quantifiers with lazy
- * variants (*? +? ??).
- * Not supported: {n,m}, backreferences, lookbehind. Patterns are plain
+ * variants (*? +? ??), X{n} X{n,} X{n,m} bounded repeats (n,m ≤ 64,
+ * desugared to copies).
+ * Not supported: backreferences, lookbehind. Patterns are plain
  * strings; the #"..." reader literal passes backslashes through raw.
  * Parse-time desugaring: X+ => X X* (atom re-parsed), X? => ALT(X, empty);
  * only star is a real loop, guarded against empty-match cycles. */
@@ -3901,6 +3902,64 @@ static RxChain rx_parse_cat(RxC *c) {
         RxChain atom = rx_parse_atom(c);
         char q = *c->p;
         RxChain unit = atom;
+        if (q == '{' && c->p[1] >= '0' && c->p[1] <= '9') {
+            /* X{n} / X{n,} / X{n,m}: desugar by re-parsing the atom —
+             * n required copies, then a star ({n,}) or m-n optionals. */
+            c->p++;
+            int lo = 0, hi = -1;             /* -1: exactly lo; -2: open */
+            while (*c->p >= '0' && *c->p <= '9') lo = lo * 10 + (*c->p++ - '0');
+            if (*c->p == ',') {
+                c->p++;
+                if (*c->p == '}') hi = -2;
+                else {
+                    hi = 0;
+                    while (*c->p >= '0' && *c->p <= '9') hi = hi * 10 + (*c->p++ - '0');
+                }
+            }
+            if (*c->p != '}') cljc_error("regex: bad {n,m} quantifier");
+            c->p++;
+            if (hi == -1) hi = lo;
+            if (lo > 64 || (hi != -2 && (hi > 64 || hi < lo)))
+                cljc_error("regex: {n,m} out of range");
+            const char *after = c->p;
+            RxChain seq = lo > 0 ? atom : (RxChain){NULL, NULL};
+            for (int k = 1; k < lo; k++) {       /* required copies 2..n */
+                c->p = atom_src;
+                int sg = c->ngroups;
+                RxChain copy = rx_parse_atom(c);
+                c->ngroups = sg;                 /* copies share group numbers */
+                if (!seq.h) seq = copy;
+                else if (copy.h) { seq.t->next = copy.h; seq.t = copy.t; }
+            }
+            if (hi == -2) {                      /* {n,}: append X* */
+                c->p = atom_src;
+                int sg = c->ngroups;
+                RxChain copy = rx_parse_atom(c);
+                c->ngroups = sg;
+                RxChain star = rx_star(c, copy, false);
+                if (!seq.h) seq = star;
+                else { seq.t->next = star.h; seq.t = star.t; }
+            } else {
+                for (int k = lo; k < hi; k++) {  /* optional copies */
+                    c->p = atom_src;
+                    int sg = c->ngroups;
+                    RxChain copy = rx_parse_atom(c);
+                    c->ngroups = sg;
+                    Rx *a = rx_node(c, RX_ALT);
+                    Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
+                    Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
+                    if (copy.t) copy.t->next = j1;
+                    a->child = copy.h ? copy.h : j1;
+                    a->alt = j2;
+                    if (!seq.h) { seq.h = seq.t = a; }
+                    else { seq.t->next = a; seq.t = a; }
+                }
+            }
+            c->p = after;
+            if (!out.h) out = seq;
+            else if (seq.h) { out.t->next = seq.h; out.t = seq.t; }
+            continue;
+        }
         if (q == '*' || q == '+' || q == '?') {
             c->p++;
             bool lazy = *c->p == '?';
@@ -5752,6 +5811,16 @@ static const char *PRELUDE =
     "               (+ (* acc radix) d)))\n"
     "           0 (seq s))))\n"
     "(def Long/parseLong Integer/parseInt)\n"
+    "(defn Integer/toString\n"
+    "  ([n] (str n))\n"
+    "  ([n radix]\n"
+    "   (if (zero? n) \"0\"\n"
+    "       (loop [n n acc \"\"]\n"
+    "         (if (zero? n) acc\n"
+    "             (recur (quot n radix)\n"
+    "                    (str (get cljc/digit-chars (mod n radix)) acc)))))))\n"
+    "(def Long/toString Integer/toString)\n"
+    "(defn Integer/toBinaryString [n] (Integer/toString n 2))\n"
     "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
     /* image-writing stubs: visualization code runs, no PNGs produced */
     "(def BufferedImage/TYPE_3BYTE_BGR 5)\n"

@@ -444,8 +444,10 @@ required by conservative stack scanning, same as Boehm GC).
     The 13 fails: 6 unfixable-ish (jpeg/match custom lib, defproject,
     upstream-broken OPS, 2 missing inputs, cherry-JS), int-array/
     byte-array (2, mutable arrays), 2 huge-apply vstack overflows,
-    Integer/toString (easy shim), 2023 d18 ({n,m} regex quantifiers
-    NOT yet implemented — diagnosed, quick win), 2017 d22 silent fail.
+    Integer/toString and 2023 d18 {n,m} quantifiers ✅ fixed
+    2026-06-12 (X{n}/X{n,}/X{n,m} desugar to atom copies, n,m ≤ 64;
+    Integer/toString with radix + toBinaryString); 2017 d22 turned out
+    to run fine now (perf-bound timeout, not a fail). → 99 passing.
     (Previous tally after batch 7, 2026-06-11: 83/28/40.)
     Batch 5 added MD5 native + interop shims (MessageDigest idiom runs
     verbatim, .indexOf, Integer/parseInt radix, Character/digit). Batch 6:

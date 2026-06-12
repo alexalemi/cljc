@@ -1332,4 +1332,21 @@
 (gc)
 (assert= true (vector? (vec (range 3))))
 
+; bounded regex quantifiers + Integer/toString
+(assert= "aaa" (re-matches #"a{3}" "aaa"))
+(assert= nil (re-matches #"a{3}" "aa"))
+(assert= nil (re-matches #"a{3}" "aaaa"))
+(assert= "aaa" (re-matches #"a{2,4}" "aaa"))
+(assert= nil (re-matches #"a{2,4}" "aaaaa"))
+(assert= "aaaaaa" (re-matches #"a{2,}" "aaaaaa"))
+(assert= nil (re-matches #"a{2,}" "a"))
+(assert= ["R 6 (#70c710)" "R" "6" "#70c710"]
+         (re-matches #"(U|D|L|R) (\d+) \((#[0-9a-f]{6})\)" "R 6 (#70c710)"))
+(assert= ["ab" "b"] (re-matches #"a(b){1}" "ab"))
+(assert= "ff" (Integer/toString 255 16))
+(assert= "101" (Integer/toString 5 2))
+(assert= "1010" (Integer/toBinaryString 10))
+(assert= "42" (Integer/toString 42))
+(assert= "0" (Integer/toString 0 2))
+
 (println "tests complete")

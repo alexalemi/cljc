@@ -446,8 +446,13 @@ required by conservative stack scanning, same as Boehm GC).
     byte-array (2, mutable arrays), 2 huge-apply vstack overflows,
     Integer/toString and 2023 d18 {n,m} quantifiers ✅ fixed
     2026-06-12 (X{n}/X{n,}/X{n,m} desugar to atom copies, n,m ≤ 64;
-    Integer/toString with radix + toBinaryString); 2017 d22 turned out
-    to run fine now (perf-bound timeout, not a fail). → 99 passing.
+    Integer/toString with radix + toBinaryString).
+    SWEEP with the 3.2x binary (2026-06-12): **99 pass / 12 fail /
+    40 timeout** — measured, matching the estimate. The 40 remaining
+    timeouts are brute-force minute+ puzzles needing >>3x (bytecode VM
+    territory). NOTE: 2015 d20 and 2017 d22 now FAIL with no error
+    output (were timeouts) — likely OOM-killed under the 4x/1M GC
+    headroom on those workloads; investigate when doing GC work next.
     (Previous tally after batch 7, 2026-06-11: 83/28/40.)
     Batch 5 added MD5 native + interop shims (MessageDigest idiom runs
     verbatim, .indexOf, Integer/parseInt radix, Character/digit). Batch 6:

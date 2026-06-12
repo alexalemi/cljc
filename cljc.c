@@ -118,11 +118,19 @@ struct Binding {
     struct Binding *next;
 };
 
+/* Non-root envs bind into inline slots first (fn params, let locals) —
+ * one Binding allocation per param was ~18% of hot-loop runtime. The
+ * ROOT env never uses slots: root Binding* must stay stable for the
+ * per-symbol root_cache, and def mutates bindings in place. */
+#define ENV_SLOTS 4
 struct CljcEnv {
-    Binding *bindings;
+    Binding *bindings;  /* overflow chain — and ALL root bindings */
     CljcEnv *parent;    /* doubles as the free-list next pointer when swept */
     uint8_t gcmark;
     uint8_t gcfree;
+    uint8_t nslots;
+    const char *sname[ENV_SLOTS];
+    Cljc *sval[ENV_SLOTS];
 };
 
 /* ───── Forward declarations ─────────────────────────────────────────── */
@@ -351,7 +359,18 @@ static CljcEnv *env_new(CljcEnv *parent) {
     CljcEnv *e = env_alloc();  /* pooled; may trigger a GC */
     e->bindings = NULL;
     e->parent = parent;
+    e->nslots = 0;
     return e;
+}
+
+/* Find a local in ONE env frame: overflow chain first (newer than any
+ * slot — sequential let rebinds shadow), then slots newest-first. */
+static inline Cljc **env_local_find(CljcEnv *e, const char *name) {
+    for (Binding *b = e->bindings; b; b = b->next)
+        if (b->name == name) return &b->value;
+    for (int i = (int)e->nslots - 1; i >= 0; i--)
+        if (e->sname[i] == name) return &e->sval[i];
+    return NULL;
 }
 
 /* Bindings are pooled like cells/envs (a fn call allocates one per param —
@@ -381,6 +400,12 @@ static Binding *binding_alloc(void) {
 }
 
 static void env_define(CljcEnv *env, const char *name, Cljc *value) {
+    if (env->parent && env->nslots < ENV_SLOTS) {  /* root: Bindings only */
+        env->sname[env->nslots] = name;
+        env->sval[env->nslots] = value;
+        env->nslots++;
+        return;
+    }
     Binding *b = binding_alloc();
     b->name = name; b->value = value; b->next = env->bindings;
     env->bindings = b;
@@ -405,18 +430,20 @@ static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
 }
 
 static Cljc *env_lookup(CljcEnv *env, const char *name) {
-    for (CljcEnv *e = env; e; e = e->parent)
-        for (Binding *b = e->bindings; b; b = b->next)
-            if (b->name == name) return b->value;
+    for (CljcEnv *e = env; e; e = e->parent) {
+        Cljc **p = env_local_find(e, name);
+        if (p) return *p;
+    }
     cljc_error("unable to resolve symbol: %s", name);
     return NIL;
 }
 
 static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
     const char *name = intern(raw, strlen(raw));
-    for (CljcEnv *e = env; e; e = e->parent)
-        for (Binding *b = e->bindings; b; b = b->next)
-            if (b->name == name) return b->value;
+    for (CljcEnv *e = env; e; e = e->parent) {
+        Cljc **p = env_local_find(e, name);
+        if (p) return *p;
+    }
     return NULL;
 }
 
@@ -519,6 +546,7 @@ static void mark_env_chain(CljcEnv *e) {
     while (e && !e->gcmark && !e->gcfree) {
         e->gcmark = 1;
         for (Binding *b = e->bindings; b; b = b->next) mark_push(b->value);
+        for (int i = 0; i < (int)e->nslots; i++) mark_push(e->sval[i]);
         e = e->parent;
     }
 }
@@ -696,6 +724,7 @@ static void gc_collect(void) {
                 e->gcfree = 1;
             }
             e->bindings = NULL;
+            e->nslots = 0;
             e->parent = env_freelist;
             env_freelist = e;
         }
@@ -1434,6 +1463,7 @@ static CljcEnv *env_alloc(void) {
     e->parent = NULL;
     e->gcmark = 0;
     e->gcfree = 0;
+    e->nslots = 0;
     return e;
 }
 
@@ -1838,7 +1868,12 @@ static Cljc *eval_body(CljcEnv *env, Cljc *body) {
     return r;
 }
 
-static const char *sym_amp(void) { return intern("&", 1); }
+static const char *sym_amp(void) {
+    static const char *amp;          /* interning is a hash lookup — this
+                                      * ran per param per call in dispatch */
+    if (!amp) amp = intern("&", 1);
+    return amp;
+}
 
 /* Recursive destructuring: bind `pattern` to `value` in `scope`.
  *   symbol            → plain binding
@@ -2212,9 +2247,10 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
              * at the root, hit the per-symbol cache or fill it once. */
             const char *name = form->as.symc.name;
             CljcEnv *e = env;
-            for (; e->parent; e = e->parent)
-                for (Binding *b = e->bindings; b; b = b->next)
-                    if (b->name == name) return b->value;
+            for (; e->parent; e = e->parent) {
+                Cljc **p = env_local_find(e, name);
+                if (p) return *p;
+            }
             Binding *cb = form->as.symc.root_cache;
             if (cb) return cb->value;
             if (form->as.symc.home_ns) {   /* library code: own ns wins */
@@ -2676,6 +2712,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             mk_cons(mk_vector(lb, nparams * 2), rest->as.cons.tail));
                         Cljc *newform = mk_cons(mk_sym(SYM_LOOP),
                             mk_cons(mk_vector(gb, nparams * 2), mk_cons(letform, NIL)));
+                        /* splice: desugar once per site, not per entry */
+                        form->as.cons.head = newform->as.cons.head;
+                        form->as.cons.tail = newform->as.cons.tail;
                         return eval(env, newform);
                     }
                     const char **names = xmalloc(sizeof(char *) * (nparams ? nparams : 1));
@@ -2698,9 +2737,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         Cljc **rvals = r->as.recur.spill
                             ? (Cljc **)r->as.recur.iv[0] : r->as.recur.iv;
                         for (size_t i = 0; i < nparams; i++) {
-                            for (Binding *b = scope->bindings; b; b = b->next) {
-                                if (b->name == names[i]) { b->value = rvals[i]; break; }
-                            }
+                            Cljc **p = env_local_find(scope, names[i]);
+                            if (p) *p = rvals[i];
                         }
                     }
                 }

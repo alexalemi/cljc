@@ -505,6 +505,18 @@ required by conservative stack scanning, same as Boehm GC).
     the args-as-array calling convention / inline env slots is now the
     clear next cut — every call allocates env + one Binding node per
     param. Then NaN-boxing / bytecode VM if still needed.
+    ROUND 2 ✅ (2026-06-12, another ~14%, cumulative ~3.2x): (a) child
+    envs bind into 4 inline slots before Binding overflow (root keeps
+    pure Binding chains — root_cache requires stable Binding*; lookup
+    checks chain-then-slots-backward for shadowing); 6 slots was WORSE
+    (bigger envs made gc sweep traffic visibly slower) — 4 is the spot.
+    (b) sym_amp() now caches the interned "&" — arity dispatch was
+    re-interning (a hash lookup) per param per call: 93M times in one
+    benchmark run. (c) destructuring loop desugar (gensym let rewrite)
+    splices into the form — was rebuilt per loop ENTRY.
+    Benchmarks now: 2015 d9 3.9s, d13 3.7s, 2017 d10 6.2s (from
+    12.8/12.6/18.5 two days ago). Next: eval_inner 33% + gc_collect 22%
+    remain — bytecode VM territory; profile before believing anything.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

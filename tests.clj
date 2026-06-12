@@ -1311,6 +1311,22 @@
 (assert= 3 (count (conj clojure.lang.PersistentQueue/EMPTY 1 2 3)))
 (assert= '(:a 1 :b 2) (mapcat (fn [a b] [a b]) [:a :b] [1 2]))
 (assert= '(:r :u) (take 2 (mapcat (fn [a b] (repeat b a)) (cycle [:r :u]) (range 1 99))))
+; chunked map/filter must not force unrealized lazy tails (iterate +
+; take-while over-realization); iterate defers (f x)
+(def cljc-halt-seq
+  (iterate (fn [x] (if (keyword? x) (throw (ex-info "forced past halt" {}))
+                       (if (= x 3) :halted (inc x)))) 0))
+(assert= '(0 1 2 3) (take-while (fn [x] (not= x :halted)) (map identity cljc-halt-seq)))
+(assert= '(0 2 4) (filter even? (take 6 (iterate inc 0))))
+; multi-binding doseq; into low arities; transients callable
+(assert= [[1 :x] [1 :y] [2 :x] [2 :y]]
+         (let [acc (atom [])]
+           (doseq [a [1 2] b [:x :y]] (swap! acc conj [a b]))
+           @acc))
+(assert= [1 2] (into [1 2]))
+(assert= [] (into))
+(assert= 20 ((transient [10 20 30]) 1))
+
 ; deep structures must not crash the GC mark (worklist, not recursion)
 (assert= 20000 (count (reduce (fn [acc i] (cons i (lazy-seq acc))) nil (range 20000))))
 (gc)

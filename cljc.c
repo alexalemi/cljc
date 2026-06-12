@@ -1983,7 +1983,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
         if (set_contains(fn, a0, &out)) return out;
         return a1;
     }
-    if (fn->tag == CLJC_VECTOR) {
+    if (fn->tag == CLJC_VECTOR || fn->tag == CLJC_TVEC) {  /* transients too */
         if (a0->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
         if (a0->as.i < 0 || (size_t)a0->as.i >= vec_len(fn))
             cljc_error("vector index out of bounds: %lld", (long long)a0->as.i);
@@ -4239,8 +4239,12 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_kw(intern(n, strlen(n)));
 }
 
-/* (cljc/chunk-map* f s n) => [strict-result-list rest-seq]; consumes
- * exactly min(n, len) elements. The chunked-seq workhorse. */
+/* (cljc/chunk-map* f s n) => [strict-result-list rest-seq]; consumes at
+ * most n elements but NEVER FORCES an unrealized lazy tail after the
+ * first element. Already-realized list runs chunk at full speed, but
+ * (map f (iterate g x)) advances one element per step — over-realizing
+ * past a take-while boundary called user fns on values they were never
+ * meant to see (JVM map doesn't chunk unchunked sources either). */
 static Cljc *prim_chunk_map(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *f = argv[0];
     Cljc *s = seq1(argv[1]);
@@ -4249,7 +4253,10 @@ static Cljc *prim_chunk_map(CljcEnv *env, Cljc **argv, int nargs) {
     while (n-- > 0 && s != NIL) {
         *t = mk_cons(apply(env, f, &s->as.cons.head, 1), NIL);
         t = &(*t)->as.cons.tail;
-        s = seq1(s->as.cons.tail);
+        Cljc *tail = s->as.cons.tail;
+        if (tail != NIL && tail->tag == CLJC_LAZY &&
+            !tail->as.lazy.done) { s = tail; break; }
+        s = seq1(tail);
     }
     Cljc *pair[2] = {out, s};
     return mk_vector(pair, 2);
@@ -4265,7 +4272,10 @@ static Cljc *prim_chunk_filter(CljcEnv *env, Cljc **argv, int nargs) {
             *t = mk_cons(s->as.cons.head, NIL);
             t = &(*t)->as.cons.tail;
         }
-        s = seq1(s->as.cons.tail);
+        Cljc *tail = s->as.cons.tail;
+        if (tail != NIL && tail->tag == CLJC_LAZY &&
+            !tail->as.lazy.done) { s = tail; break; }
+        s = seq1(tail);
     }
     Cljc *pair[2] = {out, s};
     return mk_vector(pair, 2);
@@ -5553,11 +5563,15 @@ static const char *PRELUDE =
     "     (when (< ~(nth bindings 0) ~(nth bindings 1))\n"
     "       ~@body\n"
     "       (recur (inc ~(nth bindings 0))))))\n"
+    /* multi-binding doseq nests: (doseq [a as b bs] ...) iterates b per a */
     "(defmacro doseq [bindings & body]\n"
-    "  `(loop [s# (seq ~(nth bindings 1))]\n"
-    "     (when s#\n"
-    "       (let [~(nth bindings 0) (first s#)] ~@body)\n"
-    "       (recur (next s#)))))\n"
+    "  (let [inner (if (> (count bindings) 2)\n"
+    "                (list (cons 'doseq (cons (vec (drop 2 bindings)) body)))\n"
+    "                body)]\n"
+    "    `(loop [s# (seq ~(nth bindings 1))]\n"
+    "       (when s#\n"
+    "         (let [~(nth bindings 0) (first s#)] ~@inner)\n"
+    "         (recur (next s#))))))\n"
     "(defmacro while [test & body]\n"
     "  `(loop [] (when ~test ~@body (recur))))\n"
     /* case: a (v1 v2 ...) test matches any member (Clojure semantics);
@@ -5699,6 +5713,19 @@ static const char *PRELUDE =
     "           0 (seq s))))\n"
     "(def Long/parseLong Integer/parseInt)\n"
     "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
+    /* image-writing stubs: visualization code runs, no PNGs produced */
+    "(def BufferedImage/TYPE_3BYTE_BGR 5)\n"
+    "(def BufferedImage/TYPE_INT_RGB 1)\n"
+    "(defn BufferedImage. [w h type] (atom {:w w :h h}))\n"
+    "(defn .setRGB [img x y rgb] nil)\n"
+    "(defn .getRGB [& _] 0)\n"          /* (.getRGB color) and (.getRGB img x y) */
+    "(defn java.awt.Color. [& _] 0)\n"
+    "(def java.awt.Color/WHITE 0) (def java.awt.Color/BLACK 0)\n"
+    "(def java.awt.Color/RED 0) (def java.awt.Color/GREEN 0)\n"
+    "(def java.awt.Color/BLUE 0) (def java.awt.Color/GRAY 0)\n"
+    "(def java.awt.Color/YELLOW 0) (def java.awt.Color/ORANGE 0)\n"
+    "(defn File. [path] path)\n"
+    "(defn ImageIO/write [img fmt file] true)\n"
     "(def *load-path*\n"
     "  (vec (concat [\".\" \"vendor\"]\n"
     "               (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
@@ -6036,7 +6063,9 @@ CljcEnv *cljc_new_env(void) {
         "(defn range\n"
         "  ([] (iterate inc 0))\n"
         "  ([n] (range* n)) ([a b] (range* a b)) ([a b s] (range* a b s)))\n"
-        "(defn iterate [f x] (lazy-seq (cons x (iterate f (f x)))))\n"
+        /* (f x) must stay deferred: forcing cell N must not compute cell
+         * N+1's value (take-while boundaries, effectful fns) */
+        "(defn iterate [f x] (cons x (lazy-seq (iterate f (f x)))))\n"
         "(defn map\n"
         "  ([f c] (lazy-seq (when-let [s (seq c)]\n"
         "                     (cons (f (first s)) (map f (rest s))))))\n"
@@ -6287,6 +6316,8 @@ CljcEnv *cljc_new_env(void) {
         "  ([f cf] (fn ([] (f)) ([x] (cf x)) ([x y] (f x y)))))\n"
         "(def cljc/into-impl into)\n"
         "(defn into\n"
+        "  ([] [])\n"
+        "  ([to] to)\n"
         "  ([to from] (cljc/into-impl to from))\n"
         "  ([to xform from] (transduce xform conj to from)))\n"
         "(defn reductions\n"

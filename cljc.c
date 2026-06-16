@@ -100,8 +100,13 @@ struct Cljc {
          * subnode. Collision nodes hold same-hash entries linearly. */
         struct { Cljc **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
                  bool collision; uint32_t edit_id; } hnode;
-        /* arities: list of (params-list . body-list) pairs; dispatch by argc */
-        struct { Cljc *arities; CljcEnv *env; bool is_macro; } fn;
+        /* arities: list of (params-list . body-list) pairs; dispatch by argc.
+         * fast-call cache (lazy, filled on first apply): fc_arity is the lone
+         * fixed arity whose params are all simple symbols, count fc_n <=
+         * ENV_SLOTS — lets apply skip arity_info + bind_params/destructure and
+         * fill the call frame's slots directly. NULL => always use slow path. */
+        struct { Cljc *arities; CljcEnv *env; bool is_macro;
+                 bool fc_ready; uint8_t fc_n; Cljc *fc_arity; } fn;
         CljcNativeFn native;
         struct { Cljc *value; } atom;
         struct { Cljc *thunk; Cljc *cached; bool done; } lazy;
@@ -2125,17 +2130,32 @@ static void print_to(SBuf *sb, Cljc *v, bool readably);
  * const:16 | argc:8; REBIND arg = unwind-depth:8 | names const:16.
  * Hence vm_compile's bails: ncode <= 0xffffff, nconst <= 0xffff. */
 enum {
-    VOP_NIL, VOP_TRUE, VOP_FALSE, VOP_CONST, VOP_SYM,
+    VOP_NIL, VOP_TRUE, VOP_FALSE, VOP_CONST, VOP_SYM, VOP_LOCAL,
     VOP_BIND, VOP_DESTRUCT, VOP_NEWENV, VOP_POPENV, VOP_POP,
     VOP_CALL, VOP_JMP, VOP_JMPF, VOP_JMPF_KEEP, VOP_JMPT_KEEP,
     VOP_EVAL, VOP_CLOSURE, VOP_LAZY, VOP_VEC,
     VOP_REBIND, VOP_RECURFN, VOP_RET
 };
 
+/* Lexical addressing: every simple-symbol binding records the frame it
+ * lives in and its slot index within that frame, so a reference compiles
+ * to VOP_LOCAL (depth, slot) — `depth` parent hops then sval[slot] — with
+ * no name comparison or chain scan. A frame goes "opaque" (no indexing for
+ * its own vars) the moment a destructuring bind makes the runtime slot
+ * count unpredictable, or it overflows ENV_SLOTS into the binding chain;
+ * those vars fall back to name-based VOP_SYM. Enclosing indexable frames
+ * stay indexable — opaqueness never changes the env-chain shape, only
+ * whether a var is reachable by slot. Closures compile separate chunks, so
+ * captured (free) vars are never found here and resolve by name, unchanged. */
+#define VMC_MAXFRAME 64
 typedef struct {
     uint32_t *code; uint32_t ncode, ccap;
     Cljc **consts; uint32_t nconst, kcap;
-    const char *locals[256]; int nlocals;      /* compile-time scope names */
+    struct { const char *name; int16_t frame; int16_t slot; } locals[256];
+    int nlocals;                               /* compile-time scope names */
+    int frame;                                 /* current frame nesting    */
+    uint8_t frame_n[VMC_MAXFRAME];             /* slots used per frame      */
+    bool frame_opaque[VMC_MAXFRAME];           /* indexing off for frame    */
     int loop_pc;                               /* innermost loop target    */
     Cljc *loop_names;                          /* its binding symbols      */
     uint32_t loop_nbind;
@@ -2173,19 +2193,37 @@ static uint32_t vmc_const(VmC *c, Cljc *v) {
 
 static bool vmc_local_p(VmC *c, const char *name) {
     for (int i = c->nlocals - 1; i >= 0; i--)
-        if (c->locals[i] == name) return true;
+        if (c->locals[i].name == name) return true;
     return false;
 }
 
-static void vmc_local_push(VmC *c, const char *name) {
+/* Record a name in the current frame. `simple` symbols claim the next slot
+ * (and stay indexable) until the frame goes opaque or fills ENV_SLOTS;
+ * everything else records slot -1 (name-based resolution). */
+static void vmc_bind_name(VmC *c, const char *name, bool simple) {
     if (c->nlocals >= 256) { c->ok = false; return; }   /* chunk bails */
-    c->locals[c->nlocals++] = name;
+    int slot = -1;
+    if (c->frame < VMC_MAXFRAME) {
+        if (simple && !c->frame_opaque[c->frame] &&
+            c->frame_n[c->frame] < ENV_SLOTS) {
+            slot = c->frame_n[c->frame]++;
+        } else if (simple) {
+            /* overflowed ENV_SLOTS into the binding chain — the slot
+             * counter can no longer be trusted for this frame */
+            c->frame_opaque[c->frame] = true;
+        }
+    }
+    c->locals[c->nlocals].name = name;
+    c->locals[c->nlocals].frame = (int16_t)c->frame;
+    c->locals[c->nlocals].slot = (int16_t)slot;
+    c->nlocals++;
 }
 
-/* names bound by a destructuring pattern (for shadow tracking) */
+/* names bound by a destructuring pattern (slot -1: order/count of the
+ * runtime env_defines isn't statically known, so never indexed) */
 static void vmc_pattern_locals(VmC *c, Cljc *pat) {
     if (pat == NIL) return;
-    if (pat->tag == CLJC_SYMBOL) { vmc_local_push(c, pat->as.sym); return; }
+    if (pat->tag == CLJC_SYMBOL) { vmc_bind_name(c, pat->as.sym, false); return; }
     if (pat->tag == CLJC_VECTOR)
         for (size_t i = 0; i < vec_len(pat); i++)
             vmc_pattern_locals(c, vec_nth(pat, i));
@@ -2197,6 +2235,27 @@ static void vmc_pattern_locals(VmC *c, Cljc *pat) {
             else vmc_pattern_locals(c, k);     /* {sym :key} */
         }
 }
+
+/* Bind a let/param pattern: simple symbol → indexable slot; anything else
+ * → the frame goes opaque and its names resolve by name. */
+static void vmc_bind(VmC *c, Cljc *pat) {
+    if (pat != NIL && pat->tag == CLJC_SYMBOL) {
+        vmc_bind_name(c, pat->as.sym, true);
+    } else {
+        if (c->frame < VMC_MAXFRAME) c->frame_opaque[c->frame] = true;
+        vmc_pattern_locals(c, pat);
+    }
+}
+
+/* Enter/leave a runtime env frame (one VOP_NEWENV / VOP_POPENV). */
+static void vmc_frame_enter(VmC *c) {
+    c->frame++;
+    if (c->frame < VMC_MAXFRAME) {
+        c->frame_n[c->frame] = 0;
+        c->frame_opaque[c->frame] = false;
+    }
+}
+static void vmc_frame_leave(VmC *c) { c->frame--; }
 
 static bool vm_special_name(const char *s) {
     /* must stay in sync with eval_inner's special forms (no shared
@@ -2286,9 +2345,21 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             }
             vmc_emit(c, VOP_CONST, vmc_const(c, form));
             return;
-        case CLJC_SYMBOL:
+        case CLJC_SYMBOL: {
+            const char *nm = form->as.sym;
+            for (int i = c->nlocals - 1; i >= 0; i--) {
+                if (c->locals[i].name != nm) continue;
+                int slot = c->locals[i].slot;
+                int depth = c->frame - c->locals[i].frame;
+                if (slot >= 0 && depth >= 0 && depth <= 0xffff) {
+                    vmc_emit(c, VOP_LOCAL, (uint32_t)slot | ((uint32_t)depth << 8));
+                    return;
+                }
+                break;                   /* shadowed but not indexable */
+            }
             vmc_emit(c, VOP_SYM, vmc_const(c, form));
             return;
+        }
         case CLJC_VECTOR: {
             size_t n = vec_len(form);
             if (n > 0xff) { vmc_emit(c, VOP_EVAL, vmc_const(c, form)); return; }
@@ -2402,6 +2473,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             int save_locals = c->nlocals;
             c->loop_depth++;
             vmc_emit(c, VOP_NEWENV, 0);
+            vmc_frame_enter(c);
             for (size_t i = 0; i < vec_len(bv); i += 2) {
                 Cljc *pat = vec_nth(bv, i);
                 vmc_form(c, cenv, vec_nth(bv, i + 1));
@@ -2409,10 +2481,11 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
                     vmc_emit(c, VOP_BIND, vmc_const(c, pat));
                 else
                     vmc_emit(c, VOP_DESTRUCT, vmc_const(c, pat));
-                vmc_pattern_locals(c, pat);
+                vmc_bind(c, pat);
             }
             vmc_body(c, cenv, rest->as.cons.tail);
             vmc_emit(c, VOP_POPENV, 0);
+            vmc_frame_leave(c);
             c->loop_depth--;
             c->nlocals = save_locals;
             return;
@@ -2434,12 +2507,13 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             uint32_t save_nb = c->loop_nbind;
             int save_depth = c->loop_depth;
             vmc_emit(c, VOP_NEWENV, 0);
+            vmc_frame_enter(c);
             Cljc *names = NIL, **t = &names;
             for (size_t i = 0; i < vec_len(bv); i += 2) {
                 Cljc *sym = vec_nth(bv, i);
                 vmc_form(c, cenv, vec_nth(bv, i + 1));
                 vmc_emit(c, VOP_BIND, vmc_const(c, sym));
-                vmc_local_push(c, sym->as.sym);
+                vmc_bind_name(c, sym->as.sym, true);
                 *t = mk_cons(sym, NIL);
                 t = &(*t)->as.cons.tail;
             }
@@ -2450,6 +2524,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             c->loop_depth = 0;
             vmc_body(c, cenv, rest->as.cons.tail);
             vmc_emit(c, VOP_POPENV, 0);
+            vmc_frame_leave(c);
             c->loop_pc = save_pc;
             c->loop_names = save_names;
             c->loop_nbind = save_nb;
@@ -2543,8 +2618,15 @@ static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
     size_t base = vsp;                 /* consts rooted here during build */
     for (Cljc *p = params; p && p->tag == CLJC_LIST; p = p->as.cons.tail) {
         Cljc *pe = p->as.cons.head;
-        if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) continue;
-        vmc_pattern_locals(&c, pe);
+        if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) {
+            /* the rest binding lands in the next slot (one env_define);
+             * a destructuring rest makes the param frame opaque */
+            Cljc *tail = p->as.cons.tail;
+            if (tail != NIL && tail->tag == CLJC_LIST)
+                vmc_bind(&c, tail->as.cons.head);
+            break;
+        }
+        vmc_bind(&c, pe);
     }
     vmc_body(&c, cenv, body);
     vmc_emit(&c, VOP_RET, 0);
@@ -2584,27 +2666,57 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
     (void)chunk_keep;
     CljcEnv * volatile env_keep = env_in;
     CljcEnv *env = env_in;
+    uint32_t ins, a;
+    /* Dispatch: threaded code (one indirect jump per op — far better branch
+     * prediction than a switch's single shared jump) on GCC/Clang via
+     * labels-as-values; a plain switch everywhere else. The op bodies below
+     * are written once and shared by both via the VM_CASE/VM_NEXT macros. */
+#if defined(__GNUC__)
+    static const void *const vmlbl[] = {
+        [VOP_NIL]=&&op_VOP_NIL, [VOP_TRUE]=&&op_VOP_TRUE, [VOP_FALSE]=&&op_VOP_FALSE,
+        [VOP_CONST]=&&op_VOP_CONST, [VOP_SYM]=&&op_VOP_SYM, [VOP_LOCAL]=&&op_VOP_LOCAL,
+        [VOP_BIND]=&&op_VOP_BIND, [VOP_DESTRUCT]=&&op_VOP_DESTRUCT, [VOP_NEWENV]=&&op_VOP_NEWENV,
+        [VOP_POPENV]=&&op_VOP_POPENV, [VOP_POP]=&&op_VOP_POP, [VOP_CALL]=&&op_VOP_CALL,
+        [VOP_JMP]=&&op_VOP_JMP, [VOP_JMPF]=&&op_VOP_JMPF, [VOP_JMPF_KEEP]=&&op_VOP_JMPF_KEEP,
+        [VOP_JMPT_KEEP]=&&op_VOP_JMPT_KEEP, [VOP_EVAL]=&&op_VOP_EVAL, [VOP_CLOSURE]=&&op_VOP_CLOSURE,
+        [VOP_LAZY]=&&op_VOP_LAZY, [VOP_VEC]=&&op_VOP_VEC, [VOP_REBIND]=&&op_VOP_REBIND,
+        [VOP_RECURFN]=&&op_VOP_RECURFN, [VOP_RET]=&&op_VOP_RET,
+    };
+    #define VM_CASE(op) op_##op:
+    #define VM_NEXT()   do { ins = code[pc++]; a = ins >> 8; goto *vmlbl[ins & 0xff]; } while (0)
+    VM_NEXT();
+#else
+    #define VM_CASE(op) case op:
+    #define VM_NEXT()   break
     for (;;) {
-        uint32_t ins = code[pc++];
-        uint32_t a = ins >> 8;
+        ins = code[pc++];
+        a = ins >> 8;
         switch (ins & 0xff) {
-            case VOP_NIL:   vpush(NIL); break;
-            case VOP_TRUE:  vpush(TRUE); break;
-            case VOP_FALSE: vpush(FALSE); break;
-            case VOP_CONST: vpush(K[a]); break;
-            case VOP_SYM:   vpush(resolve_symbol(env, K[a])); break;
-            case VOP_BIND:
+#endif
+            VM_CASE(VOP_NIL)   vpush(NIL); VM_NEXT();
+            VM_CASE(VOP_TRUE)  vpush(TRUE); VM_NEXT();
+            VM_CASE(VOP_FALSE) vpush(FALSE); VM_NEXT();
+            VM_CASE(VOP_CONST) vpush(K[a]); VM_NEXT();
+            VM_CASE(VOP_SYM)   vpush(resolve_symbol(env, K[a])); VM_NEXT();
+            VM_CASE(VOP_LOCAL) {
+                /* lexical address: `depth` parent hops, then sval[slot] */
+                CljcEnv *e = env;
+                for (uint32_t d = a >> 8; d; d--) e = e->parent;
+                vpush(e->sval[a & 0xff]);
+                VM_NEXT();
+            }
+            VM_CASE(VOP_BIND)
                 env_define(env, K[a]->as.sym, vstack[vsp - 1]);
                 vsp--;
-                break;
-            case VOP_DESTRUCT:
+                VM_NEXT();
+            VM_CASE(VOP_DESTRUCT)
                 destructure(env, K[a], vstack[vsp - 1]);
                 vsp--;
-                break;
-            case VOP_NEWENV: env = env_new(env); env_keep = env; break;
-            case VOP_POPENV: env = env->parent; env_keep = env; break;
-            case VOP_POP:    vsp--; break;
-            case VOP_CALL: {
+                VM_NEXT();
+            VM_CASE(VOP_NEWENV) env = env_new(env); env_keep = env; VM_NEXT();
+            VM_CASE(VOP_POPENV) env = env->parent; env_keep = env; VM_NEXT();
+            VM_CASE(VOP_POP)    vsp--; VM_NEXT();
+            VM_CASE(VOP_CALL) {
                 uint32_t n = a & 0xff;
                 Cljc *f = vstack[vsp - n - 1];
                 Cljc *r;
@@ -2624,28 +2736,28 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                     vsp -= n + 1;
                 }
                 vpush(r);
-                break;
+                VM_NEXT();
             }
-            case VOP_JMP:  pc = a; break;
-            case VOP_JMPF: if (!is_truthy(vstack[--vsp])) pc = a; break;
-            case VOP_JMPF_KEEP: if (!is_truthy(vstack[vsp - 1])) pc = a; break;
-            case VOP_JMPT_KEEP: if (is_truthy(vstack[vsp - 1])) pc = a; break;
-            case VOP_EVAL: vpush(eval(env, K[a])); break;
-            case VOP_CLOSURE: vpush(make_fn(env, K[a], false)); break;
-            case VOP_LAZY: {
+            VM_CASE(VOP_JMP)  pc = a; VM_NEXT();
+            VM_CASE(VOP_JMPF) if (!is_truthy(vstack[--vsp])) pc = a; VM_NEXT();
+            VM_CASE(VOP_JMPF_KEEP) if (!is_truthy(vstack[vsp - 1])) pc = a; VM_NEXT();
+            VM_CASE(VOP_JMPT_KEEP) if (is_truthy(vstack[vsp - 1])) pc = a; VM_NEXT();
+            VM_CASE(VOP_EVAL) vpush(eval(env, K[a])); VM_NEXT();
+            VM_CASE(VOP_CLOSURE) vpush(make_fn(env, K[a], false)); VM_NEXT();
+            VM_CASE(VOP_LAZY) {
                 Cljc *t = make_fn(env, K[a], false);
                 Cljc *l = alloc(CLJC_LAZY);
                 l->as.lazy.thunk = t;
                 vpush(l);
-                break;
+                VM_NEXT();
             }
-            case VOP_VEC: {
+            VM_CASE(VOP_VEC) {
                 Cljc *v = mk_vector(&vstack[vsp - a], a);
                 vsp -= a;
                 vpush(v);
-                break;
+                VM_NEXT();
             }
-            case VOP_REBIND: {
+            VM_CASE(VOP_REBIND) {
                 /* arg: low 16 = names-list const idx, high 8 = NEWENVs to
                  * unwind (recur from inside nested lets) */
                 uint32_t k = a & 0xffff, depth = a >> 16;
@@ -2660,9 +2772,9 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                     if (p) *p = vals[i];
                 }
                 vsp -= n;
-                break;
+                VM_NEXT();
             }
-            case VOP_RECURFN: {
+            VM_CASE(VOP_RECURFN) {
                 Cljc *r = alloc(CLJC_RECUR);
                 Cljc **vals = r->as.recur.iv;
                 if (a > 3) {
@@ -2675,16 +2787,43 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                 r->as.recur.n = (uint8_t)a;          /* set n once after */
                 vsp -= a;
                 vpush(r);
-                break;
+                VM_NEXT();
             }
-            case VOP_RET: {
+            VM_CASE(VOP_RET) {
                 Cljc *r = vstack[vsp - 1];
                 vsp = base;
                 (void)env_keep;
                 return r;
             }
+#if !defined(__GNUC__)
         }
     }
+#endif
+    #undef VM_CASE
+    #undef VM_NEXT
+}
+
+/* Decide once whether `fn` qualifies for the direct-slot fast call path:
+ * exactly one arity, fixed (no &), every param a plain symbol, count within
+ * the inline slots. Result cached on the cell (arities are immutable). */
+static void fastcall_init(Cljc *fn) {
+    fn->as.fn.fc_ready = true;
+    fn->as.fn.fc_arity = NULL;
+    fn->as.fn.fc_n = 0;
+    Cljc *arities = fn->as.fn.arities;
+    if (!arities || arities->tag != CLJC_LIST) return;
+    if (arities->as.cons.tail != NIL) return;          /* multi-arity */
+    Cljc *arity = arities->as.cons.head;
+    int n = 0;
+    for (Cljc *p = arity->as.cons.head; p && p->tag == CLJC_LIST; p = p->as.cons.tail) {
+        Cljc *pe = p->as.cons.head;
+        if (pe == NIL || pe->tag != CLJC_SYMBOL) return;   /* destructuring */
+        if (pe->as.sym == sym_amp()) return;               /* variadic     */
+        n++;
+    }
+    if (n > ENV_SLOTS) return;
+    fn->as.fn.fc_arity = arity;
+    fn->as.fn.fc_n = (uint8_t)n;
 }
 
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
@@ -2695,20 +2834,38 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
          * optimizer must not elide it. */
         Cljc * volatile recur_keep = NIL;
         (void)recur_keep;
+        if (!fn->as.fn.fc_ready) fastcall_init(fn);
         for (;;) {
-            /* Dispatch: exact param-count match wins; variadic is fallback. */
-            Cljc *chosen = NULL, *fallback = NULL;
-            for (Cljc *ar = fn->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
-                Cljc *arity = ar->as.cons.head;
-                size_t fixed; bool variadic;
-                arity_info(arity->as.cons.head, &fixed, &variadic);
-                if (!variadic && (size_t)nargs == fixed) { chosen = arity; break; }
-                if (variadic && (size_t)nargs >= fixed && !fallback) fallback = arity;
+            Cljc *chosen;
+            CljcEnv *call;
+            if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
+                /* fast path: fill the frame's slots straight from argv, no
+                 * arity_info walk and no bind_params/destructure calls. */
+                chosen = fn->as.fn.fc_arity;
+                call = env_new(fn->as.fn.env);
+                Cljc *p = chosen->as.cons.head;
+                for (int i = 0; i < nargs; i++) {
+                    call->sname[i] = p->as.cons.head->as.sym;
+                    call->sval[i] = argv[i];
+                    p = p->as.cons.tail;
+                }
+                call->nslots = (uint8_t)nargs;
+            } else {
+                /* slow dispatch: exact param-count match wins; variadic is fallback. */
+                Cljc *fallback = NULL;
+                chosen = NULL;
+                for (Cljc *ar = fn->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
+                    Cljc *arity = ar->as.cons.head;
+                    size_t fixed; bool variadic;
+                    arity_info(arity->as.cons.head, &fixed, &variadic);
+                    if (!variadic && (size_t)nargs == fixed) { chosen = arity; break; }
+                    if (variadic && (size_t)nargs >= fixed && !fallback) fallback = arity;
+                }
+                if (!chosen) chosen = fallback;
+                if (!chosen) cljc_error("no matching arity for %d args", nargs);
+                call = env_new(fn->as.fn.env);
+                bind_params(call, chosen->as.cons.head, argv, nargs);
             }
-            if (!chosen) chosen = fallback;
-            if (!chosen) cljc_error("no matching arity for %d args", nargs);
-            CljcEnv *call = env_new(fn->as.fn.env);
-            bind_params(call, chosen->as.cons.head, argv, nargs);
             /* first call compiles the body; failures pin TRUE = tree-walk.
              * TRUE is pinned BEFORE compiling: a throw mid-compilation
              * (macro expander erroring) must not retry-and-leak the

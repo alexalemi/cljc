@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <setjmp.h>
 #include <math.h>
 #include <time.h>
@@ -66,9 +67,12 @@ static int cljc_wsa_init(void) {   /* idempotent winsock startup */
 #else
 #include <sys/socket.h>  /* tcp primitives (clerk notebook server) */
 #include <netinet/in.h>
+#include <arpa/inet.h>   /* inet_addr — tcp/listen host binding */
 #include <poll.h>
 #include <sys/resource.h>  /* setrlimit — main() raises the stack ceiling */
 #include <dlfcn.h>          /* dlopen — FFI module loading */
+#include <ucontext.h>       /* makecontext/swapcontext — coroutine primitive */
+#define CLJC_HAVE_CORO 1
 #define sock_close close
 #define cljc_wsa_init() 0
 #endif  /* _WIN32 */
@@ -106,6 +110,7 @@ typedef enum {
     CLJC_HNODE,     /* internal: HAMT tree node — never user-visible */
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
     CLJC_CHUNK,     /* internal: compiled bytecode for one fn arity body */
+    CLJC_CORO,      /* stackful coroutine (coro/new): own C stack + vstack segment */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
 } CljcTag;
 
@@ -158,6 +163,7 @@ struct Cljc {
         struct { Cljc *iv[3]; uint8_t n; bool spill; } recur;
         struct { uint32_t *code; Cljc **consts;
                  uint32_t ncode; uint16_t nconst; } chunk;
+        struct Coro *coro;   /* CLJC_CORO: heap-allocated coroutine state */
     } as;
 };
 
@@ -248,6 +254,47 @@ static ErrFrame *err_top;
 static jmp_buf err_jmp;
 static char err_msg[256];
 static Cljc *cur_exc;   /* exception value in flight; a GC root */
+
+/* ───── Coroutines (stackful, ucontext-backed) ───────────────────────────
+ * A Coro owns its own C stack; the interpreter runs on it normally (eval
+ * recurses), and coro/yield does a swapcontext back to whoever resumed it.
+ * Single-threaded + cooperative, so no locks. The fiddly parts are all about
+ * the GC and the few interpreter globals that are really "per execution":
+ *   - the value stack (vstack) is SHARED; a coro's operands live in a
+ *     contiguous segment above its resumer's top. On yield we copy that
+ *     segment out (vsave) and rewind vsp; on resume we copy it back. vbase is
+ *     recaptured every resume (a coro may be resumed from different depths).
+ *   - err_top / cur_exc / eval_sp are saved/restored per switch; each coro
+ *     installs its own base ErrFrame so a throw never longjmps across stacks.
+ *   - the conservative GC scans each reachable suspended coro's live stack
+ *     range + its saved register blob (the ucontext) + its vsave segment. */
+#ifdef CLJC_HAVE_CORO
+typedef enum { CORO_NEW, CORO_SUSPENDED, CORO_RUNNING, CORO_NORMAL, CORO_DEAD } CoroStatus;
+typedef struct Coro {
+    Cljc *self;            /* the CLJC_CORO cell wrapping this (GC back-ref) */
+    Cljc *thunk;           /* zero-arg fn run by the body (GC root) */
+    Cljc *xfer;            /* value handed across resume/yield (GC root) */
+    Cljc *error;           /* value of an uncaught throw, else NULL (GC root) */
+    ucontext_t ctx;        /* machine context saved while suspended */
+    char *stack;           /* malloc'd stack (low address) */
+    size_t stack_size;
+    char *stack_top;       /* stack + stack_size (high address) */
+    void *saved_sp;        /* approx SP at last switch-away — GC scan low bound */
+    CoroStatus status;
+    struct Coro *resumer;  /* who resumed us; NULL = resumed by main */
+    Cljc **vsave;          /* copied vstack segment while suspended */
+    int vsave_n;
+    int vbase;             /* vstack depth captured at last resume */
+    ErrFrame *s_err_top;   /* saved err_top while suspended */
+    Cljc *s_cur_exc;
+    int s_eval_sp;
+} Coro;
+
+static Coro *coro_current;        /* NULL = main is the active context */
+static ucontext_t coro_main_ctx;  /* main's context saved while a coro runs */
+static void *coro_main_saved_sp;  /* main's SP at the point it entered coro-land */
+static void coro_mark_scan(Coro *c);   /* GC: scan a coro's roots + stack */
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn))
@@ -655,6 +702,11 @@ static void gc_drain(void) {
                 for (uint16_t i = 0; i < v->as.chunk.nconst; i++)
                     mark_push(v->as.chunk.consts[i]);
                 break;
+#ifdef CLJC_HAVE_CORO
+            case CLJC_CORO:
+                if (v->as.coro) coro_mark_scan(v->as.coro);
+                break;
+#endif
             default:
                 break;
         }
@@ -705,6 +757,45 @@ static void gc_mark_conservative(uintptr_t w) {
     }
 }
 
+#ifdef CLJC_HAVE_CORO
+/* Worklist-safe variants of the conservative scan: they PUSH found objects
+ * instead of gc_mark'ing (which would re-enter gc_drain). Used to scan a
+ * suspended coroutine's stack from inside the drain loop. */
+static void mark_cons_word(uintptr_t w) {
+    if (w < gc_pool_lo || w >= gc_pool_hi) return;
+    for (CellBlock *b = cell_blocks; b; b = b->next) {
+        uintptr_t lo = (uintptr_t)b->cells, hi = (uintptr_t)(b->cells + b->used);
+        if (w >= lo && w < hi) { mark_push(&b->cells[(w - lo) / sizeof(Cljc)]); return; }
+    }
+    for (EnvBlock *b = env_blocks; b; b = b->next) {
+        uintptr_t lo = (uintptr_t)b->envs, hi = (uintptr_t)(b->envs + b->used);
+        if (w >= lo && w < hi) { mark_env_chain(&b->envs[(w - lo) / sizeof(CljcEnv)]); return; }
+    }
+}
+static void scan_range_push(void *lo_, void *hi_) {
+    uintptr_t lo = ((uintptr_t)lo_ + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
+    for (uintptr_t *p = (uintptr_t *)lo; (void *)p < hi_; p++) mark_cons_word(*p);
+}
+
+/* Mark a coroutine's roots. For a SUSPENDED coro we also conservatively scan
+ * its live C-stack range, its saved registers (the ucontext blob), and its
+ * saved vstack segment. The ACTIVE coro's live stack is scanned by gc_collect
+ * with the real SP, so we skip the stack scan here for it. */
+static void coro_mark_scan(Coro *c) {
+    mark_push(c->thunk);
+    mark_push(c->xfer);
+    mark_push(c->error);
+    if (c->resumer) mark_push(c->resumer->self);
+    for (int i = 0; i < c->vsave_n; i++) mark_push(c->vsave[i]);
+    if (c != coro_current &&
+        (c->status == CORO_SUSPENDED || c->status == CORO_NORMAL) &&
+        c->saved_sp) {
+        scan_range_push(c->saved_sp, c->stack_top);          /* live stack */
+        scan_range_push(&c->ctx, (char *)&c->ctx + sizeof c->ctx);  /* regs */
+    }
+}
+#endif
+
 /* The conservative scan reads raw stack memory — dead frames, redzones, all
  * of it. That is by design, but it is exactly what AddressSanitizer polices,
  * so exempt this one function. (ASan runs also need
@@ -737,10 +828,28 @@ static void gc_collect(void) {
     for (size_t vi = 0; vi < vsp; vi++) gc_mark(vstack[vi]);
     for (int i = 0; i < gc_n_root_envs; i++) gc_mark_env(gc_root_envs[i]);
 
-    if (gc_stack_base) {
+    /* Active stack scan. When a coroutine is running, the live C stack is the
+     * coro's, not main's — scan between the real SP and the active stack's
+     * high bound (the coro's stack top, or main's gc_stack_base). */
+    void *active_top = gc_stack_base;
+#ifdef CLJC_HAVE_CORO
+    if (coro_current) {
+        active_top = coro_current->stack_top;
+        gc_mark(coro_current->self);   /* root the running coro + its resume chain */
+        /* main is suspended at the point it entered coro-land: scan its frames
+         * plus its saved registers (held in coro_main_ctx). */
+        if (coro_main_saved_sp && gc_stack_base) {
+            void *lo = coro_main_saved_sp < gc_stack_base ? coro_main_saved_sp : gc_stack_base;
+            void *hi = coro_main_saved_sp < gc_stack_base ? gc_stack_base : coro_main_saved_sp;
+            gc_scan_range(lo, hi);
+        }
+        gc_scan_range(&coro_main_ctx, (char *)&coro_main_ctx + sizeof coro_main_ctx);
+    }
+#endif
+    if (active_top) {
         void *sp = &regs;
-        void *lo = sp < gc_stack_base ? sp : gc_stack_base;
-        void *hi = sp < gc_stack_base ? gc_stack_base : sp;
+        void *lo = sp < active_top ? sp : active_top;
+        void *hi = sp < active_top ? active_top : sp;
         gc_scan_range(lo, hi);
     }
     gc_scan_range(&regs, (char *)&regs + sizeof regs);
@@ -768,6 +877,15 @@ static void gc_collect(void) {
                     case CLJC_RECUR:
                         if (c->as.recur.spill) free(c->as.recur.iv[0]);
                         break;
+#ifdef CLJC_HAVE_CORO
+                    case CLJC_CORO:
+                        if (c->as.coro) {
+                            free(c->as.coro->stack);
+                            free(c->as.coro->vsave);
+                            free(c->as.coro);
+                        }
+                        break;
+#endif
                     default: break;  /* maps own nothing — their root is a cell */
                 }
                 c->tag = CLJC_FREE;
@@ -3136,7 +3254,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL:
         case CLJC_STRING: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
-        case CLJC_ATOM: case CLJC_TVEC:
+        case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
         case CLJC_CHUNK:   /* internal; self-evaluates if it ever leaks */
             return form;
@@ -3771,6 +3889,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
         case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
         case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
+        case CLJC_CORO:   sb_puts(sb, "#<coroutine>"); break;
         case CLJC_ATOM:
             sb_puts(sb, "#atom[");
             print_to(sb, v->as.atom.value, readably);
@@ -5255,6 +5374,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_SET: n = "set"; break;
         case CLJC_ATOM: n = "atom"; break;
         case CLJC_FN: case CLJC_NATIVE: n = "fn"; break;
+        case CLJC_CORO: n = "coroutine"; break;
         default: n = "unknown"; break;
     }
     return mk_kw(intern(n, strlen(n)));
@@ -5785,6 +5905,59 @@ static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
+/* (cljc/sleep-ms* ms) → sleep this many milliseconds (csp timeouts). */
+static Cljc *prim_sleep_ms(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs < 1) return NIL;
+    double ms = as_num(argv[0]);
+    if (ms <= 0) return NIL;
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000.0);
+    ts.tv_nsec = (long)((ms - (double)ts.tv_sec * 1000.0) * 1e6);
+    nanosleep(&ts, NULL);
+#endif
+    return NIL;
+}
+
+/* (cljc/poll-fds* fds events timeout-ms) → readiness vector for the csp event
+ * loop. fds/events are parallel vectors; event bit 1 = wait-readable, bit 2 =
+ * wait-writable. Returns a vector of ints with bit 1 set when readable (or the
+ * peer hung up / errored, so a parked reader wakes to see EOF) and bit 2 when
+ * writable. timeout-ms: 0 polls, -1 blocks until something is ready. */
+static Cljc *prim_poll_fds(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs < 3) cljc_error("cljc/poll-fds*: (fds events timeout-ms)");
+    if (argv[0]->tag != CLJC_VECTOR || argv[1]->tag != CLJC_VECTOR)
+        cljc_error("cljc/poll-fds*: fds and events must be vectors");
+    size_t n = vec_len(argv[0]);
+    int timeout = (int)as_int(argv[2], "poll-fds*");
+    if (n == 0) { (void)timeout; return mk_vector(NULL, 0); }
+    struct pollfd *pfd = xmalloc(sizeof(struct pollfd) * n);
+    for (size_t i = 0; i < n; i++) {
+        int ev = (int)as_int(vec_nth(argv[1], i), "poll-fds*");
+        pfd[i].fd = (int)as_int(vec_nth(argv[0], i), "poll-fds*");
+        pfd[i].events = (short)(((ev & 1) ? POLLIN : 0) | ((ev & 2) ? POLLOUT : 0));
+        pfd[i].revents = 0;
+    }
+    poll(pfd, (nfds_t)n, timeout);
+    /* revents are 0..3 — all smallints (immortal), so building the result
+     * vector triggers no GC hazard for the in-flight item array. */
+    Cljc **items = xmalloc(sizeof(Cljc *) * n);
+    for (size_t i = 0; i < n; i++) {
+        int re = 0;
+        if (pfd[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) re |= 1;
+        if (pfd[i].revents & POLLOUT) re |= 2;
+        items[i] = mk_int(re);
+    }
+    Cljc *out = mk_vector(items, n);
+    free(items);
+    free(pfd);
+    return out;
+}
+
 /* (cljc/epoch*) → unix seconds (libc.clj's now-epoch; the C time symbol
  * must not be FFI-bound by name — it would shadow the core time macro). */
 static Cljc *prim_epoch(CljcEnv *env, Cljc **argv, int nargs) {
@@ -5826,6 +5999,10 @@ static Cljc *prim_tcp_listen(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     if (cljc_wsa_init() != 0) cljc_error("tcp/listen: winsock init failed");
     int port = (int)as_int(argv[0], "tcp/listen");
+    /* Optional host arg. Default 127.0.0.1 (loopback-only, the safe default
+     * that nREPL relies on); pass "0.0.0.0" to listen on all interfaces, or a
+     * specific dotted IP (e.g. a tailscale address) to bind just that one. */
+    const char *host = nargs > 1 ? as_str(argv[1], "tcp/listen") : NULL;
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) cljc_error("tcp/listen: cannot create socket");
     int one = 1;
@@ -5833,11 +6010,20 @@ static Cljc *prim_tcp_listen(CljcEnv *env, Cljc **argv, int nargs) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (!host || !*host) {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (!strcmp(host, "0.0.0.0") || !strcmp(host, "*")) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        addr.sin_addr.s_addr = inet_addr(host);
+        if (addr.sin_addr.s_addr == INADDR_NONE)
+            cljc_error("tcp/listen: bad host address '%s'", host);
+    }
     addr.sin_port = htons((uint16_t)port);
     if (bind(srv, (struct sockaddr *)&addr, sizeof addr) < 0) {
         sock_close(srv);
-        cljc_error("tcp/listen: cannot bind 127.0.0.1:%d (port in use?)", port);
+        cljc_error("tcp/listen: cannot bind %s:%d (port in use?)",
+                   host && *host ? host : "127.0.0.1", port);
     }
     if (listen(srv, 16) < 0) { sock_close(srv); cljc_error("tcp/listen: listen failed"); }
     return mk_int(srv);
@@ -5890,6 +6076,49 @@ static Cljc *prim_tcp_close(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     sock_close((int)as_int(argv[0], "tcp/close"));
     return NIL;
+}
+
+/* (tcp/send-some* fd str start) → ONE non-blocking send of str[start..]. Returns
+ * bytes written (≥0), -1 if it would block (caller should park on POLLOUT and
+ * retry), or -2 on a dead peer. The backpressure primitive for csp's send!. */
+static Cljc *prim_tcp_send_some(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs < 2) cljc_error("tcp/send-some*: (fd str [start])");
+    int fd = (int)as_int(argv[0], "tcp/send-some*");
+    char *s = as_str(argv[1], "tcp/send-some*");
+    size_t total = strlen(s);
+    size_t start = nargs > 2 ? (size_t)as_int(argv[2], "tcp/send-some*") : 0;
+    if (start >= total) return mk_int(0);
+    int flags = MSG_NOSIGNAL;
+#ifdef MSG_DONTWAIT
+    flags |= MSG_DONTWAIT;
+#endif
+    ssize_t n = send(fd, s + start, total - start, flags);
+    if (n >= 0) return mk_int((int64_t)n);
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return mk_int(-1);
+    return mk_int(-2);
+}
+
+/* (tcp/connect host port) → a connected client fd. */
+static Cljc *prim_tcp_connect(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (cljc_wsa_init() != 0) cljc_error("tcp/connect: winsock init failed");
+    if (nargs < 2) cljc_error("tcp/connect: (host port)");
+    const char *host = as_str(argv[0], "tcp/connect");
+    int port = (int)as_int(argv[1], "tcp/connect");
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) cljc_error("tcp/connect: cannot create socket");
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = strcmp(host, "localhost") ? inet_addr(host)
+                                                      : htonl(INADDR_LOOPBACK);
+    if (addr.sin_addr.s_addr == INADDR_NONE)
+        { sock_close(fd); cljc_error("tcp/connect: bad host '%s'", host); }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0)
+        { sock_close(fd); cljc_error("tcp/connect: cannot reach %s:%d", host, port); }
+    return mk_int(fd);
 }
 
 /* ── with-out-str ──
@@ -6410,6 +6639,165 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
     }
 }
 
+/* ── coroutine engine (Lua-style: new / resume / yield / status) ──
+ * The save/restore dance: a SWITCH-IN (resume) installs the target's vstack
+ * segment + scalar state then swapcontexts; a SWITCH-OUT (yield / die) stashes
+ * the leaving coro's segment, installs the resumer's state, then swapcontexts.
+ * So each direction restores exactly the context it jumps to. */
+#ifdef CLJC_HAVE_CORO
+#define CORO_STACK_SIZE (1u << 20)   /* 1 MiB per coro (eval recurses) */
+
+static ErrFrame *main_s_err_top;
+static Cljc *main_s_cur_exc;
+static int main_s_eval_sp;
+
+static void state_save(Coro *c) {
+    if (c) { c->s_err_top = err_top; c->s_cur_exc = cur_exc; c->s_eval_sp = eval_sp; }
+    else   { main_s_err_top = err_top; main_s_cur_exc = cur_exc; main_s_eval_sp = eval_sp; }
+}
+static void state_load(Coro *c) {
+    if (c) { err_top = c->s_err_top; cur_exc = c->s_cur_exc; eval_sp = c->s_eval_sp; }
+    else   { err_top = main_s_err_top; cur_exc = main_s_cur_exc; eval_sp = main_s_eval_sp; }
+}
+
+/* Switch INTO target, passing val. Runs on the resumer's context. */
+static Cljc *coro_resume(Coro *target, Cljc *val) {
+    Coro *resumer = coro_current;
+    char anchor;
+    if (resumer) resumer->saved_sp = &anchor; else coro_main_saved_sp = &anchor;
+    state_save(resumer);
+    if (resumer) resumer->status = CORO_NORMAL;
+    target->resumer = resumer;
+    target->vbase = (int)vsp;
+    if (target->vsave_n) {                       /* restore stashed operands */
+        memcpy(&vstack[vsp], target->vsave, sizeof(Cljc *) * target->vsave_n);
+        vsp += (size_t)target->vsave_n;
+        free(target->vsave); target->vsave = NULL; target->vsave_n = 0;
+    }
+    target->xfer = val;
+    coro_current = target; target->status = CORO_RUNNING;
+    state_load(target);
+    swapcontext(resumer ? &resumer->ctx : &coro_main_ctx, &target->ctx);
+    /* ← target yielded or died back to us; it already restored our state. */
+    return target->xfer;
+}
+
+/* Switch OUT to the resumer with the given exit status (SUSPENDED or DEAD). */
+static void coro_switch_out(Coro *self, CoroStatus st, void *sp) {
+    self->saved_sp = sp;
+    free(self->vsave); self->vsave = NULL; self->vsave_n = 0;
+    int n = (int)vsp - self->vbase;
+    if (st == CORO_SUSPENDED && n > 0) {         /* stash live operands */
+        self->vsave = xmalloc(sizeof(Cljc *) * (size_t)n);
+        memcpy(self->vsave, &vstack[self->vbase], sizeof(Cljc *) * (size_t)n);
+        self->vsave_n = n;
+    }
+    vsp = (size_t)self->vbase;
+    state_save(self);
+    self->status = st;
+    Coro *resumer = self->resumer;
+    coro_current = resumer;
+    if (resumer) resumer->status = CORO_RUNNING;
+    state_load(resumer);
+}
+
+static Cljc *coro_yield(Cljc *val) {
+    Coro *self = coro_current;
+    if (!self) cljc_error("coro/yield outside a coroutine");
+    char anchor;
+    self->xfer = val;
+    coro_switch_out(self, CORO_SUSPENDED, &anchor);
+    swapcontext(&self->ctx, self->resumer ? &self->resumer->ctx : &coro_main_ctx);
+    /* ← resumed again; coro_resume restored our vstack + state. */
+    return self->xfer;
+}
+
+static void coro_trampoline(void) {
+    Coro *self = coro_current;
+    ErrFrame base; base.prev = NULL; base.vsp_save = vsp; base.esp_save = eval_sp;
+    err_top = &base;
+    if (setjmp(base.jb) == 0) {
+        self->xfer = apply(gc_root_envs[0], self->thunk, NULL, 0);
+        self->error = NULL;
+    } else {
+        vsp = base.vsp_save; eval_sp = base.esp_save;
+        self->error = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
+        self->xfer = self->error;
+    }
+    coro_switch_out(self, CORO_DEAD, NULL);
+    setcontext(self->resumer ? &self->resumer->ctx : &coro_main_ctx);
+    /* unreachable */
+}
+
+static Cljc *coro_new(Cljc *thunk) {
+    Cljc *cell = alloc(CLJC_CORO);     /* as.coro zeroed → GC-safe before attach */
+    Coro *co = xmalloc(sizeof(Coro));
+    memset(co, 0, sizeof *co);
+    co->self = cell; co->thunk = thunk; co->xfer = NIL; co->error = NULL;
+    co->s_cur_exc = NIL; co->status = CORO_NEW;
+    co->stack = xmalloc(CORO_STACK_SIZE);
+    co->stack_size = CORO_STACK_SIZE;
+    co->stack_top = co->stack + CORO_STACK_SIZE;
+    getcontext(&co->ctx);
+    co->ctx.uc_stack.ss_sp = co->stack;
+    co->ctx.uc_stack.ss_size = CORO_STACK_SIZE;
+    co->ctx.uc_link = NULL;
+    makecontext(&co->ctx, coro_trampoline, 0);
+    cell->as.coro = co;
+    return cell;
+}
+
+static Cljc *prim_coro_new(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs < 1) cljc_error("coro/new: needs a thunk");
+    Cljc *f = argv[0];
+    if (!(f->tag == CLJC_FN || f->tag == CLJC_NATIVE))
+        cljc_error("coro/new: argument must be a function");
+    return coro_new(f);
+}
+static Cljc *prim_coro_resume(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs < 1 || argv[0]->tag != CLJC_CORO) cljc_error("coro/resume: not a coroutine");
+    Coro *co = argv[0]->as.coro;
+    if (co->status == CORO_DEAD) cljc_error("coro/resume: coroutine is dead");
+    if (co->status == CORO_RUNNING || co->status == CORO_NORMAL)
+        cljc_error("coro/resume: coroutine is already running");
+    Cljc *r = coro_resume(co, nargs > 1 ? argv[1] : NIL);
+    if (co->status == CORO_DEAD && co->error) cljc_throw_value(co->error);  /* propagate */
+    return r;
+}
+static Cljc *prim_coro_yield(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    return coro_yield(nargs > 0 ? argv[0] : NIL);
+}
+static Cljc *prim_coro_status(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs < 1 || argv[0]->tag != CLJC_CORO) cljc_error("coro/status: not a coroutine");
+    const char *s;
+    switch (argv[0]->as.coro->status) {
+        case CORO_NEW: s = "new"; break;
+        case CORO_SUSPENDED: s = "suspended"; break;
+        case CORO_RUNNING: s = "running"; break;
+        case CORO_NORMAL: s = "normal"; break;
+        default: s = "dead"; break;
+    }
+    return mk_kw(intern(s, strlen(s)));
+}
+static Cljc *prim_coro_alive(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs < 1 || argv[0]->tag != CLJC_CORO) cljc_error("coro/alive?: not a coroutine");
+    return argv[0]->as.coro->status == CORO_DEAD ? FALSE : TRUE;
+}
+#else  /* no coroutine support (e.g. Windows) */
+static Cljc *prim_coro_new(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs; cljc_error("coroutines unavailable on this platform");
+}
+static Cljc *prim_coro_resume(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+static Cljc *prim_coro_yield(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+static Cljc *prim_coro_status(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+static Cljc *prim_coro_alive(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+#endif  /* CLJC_HAVE_CORO */
+
 /* ── sh / FFI (the s7 cload model: generate glue C, compile, dlopen) ── */
 
 static Cljc *prim_sh(CljcEnv *env, Cljc **argv, int nargs) {
@@ -6454,6 +6842,11 @@ typedef struct {
     void *(*nth_arg)(void *args, int i);
     void (*def_native)(void *env, const char *name, void *(*fn)(void *, void *, int));
     void (*error)(const char *msg);
+    /* Appended for struct-by-value marshalling (raylib et al.): build a cljc
+     * vector from struct fields (returns), and read a field out of a passed
+     * vector (args). Append-only — never reorder the slots above. */
+    void *(*mk_vec)(void **items, int n);
+    void *(*nth_elem)(void *vec, int i);
 } CljcFfiApi;
 
 static void *fa_mk_int(long long i) { return mk_int((int64_t)i); }
@@ -6470,10 +6863,13 @@ static void fa_def_native(void *env, const char *name, void *(*fn)(void *, void 
     cljc_define_native((CljcEnv *)env, name, (CljcNativeFn)fn);
 }
 static void fa_error(const char *msg) { cljc_error("%s", msg); }
+static void *fa_mk_vec(void **items, int n) { return mk_vector((Cljc **)items, (size_t)n); }
+static void *fa_nth_elem(void *vec, int i) { return vec_nth((Cljc *)vec, (size_t)i); }
 
 static CljcFfiApi ffi_api = {
     fa_mk_int, fa_mk_double, fa_mk_str, fa_nil,
     fa_as_int, fa_as_double, fa_as_str, fa_nth_arg, fa_def_native, fa_error,
+    fa_mk_vec, fa_nth_elem,
 };
 
 static Cljc *prim_ffi_load(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7027,6 +7423,11 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "seq?",    prim_seq_p);
     cljc_define_native(e, "type",    prim_type);
     cljc_define_native(e, "sh",        prim_sh);
+    cljc_define_native(e, "coro/new",    prim_coro_new);
+    cljc_define_native(e, "coro/resume", prim_coro_resume);
+    cljc_define_native(e, "coro/yield",  prim_coro_yield);
+    cljc_define_native(e, "coro/status", prim_coro_status);
+    cljc_define_native(e, "coro/alive?", prim_coro_alive);
     cljc_define_native(e, "hash",      prim_hash);
     cljc_define_native(e, "cljc/env*",      prim_getenv_raw);
     cljc_define_native(e, "cljc/sharedir*", prim_sharedir);
@@ -7147,6 +7548,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "spit",    prim_spit);
     cljc_define_native(e, "cljc/mtime*", prim_mtime);
     cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
+    cljc_define_native(e, "cljc/sleep-ms*", prim_sleep_ms);
+    cljc_define_native(e, "cljc/poll-fds*", prim_poll_fds);
     cljc_define_native(e, "cljc/epoch*", prim_epoch);
     cljc_define_native(e, "cljc/md5*", prim_md5);
     cljc_define_native(e, "read-line", prim_read_line);
@@ -7159,6 +7562,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "tcp/recv",   prim_tcp_recv);
     cljc_define_native(e, "tcp/send",   prim_tcp_send);
     cljc_define_native(e, "tcp/close",  prim_tcp_close);
+    cljc_define_native(e, "tcp/connect", prim_tcp_connect);
+    cljc_define_native(e, "tcp/send-some*", prim_tcp_send_some);
     cljc_define_native(e, "cljc/with-out-str*", prim_with_out_str);
     cljc_define_native(e, "pr",      prim_pr);
     cljc_define_native(e, "prn",     prim_prn);
@@ -7546,45 +7951,69 @@ CljcEnv *cljc_new_env(void) {
         "       \" double(*as_double)(void*); const char*(*as_str)(void*);\"\n"
         "       \" void*(*nth_arg)(void*,int);\"\n"
         "       \" void(*def_native)(void*,const char*,void*(*)(void*,void*,int));\"\n"
-        "       \" void(*error)(const char*); } CljcFfiApi;\\n\"\n"
+        "       \" void(*error)(const char*);\"\n"
+        "       \" void*(*mk_vec)(void**,int); void*(*nth_elem)(void*,int);\"\n"
+        "       \" } CljcFfiApi;\\n\"\n"
         "       \"static CljcFfiApi *api;\\n\"))\n"
         "(defn cljc/ffi-build [code libs]\n"
-        "  (let [base (str \"/tmp/cljc-ffi3-\" (Math/abs (hash (str code libs))))]\n"
+        "  (let [base (str \"/tmp/cljc-ffi4-\" (Math/abs (hash (str code libs))))]\n"
         "    (when-not (zero? (:exit (sh (str \"test -f \" base \".so\"))))\n"
         "      (spit (str base \".c\") code)\n"
         "      (let [r (sh (str \"cc -shared -fPIC -O2 -o \" base \".so \" base \".c \" libs))]\n"
         "        (when-not (zero? (:exit r))\n"
         "          (throw (ex-info (str \"ffi: compile failed:\\n\" (:out r)) {})))))\n"
         "    (ffi-load* (str base \".so\"))))\n"
-        "(defn cljc/ffi-ret [t expr]\n"
+        "(defn cljc/ffi-scalar-in [t expr]\n"
         "  (case t\n"
-        "    :int (str \"return api->mk_int(\" expr \");\")\n"
-        "    :double (str \"return api->mk_double(\" expr \");\")\n"
-        "    :string (str \"return api->mk_str(\" expr \");\")\n"
-        "    :pointer (str \"return api->mk_int((long long)(\" expr \"));\")\n"
-        "    :void (str expr \"; return api->nil();\")))\n"
-        "(defn cljc/ffi-arg [t i]\n"
+        "    :int (str \"api->as_int(\" expr \")\")\n"
+        "    :double (str \"api->as_double(\" expr \")\")\n"
+        "    :float (str \"(float)api->as_double(\" expr \")\")\n"
+        "    :string (str \"api->as_str(\" expr \")\")\n"
+        "    :pointer (str \"(void*)api->as_int(\" expr \")\")))\n"
+        "(defn cljc/ffi-scalar-out [t expr]\n"
         "  (case t\n"
-        "    :int (str \"api->as_int(api->nth_arg(args, \" i \"))\")\n"
-        "    :double (str \"api->as_double(api->nth_arg(args, \" i \"))\")\n"
-        "    :string (str \"api->as_str(api->nth_arg(args, \" i \"))\")\n"
-        "    :pointer (str \"(void*)api->as_int(api->nth_arg(args, \" i \"))\")))\n"
-        "(defn cljc/ffi-wrapper [[ret cname argts]]\n"
-        "  (str \"static void *w_\" cname \"(void *env, void *args, int nargs) { (void)env; \"\n"
-        "       \"if (nargs < \" (count argts) \") api->error(\\\"\" cname \": too few args\\\"); \"\n"
-        "       (cljc/ffi-ret ret (str cname \"(\"\n"
-        "                              (str/join \", \" (map-indexed (fn [i t] (cljc/ffi-arg t i)) argts))\n"
+        "    :int (str \"api->mk_int(\" expr \")\")\n"
+        "    :double (str \"api->mk_double(\" expr \")\")\n"
+        "    :float (str \"api->mk_double((double)(\" expr \"))\")\n"
+        "    :string (str \"api->mk_str(\" expr \")\")\n"
+        "    :pointer (str \"api->mk_int((long long)(\" expr \"))\")))\n"
+        /* A type is a scalar keyword (:int etc.) or a struct reference (a
+         * string/symbol) that keys into the :structs registry. */
+        "(defn cljc/ffi-ret [structs t expr]\n"
+        "  (cond\n"
+        "    (= t :void) (str expr \"; return api->nil();\")\n"
+        "    (keyword? t) (str \"return \" (cljc/ffi-scalar-out t expr) \";\")\n"
+        "    :else\n"
+        "    (let [fields (get structs (str t)) n (count fields)]\n"
+        "      (str \"{ \" t \" _r = \" expr \"; void *_i[\" n \"]; \"\n"
+        "           (str/join \" \" (map-indexed (fn [j [ft fnm]]\n"
+        "                            (str \"_i[\" j \"] = \" (cljc/ffi-scalar-out ft (str \"_r.\" fnm)) \";\"))\n"
+        "                          fields))\n"
+        "           \" return api->mk_vec(_i, \" n \"); }\"))))\n"
+        "(defn cljc/ffi-arg [structs t i]\n"
+        "  (if (keyword? t)\n"
+        "    (cljc/ffi-scalar-in t (str \"api->nth_arg(args, \" i \")\"))\n"
+        "    (let [fields (get structs (str t)) a (str \"api->nth_arg(args, \" i \")\")]\n"
+        "      (str \"(\" t \"){\"\n"
+        "           (str/join \", \" (map-indexed (fn [j [ft _]]\n"
+        "                            (cljc/ffi-scalar-in ft (str \"api->nth_elem(\" a \", \" j \")\")))\n"
+        "                          fields))\n"
+        "           \"}\"))))\n"
+        "(defn cljc/ffi-wrapper [structs sig]\n"
+        "  (let [[ret cname argts] sig]\n"
+        "    (str \"static void *w_\" cname \"(void *env, void *args, int nargs) { (void)env; \"\n"
+        "         \"if (nargs < \" (count argts) \") api->error(\\\"\" cname \": too few args\\\"); \"\n"
+        "         (cljc/ffi-ret structs ret (str cname \"(\"\n"
+        "                              (str/join \", \" (map-indexed (fn [i t] (cljc/ffi-arg structs t i)) argts))\n"
         "                              \")\"))\n"
-        "       \" }\\n\"))\n"
+        "         \" }\\n\")))\n"
         "(defn ffi/define*\n"
         "  ([sigs] (ffi/define* sigs {}))\n"
-        "  ([sigs {:keys [headers libs prefix] :or {headers [] libs \"\" prefix \"\"}}]\n"
-        "   (let [base (atom nil)\n"
-        "         api-decl cljc/ffi-api-decl\n"
-        "         code (str \"#define _GNU_SOURCE\\n\"\n"
+        "  ([sigs {:keys [headers libs prefix structs] :or {headers [] libs \"\" prefix \"\" structs {}}}]\n"
+        "   (let [code (str \"#define _GNU_SOURCE\\n\"\n"
         "                   (str/join \"\" (map (fn [h] (str \"#include <\" h \">\\n\")) headers))\n"
-        "                   api-decl\n"
-        "                   (str/join \"\" (map cljc/ffi-wrapper sigs))\n"
+        "                   cljc/ffi-api-decl\n"
+        "                   (str/join \"\" (map (fn [s] (cljc/ffi-wrapper structs s)) sigs))\n"
         "                   \"void cljc_module_init(void *env, CljcFfiApi *a) { api = a;\\n\"\n"
         "                   (str/join \"\" (map (fn [[_ cname _]]\n"
         "                                        (str \"  api->def_native(env, \\\"\" prefix cname \"\\\", w_\" cname \");\\n\"))\n"
@@ -7600,10 +8029,10 @@ CljcEnv *cljc_new_env(void) {
         "         pfx (str \"struct \" sn \" *p = (struct \" sn \"*)(long long)api->as_int(api->nth_arg(args,0)); \")\n"
         "         getter (fn [[t f]]\n"
         "                  (str \"static void *w_get_\" sn \"_\" f \"(void *env, void *args, int nargs) { (void)env; (void)nargs; \"\n"
-        "                       pfx (cljc/ffi-ret t (str \"p->\" f)) \" }\\n\"))\n"
+        "                       pfx (cljc/ffi-ret {} t (str \"p->\" f)) \" }\\n\"))\n"
         "         setter (fn [[t f]]\n"
         "                  (str \"static void *w_set_\" sn \"_\" f \"(void *env, void *args, int nargs) { (void)env; (void)nargs; \"\n"
-        "                       pfx \"p->\" f \" = \" (cljc/ffi-arg t 1) \"; return api->nil(); }\\n\"))\n"
+        "                       pfx \"p->\" f \" = \" (cljc/ffi-arg {} t 1) \"; return api->nil(); }\\n\"))\n"
         "         code (str \"#define _GNU_SOURCE\\n\"\n"
         "                   (str/join \"\" (map (fn [h] (str \"#include <\" h \">\\n\")) headers))\n"
         "                   \"#include <stdlib.h>\\n\"\n"

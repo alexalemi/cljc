@@ -590,6 +590,83 @@ required by conservative stack scanning, same as Boehm GC).
     value — divergence).
     Next perf ideas if ever needed: compile-time local slot indices
     (skip env scan), direct-threaded dispatch, apply fast path.
+37. ~~Example suite + FFI structs/floats + GUI/DB bindings~~ ✅ done
+    2026-06-21 — (a) examples/ gallery: 15 self-contained programs
+    (mandelbrot, life, primes/lazy, nqueens, sudoku, calc parser,
+    brainfuck, macros, shapes/polymorphism, dijkstra, wordfreq, bank/
+    atoms, ffi-demo, sqlite, fractal-svg) + examples/serve.clj, a gallery
+    HTTP server written IN cljc (runs each example, captures output,
+    highlight.js page). (b) FFI gained :float (marshals via as_double/
+    mk_double with a (float) cast) and STRUCT-BY-VALUE: a :structs
+    registry {"Color" [[:int "r"]...]} lets sigs reference C struct types;
+    struct args cross as cljc vectors (destructured with new vtable
+    nth_elem), struct returns come back as vectors (built with new vtable
+    mk_vec). Both appended to CljcFfiApi (append-only preserved); cache
+    prefix ffi3->ffi4. The generated wrapper #includes the real headers so
+    the C compiler handles the actual by-value ABI — no libffi. (c)
+    raylib.clj: full binding built on the above (Color/Vector2/Rectangle
+    structs, :float args, GetMousePosition struct return) — verified to
+    LOAD + init raylib through the FFI; window/GL-context creation needs a
+    real display (use xvfb-run headless). (d) sqlite.clj: libsqlite3 via a
+    shim header (static inline wrappers flatten sqlite3** out-params to
+    handle-returning calls) — open/exec/prepare/step/column, runs against
+    real libsqlite3. (e) tcp/listen gained an optional host arg (default
+    loopback unchanged; "0.0.0.0" for LAN/tailscale) so serve.clj is
+    remote-viewable. Regression tests in tests.clj cover :float + struct
+    arg/return. NOTE: a stray raylib.h in the repo root is a saved GitHub
+    HTML page (bad download), not the header — unused by the build.
+38. ~~Coroutines + core.async~~ ✅ done 2026-06-22 — the suspend/resume
+    substrate the language was missing (cf. PLAN comparison w/ Janet fibers
+    / s7 call/cc). (a) C PRIMITIVE: CLJC_CORO, a stackful Lua-style coroutine
+    (coro/new / resume / yield / status / alive?) over ucontext, Linux-only
+    (CLJC_HAVE_CORO; Windows errors cleanly, CreateFiber a future option).
+    Each coro owns a 1 MiB C stack; the interpreter recurses on it normally
+    and yield swapcontexts back to the resumer. The fiddly bits, all solved:
+    the SHARED vstack is saved/restored as a per-coro segment on yield/resume
+    (vbase recaptured each resume — a coro can be resumed from any depth);
+    err_top/cur_exc/eval_sp saved per switch; each coro installs its own base
+    ErrFrame so a throw never longjmps across stacks (it propagates to the
+    resumer via coro/resume instead). GC: a CLJC_CORO mark case conservatively
+    scans each reachable SUSPENDED coro's live stack range + its ucontext
+    register blob + its saved vstack segment; gc_collect scans the ACTIVE
+    coro's stack with the real SP (not gc_stack_base) and the suspended-main
+    range; unreferenced suspended coros are collectible (5000 created+dropped
+    → 14 MB RSS, stacks freed). Verified: generators, value passing, nesting,
+    operands-live-across-yield, exception propagation, GC-stress with
+    suspended coros holding the only refs, ASan/UBSan clean (modulo the known
+    benign makecontext warning). Added cljc/sleep-ms* native. (b) csp.clj:
+    the ClojureScript model of core.async (single-threaded, cooperative) on
+    the primitive — chan (buffered/unbuffered), <! / >! (park via yield), go /
+    go-loop (each a coroutine; returns a result channel), close!, timeout,
+    alts! (take-only, shared commit-flag handler), a cooperative scheduler,
+    and <!! (blocking take — cljc's bonus over JS core.async, pumps the
+    scheduler). examples/csp-sieve.clj: the concurrent prime sieve (one
+    filter goroutine per prime). Regression tests in tests.clj (coro +
+    csp), pass normal + GC-stress + ASan. (c) ASYNC I/O EVENT LOOP ✅ done
+    2026-06-22 — the scheduler's idle phase now poll()s the fds that parked
+    goroutines wait on (bounded by the nearest timer; blocks until ready when
+    only I/O is pending), turning the cooperative scheduler into a real event
+    loop (~Janet ev/). New C: cljc/poll-fds* (parallel fds/events vectors +
+    timeout → readiness vector; encoding 1=read/closed, 2=write) and
+    tcp/connect (completes the socket surface for clients). csp.clj gained
+    park-io + accept!/recv!/send! (park on readiness, then the now-non-blocking
+    tcp op, so one slow connection never stalls the others). examples/
+    csp-http-server.clj: a concurrent async HTTP server, one go block per
+    connection on a single thread. Regression test: loopback echo server+client
+    through the event loop (normal + GC-stress + ASan clean). CAVEAT surfaced:
+    deferred closures over a dotimes/loop binding see its FINAL value (cljc
+    reuses loop bindings in place) — pass via a fn param for per-iteration
+    capture. (d) BACKPRESSURE + COMBINATORS 2026-06-22 — send! is now
+    backpressure-correct: tcp/send-some* (one non-blocking send via
+    MSG_DONTWAIT, returns bytes/-1 would-block/-2 dead) + a POLLOUT-park loop,
+    so a slow client can't stall the loop. csp.clj combinators (core.async-
+    flavored, all go-block based): onto-chan!/to-chan!, pipe, into, merge
+    (fan-in), mult/tap/untap/untap-all (broadcast fan-out), take-n. Capstone
+    example: examples/csp-chat.clj — a broadcast chat server (mult/tap + event
+    loop; many nc/telnet clients, one thread). Combinator + chat regression
+    tests in tests.clj (normal + GC-stress + ASan clean). REMAINING: channels
+    with transducers ((chan n xform)); pub/sub + mix; dynamic bindings still
+    don't convey across a park (same as JVM core.async).
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

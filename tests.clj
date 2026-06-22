@@ -775,6 +775,31 @@
 (set-timeval-tv_sec! tv 42)
 (assert= 42 (timeval-tv_sec tv))
 (free tv)
+
+; ── FFI :float + struct-by-value (the raylib enablers) ──
+; :float marshals through as_double/mk_double with a (float) cast.
+(ffi/define [[:float sqrtf [:float]] [:float powf [:float :float]]]
+            {:headers ["math.h"] :libs "-lm"})
+(assert= 4.0 (sqrtf 16.0))
+(assert= 8.0 (powf 2.0 3.0))
+; struct RETURN by value: div() returns div_t {int quot; int rem;} — comes
+; back as a cljc vector of the declared fields.
+(ffi/define [["div_t" div [:int :int]]]
+            {:headers ["stdlib.h"]
+             :structs {"div_t" [[:int "quot"] [:int "rem"]]}})
+(assert= [3 2] (div 17 5))
+; struct ARG by value (via a temp header): a vector is destructured into the
+; struct fields with nth_elem. Covers both struct arg and struct return.
+(spit "/tmp/cljc_test_ffi.h"
+      (str "typedef struct { int r,g,b,a; } TColor;\n"
+           "static inline int tc_luma(TColor c){ return (c.r+c.g+c.b)/3; }\n"
+           "static inline TColor tc_gray(int v){ return (TColor){v,v,v,255}; }\n"))
+(ffi/define [[:int "tc_luma" ["TColor"]] ["TColor" "tc_gray" [:int]]]
+            {:headers ["cljc_test_ffi.h"] :libs "-I/tmp"
+             :structs {"TColor" [[:int "r"] [:int "g"] [:int "b"] [:int "a"]]}})
+(assert= 100 (tc_luma [90 100 110 255]))
+(assert= [42 42 42 255] (tc_gray 42))
+
 (load-file "json.clj")
 (assert= {"a" [1 2.5 true nil]} (json/parse "{\"a\": [1, 2.5, true, null]}"))
 (assert= {:a {:b [1 -3]}} (json/parse "{\"a\": {\"b\": [1, -3]}}" {:keywords? true}))
@@ -1382,5 +1407,76 @@
 (defn cljc-vmtest-or [or] (or 1 2))
 (assert= 1 (cljc-vmtest-or (fn [a b] :param)))         ; special form beats param (eval parity)
 (assert= :threw (try (do ((fn [] (cond :x)))) (catch Exception e :threw)))  ; odd cond errors
+
+; ── coroutines (the C primitive) + csp.clj (core.async) ──
+(def cljc-coro-g (coro/new (fn [] (coro/yield 1) (coro/yield 2) :done)))
+(assert= :new (coro/status cljc-coro-g))
+(assert= 1 (coro/resume cljc-coro-g))
+(assert= 2 (coro/resume cljc-coro-g))
+(assert= :suspended (coro/status cljc-coro-g))
+(assert= :done (coro/resume cljc-coro-g))
+(assert= :dead (coro/status cljc-coro-g))
+; value passing + operands live on the vstack across a yield (segment save)
+(def cljc-coro-vp (coro/new (fn [] (+ 100 (* 2 (coro/yield :a))))))
+(assert= :a (coro/resume cljc-coro-vp))
+(assert= 110 (coro/resume cljc-coro-vp 5))             ; 100 + 2*5, partials survived
+; a suspended coro holds the only refs to heap data across a GC
+(def cljc-coro-gc (coro/new (fn [] (let [v (vec (range 64))] (coro/yield :built) (reduce + v)))))
+(coro/resume cljc-coro-gc)
+(gc)
+(assert= 2016 (coro/resume cljc-coro-gc))              ; sum 0..63, survived collection
+; exceptions escape the body and propagate to the resumer
+(def cljc-coro-boom (coro/new (fn [] (coro/yield :ok) (throw (ex-info "x" {:n 9})))))
+(assert= :ok (coro/resume cljc-coro-boom))
+(assert= 9 (try (coro/resume cljc-coro-boom) (catch Exception e (:n (ex-data e)))))
+
+(require '[csp :as cljc-a])
+; producer/consumer over a buffered channel
+(def cljc-csp-out (atom nil))
+(let [ch (cljc-a/chan 4)]
+  (cljc-a/go (dotimes [i 5] (cljc-a/>! ch (* i i))) (cljc-a/close! ch))
+  (reset! cljc-csp-out
+    (cljc-a/<!! (cljc-a/go-loop [acc []]
+                  (let [v (cljc-a/<! ch)]
+                    (if (nil? v) acc (recur (conj acc v))))))))
+(assert= [0 1 4 9 16] @cljc-csp-out)
+; <!! of a go's return value
+(assert= 4950 (cljc-a/<!! (cljc-a/go (reduce + (range 100)))))
+; unbuffered rendezvous between two go blocks
+(def cljc-csp-pp (atom []))
+(let [ping (cljc-a/chan) pong (cljc-a/chan)]
+  (cljc-a/go (dotimes [i 3] (cljc-a/>! ping i) (swap! cljc-csp-pp conj (cljc-a/<! pong))))
+  (cljc-a/go-loop [] (let [v (cljc-a/<! ping)] (cljc-a/>! pong (* v 10)) (recur)))
+  (cljc-a/run!))
+(assert= [0 10 20] @cljc-csp-pp)
+; alts! picks a ready channel
+(assert= :hit (let [r (cljc-a/chan 1)]
+                (cljc-a/<!! (cljc-a/go (cljc-a/>! r :hit) (first (cljc-a/alts! [r]))))))
+; async I/O event loop: a loopback echo server + client, both go blocks, served
+; through poll() — no blocking, one thread
+(def cljc-csp-srv (tcp/listen 8094 "127.0.0.1"))
+(cljc-a/go (let [c (cljc-a/accept! cljc-csp-srv)]
+             (cljc-a/send! c (str "echo:" (cljc-a/recv! c)))
+             (tcp/close c)))
+(assert= "echo:ping"
+  (cljc-a/<!! (cljc-a/go (let [fd (tcp/connect "127.0.0.1" 8094)]
+                           (cljc-a/send! fd "ping")
+                           (let [r (cljc-a/recv! fd)] (tcp/close fd) r)))))
+(tcp/close cljc-csp-srv)
+; combinators: merge (fan-in) + into (drain)
+(assert= 136 (reduce + (cljc-a/<!! (cljc-a/into []
+                         (cljc-a/merge [(cljc-a/to-chan! [1 2 3])
+                                        (cljc-a/to-chan! [10 20])
+                                        (cljc-a/to-chan! [100])])))))
+; mult/tap: one source broadcast to two taps
+(let [src (cljc-a/chan) m (cljc-a/mult src) t1 (cljc-a/chan 8) t2 (cljc-a/chan 8)]
+  (cljc-a/tap m t1) (cljc-a/tap m t2)
+  (cljc-a/onto-chan! src [:a :b :c])
+  (assert= [:a :b :c] (cljc-a/<!! (cljc-a/into [] t1)))
+  (assert= [:a :b :c] (cljc-a/<!! (cljc-a/into [] t2))))
+; pipe + take-n
+(assert= [0 1 2 3 4]
+  (let [to (cljc-a/chan 4)] (cljc-a/pipe (cljc-a/to-chan! (range 50)) to)
+       (cljc-a/<!! (cljc-a/take-n 5 to))))
 
 (println "tests complete")

@@ -25,10 +25,53 @@
 #include <unistd.h>      /* isatty, close — REPL detection, tcp primitives */
 #include <sys/stat.h>    /* stat — file mtimes (clerk file watching) */
 #include <dirent.h>      /* opendir — directory walking (clerk dir mode) */
+#ifdef _WIN32
+/* ── Windows portability shims ──
+ * mingw-w64 ships unistd/sys/stat/dirent, but not the BSD sockets, poll,
+ * setrlimit, or dlopen families. Map them onto winsock2 and the Win32
+ * loader so the whole file compiles; features that can't be emulated
+ * cheaply (nREPL fd-as-socket, raw-mode line editor) degrade at their
+ * call sites. Bundles (-DCLJC_NO_MAIN) only need the socket + dlopen
+ * shims; the rest is for a native cljc.exe build. */
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>    /* WSAPoll, inet_pton */
+#include <windows.h>     /* LoadLibraryA / GetProcAddress for ffi-load* */
+#undef TRUE              /* windows.h defines these as 1/0; cljc uses them */
+#undef FALSE             /* as the names of its boolean singleton globals  */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0   /* no SIGPIPE on Windows; nothing to suppress */
+#endif
+#define poll       WSAPoll
+#define sock_close closesocket
+#define popen      _popen
+#define pclose     _pclose
+#define WEXITSTATUS(s) (s)            /* _pclose already returns the exit code */
+#define RTLD_NOW   0
+#define RTLD_LOCAL 0
+static void *dlopen(const char *path, int flags) {
+    (void)flags; return (void *)LoadLibraryA(path);
+}
+static void *dlsym(void *h, const char *sym) {
+    return (void *)(uintptr_t)GetProcAddress((HMODULE)h, sym);
+}
+static int dlclose(void *h) { return FreeLibrary((HMODULE)h) ? 0 : -1; }
+static const char *dlerror(void) { return "dynamic load failed"; }
+static int cljc_wsa_init(void) {   /* idempotent winsock startup */
+    static int done = 0;
+    if (!done) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return -1; done = 1; }
+    return 0;
+}
+#else
 #include <sys/socket.h>  /* tcp primitives (clerk notebook server) */
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/resource.h>  /* setrlimit — main() raises the stack ceiling */
+#include <dlfcn.h>          /* dlopen — FFI module loading */
+#define sock_close close
+#define cljc_wsa_init() 0
+#endif  /* _WIN32 */
 
 #define CLJC_VERSION "0.1.0"
 #ifndef CLJC_SHAREDIR
@@ -5632,8 +5675,12 @@ static Cljc *prim_mtime(CljcEnv *env, Cljc **argv, int nargs) {
     char *path = as_str(argv[0], "cljc/mtime*");
     struct stat st;
     if (stat(path, &st) != 0) return NIL;
+#ifdef _WIN32
+    return mk_int((int64_t)st.st_mtime * 1000);   /* second resolution only */
+#else
     return mk_int((int64_t)st.st_mtim.tv_sec * 1000
                   + st.st_mtim.tv_nsec / 1000000);
+#endif
 }
 
 /* ── MD5 (RFC 1321) — backs util/md5-style hashing puzzles ── */
@@ -5726,9 +5773,16 @@ static Cljc *prim_isatty(CljcEnv *env, Cljc **argv, int nargs) {
 /* (cljc/now-ms*) → monotonic milliseconds as a double (for `time`). */
 static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
+#ifdef _WIN32
+    LARGE_INTEGER freq, ctr;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&ctr);
+    return mk_double((double)ctr.QuadPart * 1000.0 / (double)freq.QuadPart);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return mk_double((double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6);
+#endif
 }
 
 /* (cljc/epoch*) → unix seconds (libc.clj's now-epoch; the C time symbol
@@ -5770,21 +5824,22 @@ static Cljc *prim_list_dir(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_tcp_listen(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    if (cljc_wsa_init() != 0) cljc_error("tcp/listen: winsock init failed");
     int port = (int)as_int(argv[0], "tcp/listen");
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) cljc_error("tcp/listen: cannot create socket");
     int one = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)port);
     if (bind(srv, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        close(srv);
+        sock_close(srv);
         cljc_error("tcp/listen: cannot bind 127.0.0.1:%d (port in use?)", port);
     }
-    if (listen(srv, 16) < 0) { close(srv); cljc_error("tcp/listen: listen failed"); }
+    if (listen(srv, 16) < 0) { sock_close(srv); cljc_error("tcp/listen: listen failed"); }
     return mk_int(srv);
 }
 
@@ -5833,7 +5888,7 @@ static Cljc *prim_tcp_send(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_tcp_close(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    close((int)as_int(argv[0], "tcp/close"));
+    sock_close((int)as_int(argv[0], "tcp/close"));
     return NIL;
 }
 
@@ -5847,7 +5902,12 @@ static Cljc *prim_with_out_str(CljcEnv *env, Cljc **argv, int nargs) {
      * read it back after a longjmp into this frame. */
     char *volatile buf = NULL;
     size_t blen = 0;
+#ifdef _WIN32
+    /* no open_memstream on Windows: spool to a temp file, read back on close */
+    FILE *ms = tmpfile();
+#else
     FILE *ms = open_memstream((char **)&buf, &blen);
+#endif
     if (!ms) cljc_error("with-out-str: out of memory");
     FILE *saved = cljc_out;
     cljc_out = ms;
@@ -5869,7 +5929,17 @@ static Cljc *prim_with_out_str(CljcEnv *env, Cljc **argv, int nargs) {
         cljc_raise();
     }
     cljc_out = saved;
+#ifdef _WIN32
+    fflush(ms);
+    long sz = ftell(ms);
+    if (sz < 0) sz = 0;
+    rewind(ms);
+    buf = malloc((size_t)sz + 1);
+    if (buf) { blen = fread(buf, 1, (size_t)sz, ms); buf[blen] = 0; }
+    fclose(ms);
+#else
     fclose(ms);                    /* flush: buf/blen now final */
+#endif
     Cljc *r = mk_str(buf ? (char *)buf : "", blen);
     free((char *)buf);
     return r;
@@ -6304,8 +6374,6 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 /* ── sh / FFI (the s7 cload model: generate glue C, compile, dlopen) ── */
-
-#include <dlfcn.h>
 
 static Cljc *prim_sh(CljcEnv *env, Cljc **argv, int nargs) {
     /* (sh "cmd") => {:exit n :out "captured stdout+stderr"} */
@@ -7567,7 +7635,9 @@ static int run_stream(CljcEnv *env, FILE *f, const char *name) {
  * completion against live root bindings, live syntax highlighting,
  * paren-balance multiline, *1 *2 *3 result history. Zero dependencies. */
 
+#ifndef _WIN32
 #include <termios.h>
+#endif
 
 #define RL_MAX 8192
 #define HIST_MAX 512
@@ -7765,6 +7835,13 @@ static void rl_complete(char *buf, size_t *len, size_t *pos, const char *prompt)
 
 /* Read one edited line; returns false on EOF (ctrl-d on empty). */
 static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
+#ifdef _WIN32
+    /* No termios on Windows: plain line input, no in-line editing/history. */
+    fputs(prompt, stdout); fflush(stdout);
+    if (!fgets(buf, (int)bufcap, stdin)) return false;
+    buf[strcspn(buf, "\n")] = 0;
+    return true;
+#else
     struct termios orig, raw;
     if (tcgetattr(0, &orig) == -1) {            /* not a tty after all */
         if (!fgets(buf, (int)bufcap, stdin)) return false;
@@ -7851,6 +7928,7 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
         }
         rl_refresh(prompt, buf, pos);
     }
+#endif  /* _WIN32 */
 }
 
 static bool balanced(const char *s) {
@@ -7961,6 +8039,7 @@ static int run_repl(CljcEnv *env) {
  * to cljc: ./cljc --nrepl [port]. Single client at a time, blocking IO.
  * Ops: clone, describe, eval, load-file, close, ls-sessions, interrupt. */
 
+#ifndef _WIN32   /* the server loop relies on fdopen() over a socket fd */
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -8123,7 +8202,16 @@ static void nrepl_serve_client(int fd, CljcEnv *env) {
     fclose(out);
 }
 
+#endif  /* _WIN32 (nREPL helpers) */
+
 static int nrepl_server(CljcEnv *env, int port) {
+#ifdef _WIN32
+    /* nREPL wraps the client socket in a FILE* via fdopen(); Windows sockets
+     * are not C file descriptors, so this loop can't run as-is. */
+    (void)env; (void)port;
+    fprintf(stderr, "nREPL server is not supported on Windows builds\n");
+    return 1;
+#else
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
     int one = 1;
@@ -8143,6 +8231,7 @@ static int nrepl_server(CljcEnv *env, int port) {
         if (fd < 0) continue;
         nrepl_serve_client(fd, env);   /* one client at a time */
     }
+#endif  /* _WIN32 */
 }
 
 /* ───── subcommands ──────────────────────────────────────────────────── */
@@ -8239,12 +8328,14 @@ int main(int argc, char **argv) {
      * kernel grows the main stack on demand up to the soft limit, and
      * the conservative GC only scans the used portion. (The iterative
      * eval that removes this need is future bytecode-VM work.) */
+#ifndef _WIN32
     struct rlimit rl;
     if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
         rlim_t want = 1024ul * 1024 * 1024;   /* 1 GB */
         if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) want = rl.rlim_max;
         if (want > rl.rlim_cur) { rl.rlim_cur = want; setrlimit(RLIMIT_STACK, &rl); }
     }
+#endif
     cljc_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
     CljcEnv *env = cljc_new_env();
     const char *cmd = argc > 1 ? argv[1] : NULL;

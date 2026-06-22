@@ -85,15 +85,32 @@ version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
 ## Standalone binaries
 
 ```sh
-./cljc bundle.clj myscript.clj mybinary   # one ~130 KB executable, no deps
+./cljc bundle.clj myscript.clj mybinary       # one ~180 KB executable, no deps
+./cljc bundle.clj --static myscript.clj out   # static: no glibc dep, best to share
+./cljc bundle.clj --windows myscript.clj out.exe   # cross-compile a Windows .exe
 ```
 
-`bundle.clj` (30 lines of cljc) embeds your script next to the runtime and
-compiles the result — Janet-style deployment. Script arguments arrive as
-`*args*`. This is bundling, not compilation: the script still runs on the
-interpreter inside. (True function-to-C compilation is plausible future
-work — the FFI's generate→cc→dlopen→rebind pipeline is exactly a JIT's
-plumbing — but it isn't built.)
+`bundle.clj` embeds your script next to the runtime and compiles the result —
+Janet-style deployment. Script arguments arrive as `*args*`. This is bundling,
+not compilation: the script still runs on the interpreter inside. (True
+function-to-C compilation is plausible future work — the FFI's
+generate→cc→dlopen→rebind pipeline is exactly a JIT's plumbing — but it isn't
+built.)
+
+A bundle is native code for the platform that built it, so match your friend's
+machine. Flags steer the compiler for that:
+
+| target | command | needs |
+|---|---|---|
+| same Linux/arch | `bundle script out` | nothing extra |
+| portable Linux | `bundle --static script out` | removes the `GLIBC_2.xx` failure mode |
+| Linux ARM64 | `bundle --cc=aarch64-linux-gnu-gcc --static script out` | `gcc-aarch64-linux-gnu` |
+| Windows | `bundle --windows script out.exe` | `mingw-w64` (`x86_64-w64-mingw32-gcc`) |
+
+`--cc=`, `--libs=`, and `--cflags=` (plus the `CLJC_CC` env var) expose the
+compiler directly for any other cross toolchain, e.g. `zig cc`. On Windows the
+interactive REPL drops to plain line input (no in-line editing) and the nREPL
+server is unavailable — script execution and bundles are unaffected.
 
 ## Running Clojure libraries
 

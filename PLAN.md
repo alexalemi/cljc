@@ -256,6 +256,17 @@ required by conservative stack scanning, same as Boehm GC).
     runtime and ccs a standalone ~130KB binary (Janet-style deploys).
     Enablers: *args* (script argv as a vector), int coercion (char
     byte / double truncation). NOT compilation — noted explicitly.
+    Cross-compilation ✅ done 2026-06-21 — bundle.clj grew flag parsing:
+    --static, --windows (mingw-w64 shorthand), --cc=/--libs=/--cflags=
+    and the CLJC_CC env var steer any cross toolchain (zig cc, ARM gcc).
+    cljc.c is now Windows-portable behind `#ifdef _WIN32`: winsock2 for
+    the tcp prims, Win32 loader for dlopen, QueryPerformanceCounter for
+    monotonic time, tmpfile spooling for with-out-str, st_mtime for
+    mtime. Degraded on Windows: REPL → plain line input (no termios),
+    nREPL server unavailable (sockets aren't fdopen-able). Verified:
+    full cljc.exe and a bundle both build clean under
+    x86_64-w64-mingw32-gcc (0 warnings); Linux suite unchanged.
+    Couldn't run the .exe here (no wine) — runtime behavior unverified.
     FUTURE TIER (plausible, unbuilt): per-function Clojure->C JIT via
     the existing FFI pipeline (generate C → cc → dlopen → mutate root
     binding) — would attack the eval-dispatch wall day5 ended at.

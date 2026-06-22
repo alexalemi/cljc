@@ -6146,15 +6146,52 @@ static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs) {
         return mk_double(FN(as_num(argv[0]))); \
     }
 
+/* Two-arg double->double, same shape as MATH1. */
+#define MATH2(NAME, FN) \
+    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+        (void)env; (void)nargs; \
+        return mk_double(FN(as_num(argv[0]), as_num(argv[1]))); \
+    }
+
 MATH1(sqrt, sqrt)
+MATH1(cbrt, cbrt)
 MATH1(floor, floor)
 MATH1(ceil, ceil)
+MATH1(trunc, trunc)
 
-static Cljc *prim_pow(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
-    return mk_double(pow(as_num(argv[0]),
-                         as_num(argv[1])));
-}
+/* trigonometric */
+MATH1(sin, sin)
+MATH1(cos, cos)
+MATH1(tan, tan)
+MATH1(asin, asin)
+MATH1(acos, acos)
+MATH1(atan, atan)
+
+/* hyperbolic */
+MATH1(sinh, sinh)
+MATH1(cosh, cosh)
+MATH1(tanh, tanh)
+MATH1(asinh, asinh)
+MATH1(acosh, acosh)
+MATH1(atanh, atanh)
+
+/* exponential / logarithmic — expm1/log1p stay accurate near 0 */
+MATH1(exp, exp)
+MATH1(expm1, expm1)
+MATH1(log, log)
+MATH1(log10, log10)
+MATH1(log2, log2)
+MATH1(log1p, log1p)
+
+/* statistical / special functions */
+MATH1(erf, erf)         /* Gaussian error function */
+MATH1(erfc, erfc)       /* complementary error function, 1 - erf(x) */
+MATH1(gamma, tgamma)    /* Γ(x), the generalized factorial */
+MATH1(loggamma, lgamma) /* log|Γ(x)|, stable for large x */
+
+MATH2(pow, pow)
+MATH2(atan2, atan2)     /* note arg order: (atan2 y x) */
+MATH2(hypot, hypot)     /* sqrt(x*x + y*y) without overflow */
 
 static Cljc *prim_round(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -6744,7 +6781,9 @@ static const char *PRELUDE =
     "      (cond (nil? s) -1\n"
     "            (= (first s) x) i\n"
     "            :else (recur (inc i) (next s))))))\n"
-    /* Math/sqrt|pow|floor|ceil|round|abs are already natives */
+    /* Math/{sqrt,cbrt,pow,floor,ceil,round,abs,trunc}, the trig/hyperbolic
+     * family, exp/log{,10,2,1p}/expm1, erf/erfc/gamma/loggamma, and the
+     * constants Math/PI and Math/E are all already natives */
     "(def cljc/digit-chars \"0123456789abcdefghijklmnopqrstuvwxyz\")\n"
     "(defn Character/digit [c radix]\n"
     "  (let [i (str/index-of cljc/digit-chars (str/lower-case (str c)))]\n"
@@ -7022,11 +7061,40 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "format",      prim_format);
     cljc_define_native(e, "str/replace", prim_str_replace);
     cljc_define_native(e, "Math/sqrt",  prim_sqrt);
+    cljc_define_native(e, "Math/cbrt",  prim_cbrt);
     cljc_define_native(e, "Math/pow",   prim_pow);
     cljc_define_native(e, "Math/floor", prim_floor);
     cljc_define_native(e, "Math/ceil",  prim_ceil);
     cljc_define_native(e, "Math/round", prim_round);
     cljc_define_native(e, "Math/abs",   prim_math_abs);
+    cljc_define_native(e, "Math/trunc", prim_trunc);
+    cljc_define_native(e, "Math/sin",   prim_sin);
+    cljc_define_native(e, "Math/cos",   prim_cos);
+    cljc_define_native(e, "Math/tan",   prim_tan);
+    cljc_define_native(e, "Math/asin",  prim_asin);
+    cljc_define_native(e, "Math/acos",  prim_acos);
+    cljc_define_native(e, "Math/atan",  prim_atan);
+    cljc_define_native(e, "Math/atan2", prim_atan2);
+    cljc_define_native(e, "Math/hypot", prim_hypot);
+    cljc_define_native(e, "Math/sinh",  prim_sinh);
+    cljc_define_native(e, "Math/cosh",  prim_cosh);
+    cljc_define_native(e, "Math/tanh",  prim_tanh);
+    cljc_define_native(e, "Math/asinh", prim_asinh);
+    cljc_define_native(e, "Math/acosh", prim_acosh);
+    cljc_define_native(e, "Math/atanh", prim_atanh);
+    cljc_define_native(e, "Math/exp",   prim_exp);
+    cljc_define_native(e, "Math/expm1", prim_expm1);
+    cljc_define_native(e, "Math/log",   prim_log);
+    cljc_define_native(e, "Math/log10", prim_log10);
+    cljc_define_native(e, "Math/log2",  prim_log2);
+    cljc_define_native(e, "Math/log1p", prim_log1p);
+    cljc_define_native(e, "Math/erf",      prim_erf);
+    cljc_define_native(e, "Math/erfc",     prim_erfc);
+    cljc_define_native(e, "Math/gamma",    prim_gamma);
+    cljc_define_native(e, "Math/loggamma", prim_loggamma);
+    /* constants: bound as plain double globals, like Clojure's Math/PI field */
+    env_define_root(env_root(e), intern("Math/PI", 7), mk_double(3.14159265358979323846));
+    env_define_root(env_root(e), intern("Math/E",  6), mk_double(2.71828182845904523536));
     cljc_define_native(e, "rand",       prim_rand);
     cljc_define_native(e, "rand-int",   prim_rand_int);
     cljc_define_native(e, "read-string", prim_read_string);

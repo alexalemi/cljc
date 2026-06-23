@@ -2331,7 +2331,7 @@ enum {
     VOP_BIND, VOP_DESTRUCT, VOP_NEWENV, VOP_POPENV, VOP_POP,
     VOP_CALL, VOP_JMP, VOP_JMPF, VOP_JMPF_KEEP, VOP_JMPT_KEEP,
     VOP_EVAL, VOP_CLOSURE, VOP_LAZY, VOP_VEC,
-    VOP_REBIND, VOP_RECURFN, VOP_RET
+    VOP_REBIND, VOP_RECURFN, VOP_TAILCALL, VOP_RET
 };
 
 /* Lexical addressing: every simple-symbol binding records the frame it
@@ -2514,18 +2514,21 @@ static bool vmc_contains_recur(Cljc *form) {
     return false;
 }
 
-static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form);
+/* tail = this form's value is the enclosing fn's result (so a call here is a
+ * proper tail call → VOP_TAILCALL, which trampolines in apply instead of
+ * recursing). Propagated through if/do/let/loop/when/cond result positions. */
+static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail);
 
-static void vmc_body(VmC *c, CljcEnv *cenv, Cljc *body) {  /* do semantics */
+static void vmc_body(VmC *c, CljcEnv *cenv, Cljc *body, bool tail) {  /* do semantics */
     if (body == NIL || body->tag != CLJC_LIST) { vmc_emit(c, VOP_NIL, 0); return; }
     for (Cljc *b = body; b && b->tag == CLJC_LIST && c->ok; b = b->as.cons.tail) {
-        vmc_form(c, cenv, b->as.cons.head);
-        if (b->as.cons.tail != NIL && b->as.cons.tail->tag == CLJC_LIST)
-            vmc_emit(c, VOP_POP, 0);
+        bool last = b->as.cons.tail == NIL || b->as.cons.tail->tag != CLJC_LIST;
+        vmc_form(c, cenv, b->as.cons.head, tail && last);  /* only the last form is tail */
+        if (!last) vmc_emit(c, VOP_POP, 0);
     }
 }
 
-static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
+static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
     if (!c->ok) return;
     if (form == NIL) { vmc_emit(c, VOP_NIL, 0); return; }
     switch (form->tag) {
@@ -2560,13 +2563,13 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
         case CLJC_VECTOR: {
             size_t n = vec_len(form);
             if (n > 0xff) { vmc_emit(c, VOP_EVAL, vmc_const(c, form)); return; }
-            for (size_t i = 0; i < n; i++) vmc_form(c, cenv, vec_nth(form, i));
+            for (size_t i = 0; i < n; i++) vmc_form(c, cenv, vec_nth(form, i), false);
             vmc_emit(c, VOP_VEC, (uint32_t)n);
             return;
         }
         case CLJC_LAZY:
             form = to_seq(form);
-            if (form == NIL || form->tag != CLJC_LIST) { vmc_form(c, cenv, form); return; }
+            if (form == NIL || form->tag != CLJC_LIST) { vmc_form(c, cenv, form, tail); return; }
             break;  /* fall through to list handling */
         case CLJC_LIST:
             break;
@@ -2605,21 +2608,21 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             Cljc *then = rest->as.cons.tail != NIL ? rest->as.cons.tail->as.cons.head : NIL;
             Cljc *els = rest->as.cons.tail != NIL && rest->as.cons.tail->as.cons.tail != NIL
                         ? rest->as.cons.tail->as.cons.tail->as.cons.head : NIL;
-            vmc_form(c, cenv, cond);
+            vmc_form(c, cenv, cond, false);
             uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
-            vmc_form(c, cenv, then);
+            vmc_form(c, cenv, then, tail);
             uint32_t je = c->ncode; vmc_emit(c, VOP_JMP, 0);
             vmc_patch(c, jf);
-            vmc_form(c, cenv, els);
+            vmc_form(c, cenv, els, tail);
             vmc_patch(c, je);
             return;
         }
-        if (s == S_DO) { vmc_body(c, cenv, rest); return; }
+        if (s == S_DO) { vmc_body(c, cenv, rest, tail); return; }
         if (s == S_WHEN) {
             if (rest == NIL || rest->tag != CLJC_LIST) { c->ok = false; return; }
-            vmc_form(c, cenv, rest->as.cons.head);
+            vmc_form(c, cenv, rest->as.cons.head, false);
             uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
-            vmc_body(c, cenv, rest->as.cons.tail);
+            vmc_body(c, cenv, rest->as.cons.tail, tail);
             uint32_t je = c->ncode; vmc_emit(c, VOP_JMP, 0);
             vmc_patch(c, jf);
             vmc_emit(c, VOP_NIL, 0);
@@ -2633,7 +2636,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             }
             uint32_t jumps[128]; int nj = 0;
             for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
-                vmc_form(c, cenv, a->as.cons.head);
+                vmc_form(c, cenv, a->as.cons.head, false);
                 if (a->as.cons.tail != NIL && a->as.cons.tail->tag == CLJC_LIST) {
                     if (nj >= 128) { c->ok = false; return; }
                     jumps[nj++] = c->ncode;
@@ -2649,9 +2652,9 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             Cljc *a = rest;
             while (a && a->tag == CLJC_LIST && a->as.cons.tail != NIL &&
                    a->as.cons.tail->tag == CLJC_LIST) {
-                vmc_form(c, cenv, a->as.cons.head);
+                vmc_form(c, cenv, a->as.cons.head, false);
                 uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
-                vmc_form(c, cenv, a->as.cons.tail->as.cons.head);
+                vmc_form(c, cenv, a->as.cons.tail->as.cons.head, tail);
                 if (ne >= 128) { c->ok = false; return; }
                 ends[ne++] = c->ncode; vmc_emit(c, VOP_JMP, 0);
                 vmc_patch(c, jf);
@@ -2673,14 +2676,14 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             vmc_frame_enter(c);
             for (size_t i = 0; i < vec_len(bv); i += 2) {
                 Cljc *pat = vec_nth(bv, i);
-                vmc_form(c, cenv, vec_nth(bv, i + 1));
+                vmc_form(c, cenv, vec_nth(bv, i + 1), false);
                 if (pat != NIL && pat->tag == CLJC_SYMBOL)
                     vmc_emit(c, VOP_BIND, vmc_const(c, pat));
                 else
                     vmc_emit(c, VOP_DESTRUCT, vmc_const(c, pat));
                 vmc_bind(c, pat);
             }
-            vmc_body(c, cenv, rest->as.cons.tail);
+            vmc_body(c, cenv, rest->as.cons.tail, tail);
             vmc_emit(c, VOP_POPENV, 0);
             vmc_frame_leave(c);
             c->loop_depth--;
@@ -2708,7 +2711,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             Cljc *names = NIL, **t = &names;
             for (size_t i = 0; i < vec_len(bv); i += 2) {
                 Cljc *sym = vec_nth(bv, i);
-                vmc_form(c, cenv, vec_nth(bv, i + 1));
+                vmc_form(c, cenv, vec_nth(bv, i + 1), false);
                 vmc_emit(c, VOP_BIND, vmc_const(c, sym));
                 vmc_bind_name(c, sym->as.sym, true);
                 *t = mk_cons(sym, NIL);
@@ -2719,7 +2722,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
             c->loop_nbind = (uint32_t)(vec_len(bv) / 2);
             c->loop_pc = (int)c->ncode;
             c->loop_depth = 0;
-            vmc_body(c, cenv, rest->as.cons.tail);
+            vmc_body(c, cenv, rest->as.cons.tail, tail);
             vmc_emit(c, VOP_POPENV, 0);
             vmc_frame_leave(c);
             c->loop_pc = save_pc;
@@ -2732,7 +2735,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
         if (s == S_RECUR) {
             uint32_t n = 0;
             for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
-                vmc_form(c, cenv, a->as.cons.head);
+                vmc_form(c, cenv, a->as.cons.head, false);
                 n++;
             }
             if (c->loop_pc >= 0) {
@@ -2786,22 +2789,24 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form) {
                 form->as.cons.tail = expansion->as.cons.tail;
             }
             vmc_const(c, expansion);          /* keep rooted */
-            vmc_form(c, cenv, expansion);
+            vmc_form(c, cenv, expansion, tail);
             return;
         }
     }
     /* ordinary call: head expr, args, CALL n. The arg also carries the
      * call-site form's const index so a callee that turns out to be a
-     * macro at runtime (forward ref, fn->macro redef) deopts to eval. */
+     * macro at runtime (forward ref, fn->macro redef) deopts to eval.
+     * In tail position emit VOP_TAILCALL, which trampolines in apply
+     * (replaces the frame) instead of recursing — proper tail calls. */
     {
         uint32_t n = 0;
-        vmc_form(c, cenv, head);
+        vmc_form(c, cenv, head, false);
         for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
-            vmc_form(c, cenv, a->as.cons.head);
+            vmc_form(c, cenv, a->as.cons.head, false);
             n++;
         }
         if (n > 0xff) { c->ok = false; return; }
-        vmc_emit(c, VOP_CALL, n | (vmc_const(c, form) << 8));
+        vmc_emit(c, tail ? VOP_TAILCALL : VOP_CALL, n | (vmc_const(c, form) << 8));
     }
 }
 
@@ -2825,7 +2830,7 @@ static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
         }
         vmc_bind(&c, pe);
     }
-    vmc_body(&c, cenv, body);
+    vmc_body(&c, cenv, body, true);        /* the fn body is in tail position */
     vmc_emit(&c, VOP_RET, 0);
     if (!c.ok || c.ncode > 0xffffff || c.nconst > 0xffff) {
         if (getenv("CLJC_VM_LOG") && body != NIL && body->tag == CLJC_LIST) {
@@ -2877,7 +2882,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
         [VOP_JMP]=&&op_VOP_JMP, [VOP_JMPF]=&&op_VOP_JMPF, [VOP_JMPF_KEEP]=&&op_VOP_JMPF_KEEP,
         [VOP_JMPT_KEEP]=&&op_VOP_JMPT_KEEP, [VOP_EVAL]=&&op_VOP_EVAL, [VOP_CLOSURE]=&&op_VOP_CLOSURE,
         [VOP_LAZY]=&&op_VOP_LAZY, [VOP_VEC]=&&op_VOP_VEC, [VOP_REBIND]=&&op_VOP_REBIND,
-        [VOP_RECURFN]=&&op_VOP_RECURFN, [VOP_RET]=&&op_VOP_RET,
+        [VOP_RECURFN]=&&op_VOP_RECURFN, [VOP_TAILCALL]=&&op_VOP_TAILCALL, [VOP_RET]=&&op_VOP_RET,
     };
     #define VM_CASE(op) op_##op:
     #define VM_NEXT()   do { ins = code[pc++]; a = ins >> 8; goto *vmlbl[ins & 0xff]; } while (0)
@@ -2986,6 +2991,31 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                 vpush(r);
                 VM_NEXT();
             }
+            VM_CASE(VOP_TAILCALL) {
+                /* (f a b) in tail position: build a recur sentinel carrying the
+                 * args, with the TARGET fn in meta. apply's loop re-dispatches
+                 * to it instead of recursing — a proper tail call. */
+                uint32_t n = a & 0xff;
+                Cljc *f = vstack[vsp - n - 1];
+                if (f != NIL && f->tag == CLJC_FN && f->as.fn.is_macro) {
+                    vsp -= n + 1;                    /* late macro: deopt, no TCO */
+                    vpush(eval(env, K[a >> 8]));
+                    VM_NEXT();
+                }
+                Cljc *r = alloc(CLJC_RECUR);         /* args still rooted on the vstack */
+                Cljc **vals = r->as.recur.iv;
+                if (n > 3) {
+                    vals = xmalloc(sizeof(Cljc *) * n);
+                    r->as.recur.iv[0] = (Cljc *)vals;
+                    r->as.recur.spill = true;
+                }
+                for (uint32_t i = 0; i < n; i++) vals[i] = vstack[vsp - n + i];
+                r->as.recur.n = (uint8_t)n;
+                r->meta = f;                         /* tailcall target (NULL = self-recur) */
+                vsp -= n + 1;                        /* drop args + fn */
+                vpush(r);
+                VM_NEXT();
+            }
             VM_CASE(VOP_RET) {
                 Cljc *r = vstack[vsp - 1];
                 vsp = base;
@@ -3031,8 +3061,8 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
          * optimizer must not elide it. */
         Cljc * volatile recur_keep = NIL;
         (void)recur_keep;
-        if (!fn->as.fn.fc_ready) fastcall_init(fn);
         for (;;) {
+            if (!fn->as.fn.fc_ready) fastcall_init(fn);  /* fn can change via a tail call */
             Cljc *chosen;
             CljcEnv *call;
             if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
@@ -3077,11 +3107,25 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
                 ? vm_run(call, chosen->meta)
                 : eval_body(call, chosen->as.cons.tail);
             if (!(result && result->tag == CLJC_RECUR)) return result;
-            /* recur: the sentinel's value array IS the next argv. */
+            /* recur/tailcall: the sentinel's value array IS the next argv. */
             recur_keep = result;   /* root the cell across the next iteration */
             argv = result->as.recur.spill
                 ? (Cljc **)result->as.recur.iv[0] : result->as.recur.iv;
             nargs = (int)result->as.recur.n;
+            if (result->meta) {    /* tail call to ANOTHER fn (meta = target) */
+                Cljc *newfn = result->meta;
+                if (newfn->tag == CLJC_FN) fn = newfn;         /* loop, replacing this frame */
+                else {
+                    /* native/keyword/map: dispatch here. NOT `return apply(...)`
+                     * — that C tail call lets -O2 free this frame (and the
+                     * volatile recur_keep rooting the sentinel that owns argv),
+                     * so the GC could reclaim the args mid-call. Reading
+                     * recur_keep after the call pins the sentinel live. */
+                    Cljc *rv = apply(env, newfn, argv, nargs);
+                    recur_keep = result;
+                    return rv;
+                }
+            }
         }
     }
     Cljc *a0 = nargs > 0 ? argv[0] : NIL;

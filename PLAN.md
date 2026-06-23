@@ -733,6 +733,26 @@ required by conservative stack scanning, same as Boehm GC).
     e.g. 2021 d20 and 2016 d16 now COMPUTE the right answer, just >15s) or
     unfixable-by-design. The 42 timeouts are the benchmark set for any future
     perf work (the bytecode VM got us here; next levers per item 36).
+42. ~~General tail-call optimization~~ ✅ done 2026-06-23 — proper tail calls
+    for ANY fn in tail position (beyond Clojure, which has only recur +
+    trampoline; both also added/present). The recur machinery already did 80%:
+    VOP_RECURFN builds a CLJC_RECUR sentinel and apply's for(;;) loop re-binds
+    argv to the SAME fn. Generalized: (a) the compiler threads a `tail` flag
+    (vmc_form/vmc_body) — propagated through if/do/let/loop/when/cond result
+    positions (and/or left non-tail, conservative) — and emits VOP_TAILCALL
+    instead of VOP_CALL in tail position; (b) VOP_TAILCALL builds the same
+    sentinel but stores the TARGET fn in the cell's meta slot (zero memory cost
+    — no union growth; cell_alloc already NULLs meta, so meta==NULL reliably
+    means self-recur); (c) apply's loop, on a sentinel with meta set, switches
+    fn to the target (loops, replacing the frame) if it's a CLJC_FN, else leaf-
+    dispatches (native/keyword/map). fastcall_init moved inside the loop (fn can
+    change). Verified: 10M self-tail (non-recur), 5M mutual recursion (was
+    stack-bound), multi-arity self-tailcall, native/keyword/map tails, forward-
+    ref mutual; ADVERSARIAL: non-tail calls ((inc (h n)), (+ 1 (f 2) 3), fib,
+    nested) give correct results (not mis-TCO'd), undefined symbol in tail
+    position still errors. fib(32) unchanged (~0.5s — non-tail unaffected).
+    Tree-walked fns (uncompiled: def/try bodies) still recurse — TCO is a VM
+    feature. Suite + ASan/UBSan + AoC corpus regression all clean.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

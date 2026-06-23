@@ -1558,6 +1558,27 @@
 (assert= true  (trampoline cljc-tramp-ev? 100000))
 (assert= false (trampoline cljc-tramp-ev? 100001))
 (assert= 42 (trampoline (fn [] 42)))                       ; non-fn result returned as-is
+; ── general tail-call optimization (beyond Clojure) ──
+; non-tail calls must NOT be mis-TCO'd (value is processed after the call)
+(defn cljc-tco-h [n] (if (zero? n) 0 (inc (cljc-tco-h (dec n)))))
+(assert= 100 (cljc-tco-h 100))                             ; (inc (h …)) — not tail
+(defn cljc-tco-ten [x] (* x 10))
+(assert= 24 (+ 1 (cljc-tco-ten 2) 3))                      ; call value used in +
+(assert= 100 (cljc-tco-ten (cljc-tco-ten 1)))              ; nested
+(assert= 30 (and (cljc-tco-ten 1) (cljc-tco-ten 2) (cljc-tco-ten 3)))
+; deep proper tail calls (would overflow the C stack without TCO) — skip GC-stress
+(defn cljc-tco-ev? [n] (if (zero? n) true  (cljc-tco-od? (dec n))))
+(defn cljc-tco-od? [n] (if (zero? n) false (cljc-tco-ev? (dec n))))
+(defn cljc-tco-sum ([n] (cljc-tco-sum n 0))                ; multi-arity self tail-call
+  ([n acc] (if (zero? n) acc (cljc-tco-sum (dec n) (+ acc n)))))
+(when-not (cljc/env* "CLJC_GC_STRESS")
+  (assert= true  (cljc-tco-ev? 3000000))                   ; mutual recursion, 3M deep
+  (assert= false (cljc-tco-ev? 3000001))
+  (assert= 500000500000 (cljc-tco-sum 1000000)))           ; self tail-call, 1M deep
+; nested tail call through a native: reduce → fn body (into s x) → into-impl.
+; the sentinel owning the args must stay GC-rooted across the native dispatch
+; (a `return apply(...)` would let -O2 free it mid-call) — AoC 2015 d18.
+(assert= #{0 1 2 3 4 5} (reduce (fn [s x] (into s x)) #{} [#{0 1} #{2 3} #{4 5}]))
 ; huge apply: splicing > vstack-cap args must not overflow (heap argv path) —
 ; AoC 2016 d16 / 2021 d20. Skip under GC stress (too slow with 1.1M elements).
 (when-not (cljc/env* "CLJC_GC_STRESS")

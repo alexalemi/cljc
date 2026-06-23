@@ -8158,11 +8158,16 @@ CljcEnv *cljc_new_env(void) {
     return e;
 }
 
+/* Set true when the most recent cljc_eval_string raised (vs returned nil).
+ * The nREPL uses it to send eval-error instead of a bogus value=nil. */
+bool cljc_eval_errored;
+
 Cljc *cljc_eval_string(CljcEnv *env, const char *src) {
     char stack_anchor;
     cljc_set_stack_base(&stack_anchor);  /* ensure at least this frame is scanned */
     Cljc * volatile result = NIL;  /* survives the error longjmp */
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; return NIL; }
+    cljc_eval_errored = false;
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; cljc_eval_errored = true; return NIL; }
     while (*src) {
         skip_ws(&src);
         if (!*src) break;
@@ -8717,6 +8722,14 @@ static void resp_status(FILE *f, NreplMsg *m, const char *status) {
     fflush(f);
 }
 
+static void resp_status2(FILE *f, NreplMsg *m, const char *s1, const char *s2) {
+    resp_head(f, m);
+    bw_cstr(f, "status");
+    fputc('l', f); bw_cstr(f, s1); bw_cstr(f, s2); fputc('e', f);
+    fputc('e', f);
+    fflush(f);
+}
+
 static void resp_field(FILE *f, NreplMsg *m, const char *key, const char *val, size_t n) {
     resp_head(f, m);
     bw_cstr(f, key); bw_str(f, val, n);
@@ -8737,6 +8750,11 @@ static void nrepl_eval(FILE *out, NreplMsg *m, CljcEnv *env, const char *code) {
     if (olen) resp_field(out, m, "out", obuf, olen);
     if (elen) resp_field(out, m, "err", ebuf, elen);
     free(obuf); free(ebuf);
+    if (cljc_eval_errored) {
+        /* a throw/undefined-symbol: report eval-error, NOT a bogus value=nil */
+        resp_status2(out, m, "eval-error", "done");
+        return;
+    }
     SBuf sb = {0};
     print_to(&sb, result, true);
     resp_field(out, m, "value", sb.data ? sb.data : "nil", sb.len);

@@ -712,6 +712,27 @@ required by conservative stack scanning, same as Boehm GC).
     clojure.set, no-dep, --static, and a real AoC ns-vector file all bundle and
     run from a clean dir. Suite + ASan unaffected (registry empty without a
     bundle).
+41. ~~AoC correctness pass~~ ✅ done 2026-06-23 — re-ran the corpus (CLJC_PATH=
+    repo/vendor:repo for vendored libs; sweep categorizes PASS/ERROR/TESTFAIL/
+    TIMEOUT, grepping "N failed" so deftest failures aren't invisible). Three
+    real bugs fixed: (a) get on transient vectors returned nil for every index
+    (prim_get missed CLJC_TVEC) — 2017 d5; (b) hex (0x) + radix (NrDDD) integer
+    literals were parsed base-10 and truncated — 2021 d16; (c) huge apply
+    ((apply str/concat/+ million-element-seq)) overflowed the value stack —
+    heap-argv path when the splice won't fit + fast-path headroom so seq1's
+    realization doesn't overflow near the cap + lazy concat variadic arity
+    (was ~n-deep recursion) — 2016 d16 part-1, 2021 d20. TALLY (15s timeout):
+    99 pass / 42 timeout / 7 error / 2 testfail (was 97/40/9/13 at session
+    start of this pass). The 2 TESTFAILs (2017 d4 char-set anagram, 2021 d12
+    cave-paths) are UPSTREAM-BROKEN — cljc gives byte-identical results to
+    babashka; the authors' tests don't match their own code. The 7 ERRORs are
+    all not-cljc: jpeg/match + OPS custom libs, 2 missing input files, a
+    Leiningen project.clj the glob caught, 2025 cherry-JS, and 2023 d22 (bb
+    produces no answer either). NET: cljc is now CORRECT on every corpus file
+    it can run; remaining failures are pure performance (the 42 timeouts —
+    e.g. 2021 d20 and 2016 d16 now COMPUTE the right answer, just >15s) or
+    unfixable-by-design. The 42 timeouts are the benchmark set for any future
+    perf work (the bytecode VM got us here; next levers per item 36).
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

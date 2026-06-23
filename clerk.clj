@@ -203,8 +203,19 @@
   (loop [j i]
     (if (and (< j (count s)) (pred (subs s j (inc j)))) (recur (inc j)) j)))
 
+;; Special forms + the def/macro family get their own colour so the most
+;; salient tokens (defn, let, if, map-position keywords) actually stand out.
+(def clerk/hl-specials
+  #{"def" "defn" "defn-" "defmacro" "defmulti" "defmethod" "defrecord"
+    "defprotocol" "deftype" "definline" "let" "letfn" "fn" "loop" "recur"
+    "if" "if-not" "if-let" "if-some" "when" "when-not" "when-let" "when-some"
+    "cond" "condp" "case" "do" "doseq" "dotimes" "for" "while" "try" "catch"
+    "finally" "throw" "quote" "var" "ns" "require" "use" "import" "binding"
+    "and" "or" "not" "->" "->>" "as->" "some->" "some->>" "cond->" "cond->>"
+    "fn*" "let*" "lazy-seq" "delay" "future" "declare" "in-ns"})
+
 (defn clerk/hl
-  "Code → HTML with .com .str .kwd .lit .pun spans."
+  "Code → HTML with .com .str .kwd .lit .pun .spe spans."
   [code]
   (let [n (count code)
         token-char? (fn [c] (not (or (str/blank? c) (str/includes? "()[]{}\";" c))))]
@@ -232,8 +243,11 @@
             (str/includes? "()[]{}" c)
             (recur (inc i) (str out "<span class=\"pun\">" (clerk/escape c) "</span>"))
             (token-char? c)
-            (let [j (cljc/clerk-scan-while code i token-char?)]
-              (recur j (str out (clerk/escape (subs code i j)))))
+            (let [j (cljc/clerk-scan-while code i token-char?)
+                  tok (subs code i j)]
+              (recur j (str out (if (contains? clerk/hl-specials tok)
+                                  (str "<span class=\"spe\">" (clerk/escape tok) "</span>")
+                                  (clerk/escape tok)))))
             :else (recur (inc i) (str out (clerk/escape c)))))))))
 
 ;; ── viewers ──
@@ -246,7 +260,7 @@
   (swap! clerk/viewers conj {:pred pred :render render}))
 
 (defn cljc/clerk-table-row [tag cells]
-  (str "<tr>" (str/join "" (map (fn [c] (str "<" tag ">" (clerk/escape (pr-str c)) "</" tag ">")) cells)) "</tr>"))
+  (str "<tr>" (str/join "" (map (fn [c] (str "<" tag ">" (clerk/escape (clerk/pr-bounded c)) "</" tag ">")) cells)) "</tr>"))
 
 ;; map → two-column key/value table
 (clerk/register-viewer!
@@ -271,11 +285,24 @@
   (fn [v] (and (string? v) (str/starts-with? v "<")))
   (fn [s] (str "<div class=\"raw\">" s "</div>")))
 
+;; Bound a possibly-infinite/huge seq before printing — realize at most 100
+;; elements so an infinite lazy seq (e.g. (iterate inc 0)) can't hang the
+;; render. (count (take 101 v)) realizes ≤101 elements, never the whole seq.
+(defn clerk/long-seq? [v]
+  (and (sequential? v) (> (count (take 101 v)) 100)))
+
+(defn clerk/pr-bounded [v]
+  (if (clerk/long-seq? v)
+    (str "(" (str/join " " (map clerk/pr-bounded (take 100 v))) " …)")
+    (pr-str v)))
+
 (defn clerk/render-value [v]
-  (or (some (fn [{:keys [pred render]}]
-              (when (try (pred v) (catch Exception e nil)) (render v)))
-            (reverse @clerk/viewers))
-      (str "<pre class=\"value\">" (clerk/escape (pr-str v)) "</pre>")))
+  (if (clerk/long-seq? v)
+    (str "<pre class=\"value\">" (clerk/escape (clerk/pr-bounded v)) "</pre>")
+    (or (some (fn [{:keys [pred render]}]
+                (when (try (pred v) (catch Exception e nil)) (render v)))
+              (reverse @clerk/viewers))
+        (str "<pre class=\"value\">" (clerk/escape (pr-str v)) "</pre>"))))
 
 ;; (clerk/html "<svg>...</svg>") — explicit raw-html marker for notebooks
 (defn clerk/html [s] (str s))
@@ -319,8 +346,8 @@ table{border-collapse:collapse;margin-top:.45rem;
       font:13.5px/1.5 'JetBrains Mono',monospace}
 td,th{border:1px solid #cfcabf;padding:.22rem .6rem;text-align:left}
 th{background:#efeeea}
-.com{color:#9a917f}.str{color:#85605c}.kwd{color:#3a5e8c}
-.lit{color:#406040}.pun{color:#9a917f}
+.com{color:#9a917f;font-style:italic}.str{color:#85605c}.kwd{color:#3a5e8c}
+.lit{color:#406040}.pun{color:#9a917f}.spe{color:#8a3fa0;font-weight:600}
 ")
 
 (def cljc/clerk-katex

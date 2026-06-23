@@ -211,6 +211,7 @@ static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs);
 #define VSTACK_CAP (1u << 20)
 static Cljc **vstack;
 static size_t vsp;
+static size_t vstack_cap = VSTACK_CAP;   /* swapped to the active coro's cap */
 static void vpush(Cljc *v);
 void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
 /* Namespace aliases for the flat-global model: (require '[x.y :as m])
@@ -260,14 +261,15 @@ static Cljc *cur_exc;   /* exception value in flight; a GC root */
  * recurses), and coro/yield does a swapcontext back to whoever resumed it.
  * Single-threaded + cooperative, so no locks. The fiddly parts are all about
  * the GC and the few interpreter globals that are really "per execution":
- *   - the value stack (vstack) is SHARED; a coro's operands live in a
- *     contiguous segment above its resumer's top. On yield we copy that
- *     segment out (vsave) and rewind vsp; on resume we copy it back. vbase is
- *     recaptured every resume (a coro may be resumed from different depths).
+ *   - each coro has its OWN value stack (a stable array). The interpreter
+ *     caches absolute pointers into the active vstack (argv = &vstack[base]),
+ *     so a coro must always resume onto the SAME array — sharing one vstack and
+ *     relocating operands broke those pointers (only when a yield happened deep
+ *     in nested calls). We swap the global vstack/vsp/vstack_cap on every switch.
  *   - err_top / cur_exc / eval_sp are saved/restored per switch; each coro
  *     installs its own base ErrFrame so a throw never longjmps across stacks.
- *   - the conservative GC scans each reachable suspended coro's live stack
- *     range + its saved register blob (the ucontext) + its vsave segment. */
+ *   - the conservative GC scans each reachable suspended coro's live C-stack
+ *     range + its saved register blob (the ucontext) + its own vstack. */
 #ifdef CLJC_HAVE_CORO
 typedef enum { CORO_NEW, CORO_SUSPENDED, CORO_RUNNING, CORO_NORMAL, CORO_DEAD } CoroStatus;
 typedef struct Coro {
@@ -282,9 +284,14 @@ typedef struct Coro {
     void *saved_sp;        /* approx SP at last switch-away — GC scan low bound */
     CoroStatus status;
     struct Coro *resumer;  /* who resumed us; NULL = resumed by main */
-    Cljc **vsave;          /* copied vstack segment while suspended */
-    int vsave_n;
-    int vbase;             /* vstack depth captured at last resume */
+    /* Each coro has its OWN value stack — a stable allocation. The interpreter
+     * caches absolute pointers into the active vstack (argv = &vstack[base]),
+     * so a coro must always resume onto the SAME array; sharing one vstack and
+     * relocating segments broke those pointers. We swap the global vstack/vsp/
+     * vstack_cap to the active coro's on every context switch. */
+    Cljc **s_vstack;       /* the coro's vstack array (saved globals while away) */
+    size_t s_vsp;
+    size_t s_vstack_cap;
     ErrFrame *s_err_top;   /* saved err_top while suspended */
     Cljc *s_cur_exc;
     int s_eval_sp;
@@ -293,6 +300,13 @@ typedef struct Coro {
 static Coro *coro_current;        /* NULL = main is the active context */
 static ucontext_t coro_main_ctx;  /* main's context saved while a coro runs */
 static void *coro_main_saved_sp;  /* main's SP at the point it entered coro-land */
+/* main's execution state saved while a coro runs (see state_save/state_load) */
+static ErrFrame *main_s_err_top;
+static Cljc *main_s_cur_exc;
+static int main_s_eval_sp;
+static Cljc **main_s_vstack;
+static size_t main_s_vsp;
+static size_t main_s_vstack_cap;
 static void coro_mark_scan(Coro *c);   /* GC: scan a coro's roots + stack */
 #endif
 
@@ -330,7 +344,7 @@ static void cljc_throw_value(Cljc *v) {
 }
 
 static void vpush(Cljc *v) {
-    if (vsp >= VSTACK_CAP) cljc_error("value stack overflow");
+    if (vsp >= vstack_cap) cljc_error("value stack overflow");
     vstack[vsp++] = v;
 }
 
@@ -786,7 +800,10 @@ static void coro_mark_scan(Coro *c) {
     mark_push(c->xfer);
     mark_push(c->error);
     if (c->resumer) mark_push(c->resumer->self);
-    for (int i = 0; i < c->vsave_n; i++) mark_push(c->vsave[i]);
+    /* The active coro's vstack is the global one (scanned by gc_collect); a
+     * suspended coro's operands live in its own saved vstack array. */
+    if (c != coro_current && c->s_vstack)
+        for (size_t i = 0; i < c->s_vsp; i++) mark_push(c->s_vstack[i]);
     if (c != coro_current &&
         (c->status == CORO_SUSPENDED || c->status == CORO_NORMAL) &&
         c->saved_sp) {
@@ -836,6 +853,9 @@ static void gc_collect(void) {
     if (coro_current) {
         active_top = coro_current->stack_top;
         gc_mark(coro_current->self);   /* root the running coro + its resume chain */
+        /* main's value stack is suspended too (the global vstack is the coro's). */
+        if (main_s_vstack)
+            for (size_t vi = 0; vi < main_s_vsp; vi++) gc_mark(main_s_vstack[vi]);
         /* main is suspended at the point it entered coro-land: scan its frames
          * plus its saved registers (held in coro_main_ctx). */
         if (coro_main_saved_sp && gc_stack_base) {
@@ -881,7 +901,7 @@ static void gc_collect(void) {
                     case CLJC_CORO:
                         if (c->as.coro) {
                             free(c->as.coro->stack);
-                            free(c->as.coro->vsave);
+                            free(c->as.coro->s_vstack);
                             free(c->as.coro);
                         }
                         break;
@@ -6645,19 +6665,23 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
  * the leaving coro's segment, installs the resumer's state, then swapcontexts.
  * So each direction restores exactly the context it jumps to. */
 #ifdef CLJC_HAVE_CORO
-#define CORO_STACK_SIZE (1u << 20)   /* 1 MiB per coro (eval recurses) */
+#define CORO_STACK_SIZE (1u << 20)   /* 1 MiB C stack per coro (eval recurses) */
+#define CORO_VSTACK_CAP (1u << 14)   /* 16K operand slots per coro (128 KiB) */
 
-static ErrFrame *main_s_err_top;
-static Cljc *main_s_cur_exc;
-static int main_s_eval_sp;
-
+/* Save the active execution state (the globals) into a coro's slot, or main's.
+ * The vstack trio is part of this: switching coros swaps the whole value stack
+ * so each coro keeps its own stable array (absolute argv pointers stay valid). */
 static void state_save(Coro *c) {
-    if (c) { c->s_err_top = err_top; c->s_cur_exc = cur_exc; c->s_eval_sp = eval_sp; }
-    else   { main_s_err_top = err_top; main_s_cur_exc = cur_exc; main_s_eval_sp = eval_sp; }
+    if (c) { c->s_err_top = err_top; c->s_cur_exc = cur_exc; c->s_eval_sp = eval_sp;
+             c->s_vstack = vstack; c->s_vsp = vsp; c->s_vstack_cap = vstack_cap; }
+    else   { main_s_err_top = err_top; main_s_cur_exc = cur_exc; main_s_eval_sp = eval_sp;
+             main_s_vstack = vstack; main_s_vsp = vsp; main_s_vstack_cap = vstack_cap; }
 }
 static void state_load(Coro *c) {
-    if (c) { err_top = c->s_err_top; cur_exc = c->s_cur_exc; eval_sp = c->s_eval_sp; }
-    else   { err_top = main_s_err_top; cur_exc = main_s_cur_exc; eval_sp = main_s_eval_sp; }
+    if (c) { err_top = c->s_err_top; cur_exc = c->s_cur_exc; eval_sp = c->s_eval_sp;
+             vstack = c->s_vstack; vsp = c->s_vsp; vstack_cap = c->s_vstack_cap; }
+    else   { err_top = main_s_err_top; cur_exc = main_s_cur_exc; eval_sp = main_s_eval_sp;
+             vstack = main_s_vstack; vsp = main_s_vsp; vstack_cap = main_s_vstack_cap; }
 }
 
 /* Switch INTO target, passing val. Runs on the resumer's context. */
@@ -6665,18 +6689,12 @@ static Cljc *coro_resume(Coro *target, Cljc *val) {
     Coro *resumer = coro_current;
     char anchor;
     if (resumer) resumer->saved_sp = &anchor; else coro_main_saved_sp = &anchor;
-    state_save(resumer);
+    state_save(resumer);                 /* stash resumer's globals (incl. its vstack) */
     if (resumer) resumer->status = CORO_NORMAL;
     target->resumer = resumer;
-    target->vbase = (int)vsp;
-    if (target->vsave_n) {                       /* restore stashed operands */
-        memcpy(&vstack[vsp], target->vsave, sizeof(Cljc *) * target->vsave_n);
-        vsp += (size_t)target->vsave_n;
-        free(target->vsave); target->vsave = NULL; target->vsave_n = 0;
-    }
     target->xfer = val;
     coro_current = target; target->status = CORO_RUNNING;
-    state_load(target);
+    state_load(target);                  /* install target's vstack + scalars */
     swapcontext(resumer ? &resumer->ctx : &coro_main_ctx, &target->ctx);
     /* ← target yielded or died back to us; it already restored our state. */
     return target->xfer;
@@ -6685,15 +6703,7 @@ static Cljc *coro_resume(Coro *target, Cljc *val) {
 /* Switch OUT to the resumer with the given exit status (SUSPENDED or DEAD). */
 static void coro_switch_out(Coro *self, CoroStatus st, void *sp) {
     self->saved_sp = sp;
-    free(self->vsave); self->vsave = NULL; self->vsave_n = 0;
-    int n = (int)vsp - self->vbase;
-    if (st == CORO_SUSPENDED && n > 0) {         /* stash live operands */
-        self->vsave = xmalloc(sizeof(Cljc *) * (size_t)n);
-        memcpy(self->vsave, &vstack[self->vbase], sizeof(Cljc *) * (size_t)n);
-        self->vsave_n = n;
-    }
-    vsp = (size_t)self->vbase;
-    state_save(self);
+    state_save(self);                    /* keep self's vstack as-is for resume */
     self->status = st;
     Coro *resumer = self->resumer;
     coro_current = resumer;
@@ -6735,6 +6745,9 @@ static Cljc *coro_new(Cljc *thunk) {
     memset(co, 0, sizeof *co);
     co->self = cell; co->thunk = thunk; co->xfer = NIL; co->error = NULL;
     co->s_cur_exc = NIL; co->status = CORO_NEW;
+    co->s_vstack = xmalloc(sizeof(Cljc *) * CORO_VSTACK_CAP);   /* this coro's own vstack */
+    co->s_vsp = 0;
+    co->s_vstack_cap = CORO_VSTACK_CAP;
     co->stack = xmalloc(CORO_STACK_SIZE);
     co->stack_size = CORO_STACK_SIZE;
     co->stack_top = co->stack + CORO_STACK_SIZE;

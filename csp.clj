@@ -32,9 +32,17 @@
 ;; A taker is a HANDLER {:co coro :done (atom false) :sel (atom nil)} so a
 ;; single alts! can register on many channels and commit to exactly one (the
 ;; :done flag); :sel records which channel fired. <! uses a plain handler.
+;; chan: optional buffer size and an optional TRANSDUCER applied to values as
+;; they are put. The xform reduces into the buffer, so one put can yield many
+;; values (mapcat), none (filter), or signal close (a reduced from take). An
+;; xform channel needs a buffer ≥ 1 for the transformed outputs to land in.
 (defn chan
-  ([]  (chan 0))
-  ([n] (atom {:buf [] :n n :takers [] :putters [] :closed false})))
+  ([]      (chan 0 nil))
+  ([n]     (chan n nil))
+  ([n xform]
+   (atom {:buf [] :n (if xform (max 1 n) n) :takers [] :putters [] :closed false
+          :add (when xform
+                 (xform (fn ([] []) ([b] b) ([b v] (conj b v)))))})))
 
 (defn- handler [] {:co *self* :done (atom false) :sel (atom nil)})
 
@@ -53,6 +61,16 @@
           (swap! ch update :takers subvec 1)
           (if @(:done h) (recur) h))))))
 
+;; Wake one parked putter when a buffer slot frees. For a transducer channel the
+;; putter's value already went through the xform into the buffer, so we only
+;; release its backpressure; for a plain channel we move its value into the buf.
+(defn- release-putter! [ch]
+  (when (and (seq (:putters @ch)) (< (count (:buf @ch)) (:n @ch)))
+    (let [[pc pv] (first (:putters @ch))]
+      (swap! ch update :putters subvec 1)
+      (when-not (= pv ::xform) (swap! ch update :buf conj pv))
+      (schedule! pc true))))
+
 ;; A taker's immediate path: a buffered value, or a parked putter handed off.
 ;; Returns [hit? value]; nil-on-closed counts as a hit.
 (defn- take-ready! [ch]
@@ -60,18 +78,40 @@
     (cond
       (seq (:buf c))     (let [v (first (:buf c))]
                            (swap! ch update :buf subvec 1)
-                           (when (seq (:putters @ch))            ; refill from a parked putter
-                             (let [[pc pv] (first (:putters @ch))]
-                               (swap! ch update :putters subvec 1)
-                               (swap! ch update :buf conj pv)
-                               (schedule! pc true)))
+                           (release-putter! ch)
                            [true v])
-      (seq (:putters c)) (let [[pc pv] (first (:putters c))]     ; unbuffered handoff
+      (and (not (:add c)) (seq (:putters c)))                   ; unbuffered handoff (plain only)
+                         (let [[pc pv] (first (:putters c))]
                            (swap! ch update :putters subvec 1)
                            (schedule! pc true)
                            [true pv])
       (:closed c)        [true nil]
       :else              [false nil])))
+
+;; Push buffered values to any waiting takers (transducer channels deliver via
+;; the buffer, never by direct handoff).
+(defn- flush-buf! [ch]
+  (loop []
+    (when (and (seq (:buf @ch)) (seq (:takers @ch)))
+      (when-let [h (next-taker! ch)]
+        (let [v (first (:buf @ch))]
+          (swap! ch update :buf subvec 1)
+          (release-putter! ch)
+          (deliver-take! h v ch)
+          (recur))))))
+
+;; A put into a transducer channel: run v through the xform into the buffer,
+;; flush to takers, then apply backpressure (park if the buffer is over cap).
+(defn- xform-put! [ch v]
+  (let [result ((:add @ch) (:buf @ch) v)
+        closing? (reduced? result)]
+    (swap! ch assoc :buf (unreduced result))
+    (flush-buf! ch)
+    (cond
+      closing?                            (do (close! ch) true)
+      (> (count (:buf @ch)) (:n @ch))     (do (swap! ch update :putters conj [*self* ::xform])
+                                              (coro/yield nil) true)
+      :else                               true)))
 
 (defn <! [ch]                           ; take (parks inside a go)
   (let [[hit v] (take-ready! ch)]
@@ -82,7 +122,8 @@
 (defn >! [ch v]                         ; put (parks inside a go)
   (let [c @ch]
     (cond
-      (:closed c)  (throw (ex-info "put on closed channel" {}))
+      (:closed c)  false                               ; put on closed → false (core.async)
+      (:add c)     (xform-put! ch v)                   ; transducer channel
       :else
       (if-let [h (next-taker! ch)]
         (do (deliver-take! h v ch) true)               ; direct handoff
@@ -92,10 +133,17 @@
               (coro/yield nil) true))))))
 
 (defn close! [ch]
+  (when (and (:add @ch) (not (:closed @ch)))   ; flush the transducer's pending state
+    (let [final ((:add @ch) (:buf @ch))]       ; 1-arity completion (e.g. partition-all)
+      (swap! ch assoc :buf (unreduced final))
+      (flush-buf! ch)))
   (swap! ch assoc :closed true)
   (let [ts (:takers @ch)]
     (swap! ch assoc :takers [])
     (doseq [h ts] (deliver-take! h nil ch)))  ; takers on a closed channel get nil
+  (let [ps (:putters @ch)]
+    (swap! ch assoc :putters [])
+    (doseq [[pc _] ps] (schedule! pc false))) ; parked putters wake (don't hang)
   nil)
 
 ;; ── go ───────────────────────────────────────────────────────────────────
@@ -277,3 +325,49 @@
       acc
       (let [v (<! ch)]
         (if (nil? v) acc (recur (conj acc v) (inc k)))))))
+
+;; ── pub / sub — topic-based broadcast ───────────────────────────────────────
+;; A publication routes each value of `ch` by (topic-fn v) to a per-topic mult;
+;; subscribers tap the topic they care about. Topics are created lazily on sub.
+(defn pub [ch topic-fn]
+  (let [mults (atom {})                  ; topic -> {:src chan :mult mult}
+        p {:mults mults :topic-fn topic-fn}]
+    (go-loop []
+      (let [v (<! ch)]
+        (if (nil? v)
+          (doseq [e (vals @mults)] (close! (:src e)))   ; source closed → close topics
+          (do (when-let [e (get @mults (topic-fn v))] (>! (:src e) v))
+              (recur)))))
+    p))
+
+(defn- pub-topic! [p t]                  ; get-or-create the mult for a topic
+  (or (get @(:mults p) t)
+      (let [src (chan) e {:src src :mult (mult src)}]
+        (swap! (:mults p) assoc t e)
+        e)))
+
+(defn sub
+  ([p t ch] (sub p t ch true))
+  ([p t ch close?] (tap (:mult (pub-topic! p t)) ch close?) ch))
+(defn unsub [p t ch]
+  (when-let [e (get @(:mults p) t)] (untap (:mult e) ch)) ch)
+
+;; ── pipeline-async — N concurrent async workers ─────────────────────────────
+;; Each worker pulls from `from`, calls (af v result-ch) — which does async work
+;; (it may park) and puts result(s) onto result-ch, closing it when done — and
+;; forwards results to `to`. With N>1 there can be N operations in flight at
+;; once (e.g. N concurrent fetches), which is exactly what a single-threaded
+;; event loop CAN parallelize: the waiting overlaps. Output order is not
+;; preserved. `to` closes when `from` is exhausted and all workers finish.
+(defn pipeline-async [n to af from]
+  (let [left (atom n)]
+    (dotimes [_ n]
+      (go-loop []
+        (let [v (<! from)]
+          (if (nil? v)
+            (when (zero? (swap! left dec)) (close! to))
+            (let [rc (chan 1)]
+              (af v rc)
+              (loop [] (let [r (<! rc)] (when-not (nil? r) (>! to r) (recur))))
+              (recur))))))
+    to))

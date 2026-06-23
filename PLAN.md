@@ -664,9 +664,38 @@ required by conservative stack scanning, same as Boehm GC).
     (fan-in), mult/tap/untap/untap-all (broadcast fan-out), take-n. Capstone
     example: examples/csp-chat.clj — a broadcast chat server (mult/tap + event
     loop; many nc/telnet clients, one thread). Combinator + chat regression
-    tests in tests.clj (normal + GC-stress + ASan clean). REMAINING: channels
-    with transducers ((chan n xform)); pub/sub + mix; dynamic bindings still
-    don't convey across a park (same as JVM core.async).
+    tests in tests.clj (normal + GC-stress + ASan clean).
+39. ~~core.async completion + HTTP battery~~ ✅ done 2026-06-22 — (a)
+    TRANSDUCER CHANNELS: (chan n xform) reduces values through the transducer
+    into the buffer on put — one put can yield many (mapcat), none (filter),
+    or a reduced that closes the channel; close! runs the 1-arity completion
+    (partition-all flushes its remainder). Backpressure via a ::xform parked-
+    putter marker. (b) pub/sub (per-topic mults, lazy topic creation) and
+    pipeline-async (N concurrent async workers — the parallelism a single
+    thread CAN exploit: overlapping waits). (c) http.clj battery on the csp
+    event loop: request parsing (method/path/query/headers/Content-Length
+    body), a router with ":param" path captures, response maps (status/
+    headers/body, string→200 shorthand), an async server (one go per
+    connection), and an async CLIENT that returns a channel (so it composes in
+    go blocks — N concurrent fetches via pipeline-async). examples/http-app.clj
+    (routed app + shared atom state). GOTCHA: defining http/get SHADOWS core
+    get inside the http ns (flat-namespace home-ns resolution) — used map-as-fn
+    internally instead. Regression tests (transducer chan, pub/sub, http
+    round-trip server+client) pass normal + GC-stress. (d) CONCURRENT nREPL
+    ✅ done 2026-06-22 — nrepl.clj: a multi-client bencode nREPL on csp (the
+    built-in C --nrepl is single-client/serial; this one is additive, C
+    untouched). bencode encode/decode (decode returns nil on a partial value →
+    read more), one go block per client accumulating + dispatching framed
+    messages, ops clone/describe/eval/load-file/close/ls-sessions, eval with
+    with-out-str stdout capture + error status. All sessions share the one root
+    env (defs visible across clients — verified two Python clients, B sees A's
+    def). start (setup, returns srv) / serve (start + run! + .nrepl-port).
+    Tests: bencode round-trip + in-process concurrent eval through the loop.
+    NOTE: clerk was NOT moved to csp — its accept loop is entangled with file-
+    watching and works cross-platform (csp would make it Linux-only), so a new
+    additive nREPL was the better-value, zero-regression choice. REMAINING:
+    clerk multi-client (needs a coro-availability fallback); mix; dynamic
+    bindings still don't convey across a park.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

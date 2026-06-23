@@ -1429,6 +1429,19 @@
 (def cljc-coro-boom (coro/new (fn [] (coro/yield :ok) (throw (ex-info "x" {:n 9})))))
 (assert= :ok (coro/resume cljc-coro-boom))
 (assert= 9 (try (coro/resume cljc-coro-boom) (catch Exception e (:n (ex-data e)))))
+; per-coro vstack: yield DEEP inside nested calls, with sibling coros resumed
+; from separate top-level calls (caches absolute argv pointers — segment
+; relocation used to corrupt this; each coro now keeps its own value stack)
+(defn cljc-coro-y3 [m] (coro/yield m))
+(defn cljc-coro-y2 [m] (+ 0 (cljc-coro-y3 m)))
+(defn cljc-coro-y1 [m] (* 1 (cljc-coro-y2 m)))
+(def cljc-coro-da (coro/new (fn [] (+ 100 (cljc-coro-y1 :a1) (cljc-coro-y1 :a2)))))
+(def cljc-coro-db (coro/new (fn [] (+ 200 (cljc-coro-y1 :b1)))))
+(coro/resume cljc-coro-da)
+(coro/resume cljc-coro-db)
+(assert= :a2 (coro/resume cljc-coro-da 5))     ; sibling interleave, separate pump
+(assert= 207 (coro/resume cljc-coro-db 7))
+(assert= 114 (coro/resume cljc-coro-da 9))     ; 100 + 5 + 9, operands intact
 
 (require '[csp :as cljc-a])
 ; producer/consumer over a buffered channel
@@ -1478,5 +1491,46 @@
 (assert= [0 1 2 3 4]
   (let [to (cljc-a/chan 4)] (cljc-a/pipe (cljc-a/to-chan! (range 50)) to)
        (cljc-a/<!! (cljc-a/take-n 5 to))))
+; transducer channel: inc then keep evens
+(assert= [2 4 6 8]
+  (let [ch (cljc-a/chan 16 (comp (map-xf inc) (filter-xf even?)))]
+    (cljc-a/go (dotimes [i 8] (cljc-a/>! ch i)) (cljc-a/close! ch))
+    (cljc-a/<!! (cljc-a/into [] ch))))
+; transducer channel: mapcat (one in, many out) + completion flush on close
+(assert= [[0 1] [2 3] [4]]
+  (let [ch (cljc-a/chan 8 (partition-all 2))]
+    (cljc-a/go (dotimes [i 5] (cljc-a/>! ch i)) (cljc-a/close! ch))
+    (cljc-a/<!! (cljc-a/into [] ch))))
+; pub/sub: route by topic; non-subscribed topics are dropped
+(let [in (cljc-a/chan) p (cljc-a/pub in :t) ca (cljc-a/chan 8) da (cljc-a/chan 8)]
+  (cljc-a/sub p :cat ca) (cljc-a/sub p :dog da)
+  (cljc-a/go (doseq [m [{:t :cat :n 1} {:t :dog :n 2} {:t :cat :n 3} {:t :fish}]]
+               (cljc-a/>! in m)) (cljc-a/close! in))
+  (assert= [1 3] (mapv :n (cljc-a/<!! (cljc-a/into [] ca))))
+  (assert= [2]   (mapv :n (cljc-a/<!! (cljc-a/into [] da)))))
+; http.clj: a routed server + the client, full round-trip through the event loop
+(require '[http :as cljc-h])
+(cljc-h/serve 8093
+  (cljc-h/router [[:get  "/hi/:who" (fn [req] (str "hi " (:who (:params req))))]
+                  [:post "/echo"    (fn [req] {:status 201 :body (:body req)})]]))
+(assert= "hi bob" (:body (cljc-a/<!! (cljc-h/get "http://127.0.0.1:8093/hi/bob"))))
+(let [r (cljc-a/<!! (cljc-h/post "http://127.0.0.1:8093/echo" "payload"))]
+  (assert= 201 (:status r))
+  (assert= "payload" (:body r)))
+; nrepl.clj: bencode round-trip + a concurrent server eval through the loop
+(require '[nrepl :as cljc-n])
+(assert= [{"op" "eval" "id" "1" "code" "(+ 2 3)"} ""]      ; bencode encode/decode round-trip
+         (cljc-n/bdecode (cljc-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"})))
+(cljc-n/start 8092)
+(let [resp (cljc-a/<!! (cljc-a/go
+             (let [fd (tcp/connect "127.0.0.1" 8092)]
+               (csp/send! fd (cljc-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"}))
+               (loop [b ""]
+                 (let [m (csp/recv! fd)]
+                   (if (or (nil? m) (str/includes? (str b m) "done"))
+                     (do (tcp/close fd) (str b m))
+                     (recur (str b m))))))))]
+  (assert= true (str/includes? resp "5:value1:5"))         ; value 5 came back
+  (assert= true (str/includes? resp "4:done")))            ; status done
 
 (println "tests complete")

@@ -696,6 +696,22 @@ required by conservative stack scanning, same as Boehm GC).
     additive nREPL was the better-value, zero-regression choice. REMAINING:
     clerk multi-client (needs a coro-availability fallback); mix; dynamic
     bindings still don't convey across a park.
+40. ~~Bundle dependency embedding~~ ✅ done 2026-06-22 — bundling was NOT
+    self-contained: it embedded only the script, so a bundled binary that
+    require'd clojure.test (or any battery/vendored lib) failed at runtime away
+    from vendor//the share dir (the AoC deftest report). Fix: (a) C embedded
+    virtual-file registry (CljcEmbeddedFile {name,data}, cljc_set_embedded_files);
+    prim_slurp checks it before the filesystem, matching by exact name or a
+    '/'-bounded suffix so "clojure/test.clj" satisfies require's
+    "./clojure/test.clj" / "vendor/clojure/test.clj" lookups. Empty in a normal
+    cljc → no effect. (b) bundle.clj walks the require/ns(:require, list OR
+    vector clause)/use/load-file graph transitively (read-string the source
+    wrapped in parens, spec->ns), resolves each against *load-path*, and emits
+    the dep sources as NUL-terminated byte arrays + a bundled[] table the
+    generated main registers before eval. Verified: deftest/clojure.test,
+    clojure.set, no-dep, --static, and a real AoC ns-vector file all bundle and
+    run from a clean dir. Suite + ASan unaffected (registry empty without a
+    bundle).
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

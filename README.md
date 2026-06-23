@@ -90,8 +90,11 @@ version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
 ./cljc bundle.clj --windows myscript.clj out.exe   # cross-compile a Windows .exe
 ```
 
-`bundle.clj` embeds your script next to the runtime and compiles the result —
-Janet-style deployment. Script arguments arrive as `*args*`. This is bundling,
+`bundle.clj` embeds your script — plus every `.clj` it transitively `require`s
+or `load-file`s (batteries, vendored libs like `clojure.test`/`clojure.set`) —
+next to the runtime and compiles the result: a genuinely self-contained binary
+that runs anywhere, no `vendor/` or share dir needed. Janet-style deployment.
+Script arguments arrive as `*args*`. This is bundling,
 not compilation: the script still runs on the interpreter inside. (True
 function-to-C compilation is plausible future work — the FFI's
 generate→cc→dlopen→rebind pipeline is exactly a JIT's plumbing — but it isn't

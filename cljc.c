@@ -5773,9 +5773,34 @@ static Cljc *prim_blank_p(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── file IO ── */
 
+/* Embedded virtual files for self-contained bundles. A bundle registers its
+ * script's transitive .clj dependencies here; slurp checks this table before
+ * the filesystem, so require/load-file resolve embedded files even when no
+ * vendor/ or share dir is present. Empty in a normal cljc → no effect. */
+typedef struct { const char *name; const char *data; } CljcEmbeddedFile;
+static const CljcEmbeddedFile *cljc_embedded;
+static int cljc_n_embedded;
+
+/* Match by exact name or by a '/'-bounded suffix, so a registered
+ * "clojure/test.clj" satisfies a lookup of "./clojure/test.clj",
+ * "vendor/clojure/test.clj", etc. (the paths require/ builds from *load-path*). */
+static const char *embedded_lookup(const char *path) {
+    size_t pl = strlen(path);
+    for (int i = 0; i < cljc_n_embedded; i++) {
+        const char *name = cljc_embedded[i].name;
+        size_t nl = strlen(name);
+        if (pl == nl && !strcmp(path, name)) return cljc_embedded[i].data;
+        if (pl > nl && path[pl - nl - 1] == '/' && !strcmp(path + pl - nl, name))
+            return cljc_embedded[i].data;
+    }
+    return NULL;
+}
+
 static Cljc *prim_slurp(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     char *path = as_str(argv[0], "slurp");
+    const char *emb = embedded_lookup(path);
+    if (emb) return mk_str(emb, strlen(emb));   /* bundled dependency */
     FILE *f = fopen(path, "rb");
     if (!f) cljc_error("slurp: cannot open %s", path);
     SBuf sb = {0};
@@ -6904,9 +6929,16 @@ Cljc    *cljc_eval_string(CljcEnv *env, const char *src);
 void     cljc_print(Cljc *v);
 void     cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
 void     cljc_set_stack_base(void *p);
+void     cljc_set_embedded_files(const CljcEmbeddedFile *files, int n);
 
 void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn) {
     env_define_root(env_root(env), intern(name, strlen(name)), mk_native(fn));
+}
+
+/* Register bundled .clj dependencies so slurp/require/load-file find them
+ * without a filesystem. Call before cljc_eval_string. */
+void cljc_set_embedded_files(const CljcEmbeddedFile *files, int n) {
+    cljc_embedded = files; cljc_n_embedded = n;
 }
 
 /* Record the high-water mark of the C stack for conservative root scanning.

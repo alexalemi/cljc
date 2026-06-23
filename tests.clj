@@ -1533,4 +1533,31 @@
   (assert= true (str/includes? resp "5:value1:5"))         ; value 5 came back
   (assert= true (str/includes? resp "4:done")))            ; status done
 
+; ── AoC regressions ──
+; get on a transient vector (was returning nil for every index) — AoC 2017 d5
+(let [t (transient [10 20 30])]
+  (assert= 10 (get t 0))
+  (assert= 30 (get t 2))
+  (assert= nil (get t 9))
+  (assert= :d (get t 9 :d))
+  (assoc! t 0 99)
+  (assert= 99 (get t 0)))
+; hex (0x) and radix (NrDDD) integer literals — AoC 2021 d16
+(assert= 138 0x8A)
+(assert= 255 0xff)
+(assert= 255 16rFF)
+(assert= 10 2r1010)
+(assert= 35 36rZ)
+(assert= -16 -0x10)
+(assert= 17 017)                                           ; leading 0 stays decimal (not octal)
+(assert= 256 (+ 0xff 1))
+(assert= 100000.0 1e5)                                     ; float reader unaffected
+; huge apply: splicing > vstack-cap args must not overflow (heap argv path) —
+; AoC 2016 d16 / 2021 d20. Skip under GC stress (too slow with 1.1M elements).
+(when-not (cljc/env* "CLJC_GC_STRESS")
+  (assert= 1100000 (count (apply str (repeat 1100000 "x"))))        ; native, lazy seq
+  (assert= 1100000 (apply + (repeat 1100000 1)))                    ; native +
+  (assert= 1100000 (count (apply concat (repeat 1100000 [1]))))     ; lazy concat fn
+  (assert= 1100000 (apply (fn [& xs] (count xs)) (repeat 1100000 1)))) ; user variadic fn
+
 (println "tests complete")

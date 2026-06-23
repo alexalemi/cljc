@@ -1769,10 +1769,26 @@ static Cljc *read_atom(const char **p) {
                    ((start[0] == '+' || start[0] == '-') && n > 1 &&
                     isdigit((unsigned char)start[1])));
     if (is_num) {
-        bool is_float = false;
-        for (size_t i = 0; i < n; i++) if (start[i] == '.' || start[i] == 'e') is_float = true;
         char buf[64]; if (n >= sizeof buf) cljc_error("number too long");
         memcpy(buf, start, n); buf[n] = '\0';
+        int64_t sign = 1;
+        char *d = buf;
+        if (*d == '+' || *d == '-') { if (*d == '-') sign = -1; d++; }
+        /* hex: 0x1F / 0XFF */
+        if (d[0] == '0' && (d[1] == 'x' || d[1] == 'X') && d[2])
+            return mk_int(sign * (int64_t)strtoll(d + 2, NULL, 16));
+        /* radix: 2r1010, 16rFF, 36rZ (Clojure's <radix>r<digits>) */
+        char *rp = strchr(d, 'r'); if (!rp) rp = strchr(d, 'R');
+        if (rp && rp != d && rp[1]) {
+            *rp = '\0';
+            long radix = strtol(d, NULL, 10);
+            if (radix >= 2 && radix <= 36)
+                return mk_int(sign * (int64_t)strtoll(rp + 1, NULL, (int)radix));
+            *rp = 'r';
+        }
+        bool is_float = false;
+        for (size_t i = 0; i < n; i++)
+            if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') is_float = true;
         if (is_float) return mk_double(strtod(buf, NULL));
         return mk_int(strtoll(buf, NULL, 10));
     }
@@ -4349,12 +4365,40 @@ static Cljc *prim_apply(CljcEnv *env, Cljc **argv, int nargs) {
     /* (apply f a b [c d]) => (f a b c d) — last arg is spliced. */
     Cljc *fn = argv[0];
     size_t base = vsp;
-    for (int i = 1; i < nargs - 1; i++) vpush(argv[i]);
-    if (nargs > 1)  /* splice the final collection — any seqable */
-        for (Cljc *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail))
-            vpush(s->as.cons.head);
-    Cljc *r = apply(env, fn, &vstack[base], (int)(vsp - base));
+    bool overflow = false;
+    for (int i = 1; i < nargs - 1; i++) {
+        if (vsp >= vstack_cap) { overflow = true; break; }
+        vstack[vsp++] = argv[i];
+    }
+    /* Reserve headroom: seq1 below realizes the next lazy cell, whose thunk
+     * needs operand space — if we fill the vstack to the brim, that realization
+     * overflows. Bail to the heap path (which realizes from a clean vstack)
+     * well before the cap. */
+    size_t splice_lim = vstack_cap > 65536 ? vstack_cap - 65536 : vstack_cap;
+    if (!overflow && nargs > 1)  /* splice the final collection — any seqable */
+        for (Cljc *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail)) {
+            if (vsp >= splice_lim) { overflow = true; break; }
+            vstack[vsp++] = s->as.cons.head;
+        }
+    if (!overflow) {
+        Cljc *r = apply(env, fn, &vstack[base], (int)(vsp - base));
+        vsp = base;
+        return r;
+    }
+    /* Huge apply ((apply str/concat/+ million-element-seq)): the args don't fit
+     * on the value stack. Build argv on the heap instead. The spliced elements
+     * stay GC-reachable through the seq, which is still on the vstack at
+     * argv[nargs-1], so no extra rooting is needed. */
     vsp = base;
+    size_t total = (nargs > 2 ? (size_t)(nargs - 2) : 0);
+    for (Cljc *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail)) total++;
+    Cljc **big = xmalloc(sizeof(Cljc *) * (total ? total : 1));
+    size_t k = 0;
+    for (int i = 1; i < nargs - 1; i++) big[k++] = argv[i];
+    for (Cljc *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail))
+        big[k++] = s->as.cons.head;
+    Cljc *r = apply(env, fn, big, (int)total);
+    free(big);
     return r;
 }
 
@@ -4441,7 +4485,8 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
     } else if (coll != NIL && coll->tag == CLJC_SET) {
         Cljc *out;
         if (set_contains(coll, k, &out)) return out;
-    } else if (coll != NIL && coll->tag == CLJC_VECTOR && k->tag == CLJC_INT) {
+    } else if (coll != NIL && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)
+               && k->tag == CLJC_INT) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
             return vec_nth(coll, (size_t)k->as.i);
     } else if (coll != NIL && coll->tag == CLJC_STRING && k->tag == CLJC_INT) {
@@ -7677,7 +7722,13 @@ CljcEnv *cljc_new_env(void) {
         "  ([a b] (lazy-seq (if-let [s (seq a)]\n"
         "                     (cons (first s) (concat (rest s) b))\n"
         "                     (seq b))))\n"
-        "  ([a b & more] (concat (concat a b) (apply concat more))))\n"
+        "  ([a b & more]\n"
+        "   (let [cat (fn cat [xys zs]\n"   /* lazy: consume one seq, then move to the next */
+        "               (lazy-seq\n"
+        "                 (if-let [s (seq xys)]\n"
+        "                   (cons (first s) (cat (rest s) zs))\n"
+        "                   (when (seq zs) (cat (first zs) (rest zs))))))]\n"
+        "     (cat (concat a b) more))))\n"
         "(defn cycle [c] (lazy-seq (concat (seq c) (cycle c))))\n"
         "(defn map-xf [f]\n"
         "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc)) ([acc x] (rf acc (f x))))))\n"

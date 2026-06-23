@@ -7441,6 +7441,11 @@ static const char *PRELUDE =
     "(defn flatten [coll]\n"  /* sequential?: lazy sub-seqs flatten too */
     "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
+    /* trampoline: call f; while it returns a fn, keep calling it (stack-safe
+     * via recur). Clojure's idiom for mutual recursion without proper TCO. */
+    "(defn trampoline\n"
+    "  ([f] (let [r (f)] (if (fn? r) (recur r) r)))\n"
+    "  ([f & args] (trampoline (fn [] (apply f args)))))\n"
     "(defmacro assert\n"
     "  ([x] `(when-not ~x\n"
     "          (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"

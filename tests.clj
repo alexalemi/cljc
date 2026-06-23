@@ -1552,6 +1552,12 @@
 (assert= 17 017)                                           ; leading 0 stays decimal (not octal)
 (assert= 256 (+ 0xff 1))
 (assert= 100000.0 1e5)                                     ; float reader unaffected
+; trampoline: stack-safe mutual recursion (Clojure's escape hatch, no TCO)
+(defn cljc-tramp-ev? [n] (if (zero? n) true #(cljc-tramp-od? (dec n))))
+(defn cljc-tramp-od? [n] (if (zero? n) false #(cljc-tramp-ev? (dec n))))
+(assert= true  (trampoline cljc-tramp-ev? 100000))
+(assert= false (trampoline cljc-tramp-ev? 100001))
+(assert= 42 (trampoline (fn [] 42)))                       ; non-fn result returned as-is
 ; huge apply: splicing > vstack-cap args must not overflow (heap argv path) —
 ; AoC 2016 d16 / 2021 d20. Skip under GC stress (too slow with 1.1M elements).
 (when-not (cljc/env* "CLJC_GC_STRESS")

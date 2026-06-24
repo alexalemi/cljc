@@ -201,6 +201,7 @@ static bool map_find(Cljc *m, Cljc *key, Cljc **out);
 static double as_num(Cljc *v);
 static Cljc *to_seq(Cljc *v);
 static Cljc *seq1(Cljc *v);
+static Cljc *seq1_slot(Cljc **slot);
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs);
 static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs);
 static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs);
@@ -4330,15 +4331,26 @@ static Cljc *prim_not(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
-    if (v == NIL) return mk_int(0);
-    if (v->tag == CLJC_LIST || v->tag == CLJC_LAZY)
-        return mk_int((int64_t)list_len(to_seq(v)));
-    if (v->tag == CLJC_VECTOR || v->tag == CLJC_TVEC)
-        return mk_int((int64_t)vec_len(v));
-    if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
-        return mk_int((int64_t)v->as.map.count);
-    if (v->tag == CLJC_STRING) return mk_int((int64_t)strlen(v->as.str));
+    if (argv[0] == NIL) return mk_int(0);
+    /* read the tag as an int — keeping no Cljc* head copy. A live local holding
+     * argv[0] would conservatively pin the whole realized chain through the walk
+     * below (count O(n) live); the int dispatch leaves nothing for the scan. */
+    int tag = argv[0]->tag;
+    if (tag == CLJC_LIST || tag == CLJC_LAZY) {
+        /* walk advancing the root — don't materialize the whole seq (to_seq
+         * would also make count O(n) live). */
+        int64_t n = 0;
+        for (Cljc *s = seq1_slot(&argv[0]); s != NIL; s = seq1_slot(&argv[0])) {
+            n++;
+            argv[0] = s->as.cons.tail;
+        }
+        return mk_int(n);
+    }
+    if (tag == CLJC_VECTOR || tag == CLJC_TVEC)
+        return mk_int((int64_t)vec_len(argv[0]));
+    if (tag == CLJC_MAP || tag == CLJC_SET)
+        return mk_int((int64_t)argv[0]->as.map.count);
+    if (tag == CLJC_STRING) return mk_int((int64_t)strlen(argv[0]->as.str));
     cljc_error("count: not countable");
     return NIL;
 }
@@ -4352,7 +4364,9 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
     if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
     } else if (coll && (coll->tag == CLJC_LIST || coll->tag == CLJC_LAZY)) {
-        for (Cljc *l = seq1(coll); l && l->tag == CLJC_LIST; l = seq1(l->as.cons.tail))
+        /* advance argv[0] so a deep index into a lazy seq stays O(1) live */
+        for (Cljc *l = seq1_slot(&argv[0]); l && l->tag == CLJC_LIST;
+             argv[0] = l->as.cons.tail, l = seq1_slot(&argv[0]))
             if (n-- == 0) return l->as.cons.head;
     }
     if (not_found) return not_found;
@@ -4639,7 +4653,8 @@ static Cljc *prim_list(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_first(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    Cljc *s = seq1(argv[0]);  /* forces ONE cell at most */
+    Cljc *s = seq1_slot(&argv[0]);  /* advances the root: skipping into a long
+                                       lazy chain (e.g. filter) stays O(1) live */
     return s == NIL ? NIL : s->as.cons.head;
 }
 
@@ -4685,6 +4700,25 @@ static Cljc *seq1(Cljc *v) {
         if (v->tag == CLJC_LIST) return v;
         if (v->tag == CLJC_LAZY) { v = lazy_force(v); continue; }
         return to_seq(v);  /* finite collections materialize */
+    }
+}
+
+/* Like seq1, but advances the caller's GC root slot as it forces, so a long
+ * lazy chain doesn't stay pinned by its head. *slot must be a live root (a
+ * vstack arg slot): a single-pass consumer (first/count/reduce/nth/…) walks
+ * with seq1_slot(&argv[i]) instead of seq1(argv[i]) and the realized prefix
+ * is collected behind it — O(1) live set instead of O(n). */
+static Cljc *seq1_slot(Cljc **slot) {
+    Cljc *v = *slot;
+    for (;;) {
+        if (v == NULL || v == NIL) return NIL;
+        if (v->tag == CLJC_LIST) { *slot = v; return v; }
+        if (v->tag == CLJC_LAZY) {
+            *slot = v;             /* keep the cell being forced rooted... */
+            v = lazy_force(v);     /* ...then advance: the old head drops */
+            continue;
+        }
+        *slot = v; return to_seq(v);
     }
 }
 
@@ -4764,17 +4798,20 @@ static Cljc *prim_filter(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
     /* (reduce f coll) or (reduce f init coll) */
     Cljc *f = argv[0];
-    Cljc *acc, *seq;
+    Cljc *acc;
+    Cljc **slot;                           /* the input-seq arg: advanced as we
+                                              walk so the head isn't pinned */
     if (nargs < 3) {
-        seq = seq1(argv[1]);               /* lazy cursor: no realization */
-        if (seq == NIL) return apply(env, f, NULL, 0);  /* (reduce f []) => (f) */
-        acc = seq->as.cons.head;
-        seq = seq1(seq->as.cons.tail);
+        slot = &argv[1];
+        Cljc *s = seq1_slot(slot);         /* lazy cursor: no realization */
+        if (s == NIL) return apply(env, f, NULL, 0);  /* (reduce f []) => (f) */
+        acc = s->as.cons.head;
+        *slot = s->as.cons.tail;
     } else {
         acc = argv[1];
-        seq = seq1(argv[2]);
+        slot = &argv[2];
     }
-    for (Cljc *l = seq; l != NIL; l = seq1(l->as.cons.tail)) {
+    for (Cljc *l = seq1_slot(slot); l != NIL; *slot = l->as.cons.tail, l = seq1_slot(slot)) {
         Cljc *two[2] = {acc, l->as.cons.head};
         acc = apply(env, f, two, 2);
         /* (reduced x) terminates early — works on infinite seqs now */

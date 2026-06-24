@@ -753,6 +753,25 @@ required by conservative stack scanning, same as Boehm GC).
     position still errors. fib(32) unchanged (~0.5s — non-tail unaffected).
     Tree-walked fns (uncompiled: def/try bodies) still recurse — TCO is a VM
     feature. Suite + ASan/UBSan + AoC corpus regression all clean.
+43. ~~Lazy-seq head-retention fix (seq1_slot)~~ ✅ done 2026-06-23 — profiling
+    the AoC timeouts (perf triage: ~9 of 42 are cljc-specific gaps where bb is
+    fast; the rest are algorithmic/missing-input) found `(first (filter p
+    (iterate f x)))` and friends growing the live set LINEARLY (O(n²) GC): the
+    consumer pins the lazy-seq head as its argv slot on the value stack for the
+    whole walk, so `F0.cached → F1.cached → …` keeps the entire realized chain
+    live (Clojure avoids this with compiler locals-clearing, which cljc lacks).
+    Fix: `seq1_slot(Cljc **slot)` — like seq1 but advances the caller's GC root
+    slot as it forces, dropping the head behind it. Applied to prim_first /
+    prim_reduce / prim_nth (now O(1) live) and prim_count (which also stopped
+    materializing via to_seq — 10× better, but a residual O(n) remains: a tight
+    no-call loop leaves a stale head pointer in a register that the conservative
+    scan finds; reduce avoids it because apply() clobbers the register). p11's
+    live set: was growing to millions, now constant ~12K. NOTE: this did NOT get
+    the 9 gap files under the 15s bar — they're compute/alloc-bound (interpreter-
+    vs-JIT gap; p11 still ~60s vs bb 4.9s). It's a general scalability/correctness
+    win for all lazy-seq consumption, not a timeout-buster. The 42 timeouts need
+    raw interpreter throughput (env-alloc-per-call, dispatch, resolve_symbol
+    volume — a larger project). Suite + ASan/UBSan + corpus regression clean.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

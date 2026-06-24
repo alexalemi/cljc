@@ -1579,6 +1579,13 @@
 ; the sentinel owning the args must stay GC-rooted across the native dispatch
 ; (a `return apply(...)` would let -O2 free it mid-call) — AoC 2015 d18.
 (assert= #{0 1 2 3 4 5} (reduce (fn [s x] (into s x)) #{} [#{0 1} #{2 3} #{4 5}]))
+; lazy-seq consumers (first/reduce/nth) advance their arg slot, so realizing a
+; deep prefix stays O(1) live instead of O(n) — these would crawl/OOM before the
+; seq1_slot fix. Skip GC-stress (realizes millions of cells). AoC 2015 d11.
+(when-not (cljc/env* "CLJC_GC_STRESS")
+  (assert= 3000000 (first (filter #(= % 3000000) (iterate inc 0))))
+  (assert= 2000000 (nth (iterate inc 0) 2000000))
+  (assert= 4499998500000 (reduce + 0 (take 3000000 (iterate inc 0)))))
 ; huge apply: splicing > vstack-cap args must not overflow (heap argv path) —
 ; AoC 2016 d16 / 2021 d20. Skip under GC stress (too slow with 1.1M elements).
 (when-not (cljc/env* "CLJC_GC_STRESS")

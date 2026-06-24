@@ -639,7 +639,10 @@ static CljcEnv *env_freelist;      /* linked through ->parent */
  * sets are collection-bound: at 64k this was thousands of collections on
  * AoC hot loops (~38% of runtime). ~1M cells ≈ tens of MB of slack. */
 #define GC_MIN_THRESHOLD (1u << 20)
+#define GC_CHURN_CAP (4u << 20)   /* adaptive floor ceiling: ~8M cells (~320MB)
+                                   * of garbage between collections, max */
 static size_t gc_allocs, gc_threshold = GC_MIN_THRESHOLD;
+static size_t churn_floor = GC_MIN_THRESHOLD;   /* adaptive collection floor */
 static size_t gc_freed_last;
 static bool gc_stress;             /* CLJC_GC_STRESS=1: collect every 512 allocs */
 static void *gc_stack_base;
@@ -954,8 +957,22 @@ static void gc_collect(void) {
     }
     /* 4x headroom: GC was ~60% of runtime on allocation-heavy workloads
      * at 2x (AoC profile, 2026-06). Mark cost scales with live data, so
-     * collecting half as often nearly halves GC time for 2x peak waste. */
-    gc_threshold = live * 4 > GC_MIN_THRESHOLD ? live * 4 : GC_MIN_THRESHOLD;
+     * collecting half as often nearly halves GC time for 2x peak waste.
+     *
+     * Adaptive floor: compute-heavy code keeps a tiny live set but churns
+     * millions of short-lived cells (e.g. lazy-seq pipelines), so the fixed
+     * per-collection cost (conservative stack scan + root marking) dominates
+     * — collecting every 1M allocs wastes it. When a collection reclaims
+     * almost everything (live ≪ heap), grow the floor so we collect less
+     * often; when much survives (retentive), shrink it back to cap memory.
+     * Bounded by GC_CHURN_CAP (peak ≈ that many cells of garbage). */
+    size_t total = live + freed;
+    if (live * 8 < total && churn_floor < GC_CHURN_CAP)
+        churn_floor *= 2;                 /* <12.5% live: amortize fixed cost */
+    else if (live * 2 > total && churn_floor > GC_MIN_THRESHOLD)
+        churn_floor /= 2;                 /* >50% live: tighten, save memory */
+    size_t floor = churn_floor;
+    gc_threshold = live * 4 > floor ? live * 4 : floor;
 }
 
 #define GC_BYTES_CAP (256u << 20)   /* string-churn slack ceiling: 256MB */

@@ -772,6 +772,14 @@ required by conservative stack scanning, same as Boehm GC).
     win for all lazy-seq consumption, not a timeout-buster. The 42 timeouts need
     raw interpreter throughput (env-alloc-per-call, dispatch, resolve_symbol
     volume — a larger project). Suite + ASan/UBSan + corpus regression clean.
+    Follow-on: adaptive GC floor — compute-heavy code keeps a tiny live set but
+    churns millions of cells, so the fixed per-collection cost (stack scan +
+    root marking) dominated at the 1M floor. The floor now doubles when a
+    collection reclaims >87.5% (mostly garbage) and halves when >50% survives
+    (retentive), capped at GC_CHURN_CAP (4M cells, ~192MB). ~1.2x on alloc-heavy
+    workloads; retentive programs stay tight (a 5M-vec build peaks at genuine
+    live data, not ballooned garbage). Still not enough to cross 15s on the
+    gap files — raw throughput remains the real lever.
 
 ## Known divergences from Clojure (deliberate, v0)
 - `()` ≡ `nil` (so `(= () [])` is false)

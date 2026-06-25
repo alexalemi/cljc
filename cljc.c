@@ -579,9 +579,14 @@ static void env_define(CljcEnv *env, const char *name, Cljc *value) {
  * root_cache sound — a cached binding sees redefinitions through the
  * mutation instead of going stale. */
 static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
-    /* While a library loads, its defs land under "ns/name" — isolation
-     * from the flat globals (and from each other). */
-    if (cur_reader_ns) {
+    /* While a library loads, its BARE defs land under "ns/name" — isolation
+     * from the flat globals (and from each other). An ALREADY-qualified name
+     * (e.g. (defn cljc/foo ...) inside an (ns bar) file) keeps its explicit
+     * namespace — Clojure semantics — so we don't double-prefix it to
+     * bar/cljc/foo. This is what lets a battery carry an (ns ...) header (for
+     * babashka/clj compatibility) yet still define its cljc-prefixed helpers
+     * in place. */
+    if (cur_reader_ns && !strchr(name, '/')) {
         char buf[256];
         snprintf(buf, sizeof buf, "%s/%s", cur_reader_ns, name);
         name = intern(buf, strlen(buf));

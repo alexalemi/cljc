@@ -2414,6 +2414,39 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
             }
         }
     }
+    /* JVM-qualified type/ctor name (sci.lang.Var, sci.lang.Var., java.io.Writer):
+     * cljc stores a deftype's name/ctor as ns/Name (slash) via home-ns stamping,
+     * so map the "." before the Capitalized class segment to "/" and retry. */
+    if (!strchr(name, '/')) {
+        for (const char *p = name; *p; p++) {
+            if (*p == '.' && p[1] >= 'A' && p[1] <= 'Z') {
+                size_t pre = (size_t)(p - name);
+                char buf[256];
+                if (pre + strlen(p) < sizeof buf) {
+                    memcpy(buf, name, pre);
+                    buf[pre] = '/';
+                    strcpy(buf + pre + 1, p + 1);
+                    const char *q = intern(buf, strlen(buf));
+                    for (Binding *b = root->bindings; b; b = b->next)
+                        if (b->name == q) return b;
+                }
+                break;
+            }
+        }
+    }
+    /* Host-class fallback: an unresolved DOTTED, Capitalized-last-segment name
+     * (e.g. sci.lang.IVar, java.io.Writer) is a JVM class cljc has no instance
+     * of. Synthesize (and memoize) a keyword token so references to it resolve
+     * — protocol extensions / prefer-method / instance? on it become harmless
+     * no-ops. (Bare Capitalized names like Object are stubbed explicitly.) */
+    {
+        const char *dot = strrchr(name, '.');
+        if (dot && dot[1] >= 'A' && dot[1] <= 'Z' && !strchr(name, '/')) {
+            env_define(root, name, mk_kw(name));
+            for (Binding *b = root->bindings; b; b = b->next)
+                if (b->name == name) return b;
+        }
+    }
     return NULL;
 }
 
@@ -7637,7 +7670,8 @@ static const char *PRELUDE =
     "                                           (cljc/deftype-walk (second kv) fset mset this)]) form))\n"
     "    :else form)))\n"
     "(defmacro deftype [tname fields & specs]\n"
-    "  (let [tkw   (keyword (str tname))\n"
+    "  (let [tname (cljc/field-sym tname)\n"   /* peel ^{:doc ..} off the name */
+    "        tkw   (keyword (str tname))\n"
     "        fsyms (mapv cljc/field-sym fields)\n"
     "        fset  (set fsyms)\n"
     "        mset  (set (filter some? (map (fn [f] (when (cljc/field-mut? f) (cljc/field-sym f))) fields)))\n"
@@ -7647,6 +7681,7 @@ static const char *PRELUDE =
     "       (def ~tname ~tkw)\n"
     "       (defn ~(symbol (str tname \".\")) ~fsyms\n"
     "         (hash-map :cljc/type ~tkw ~@kvs))\n"
+    "       (def ~(symbol (str \"->\" tname)) ~(symbol (str tname \".\")))\n"
     "       ~@(map (fn [m]\n"
     "                (let [mname (first m) params (vec (second m)) this (first (second m))\n"
     "                      body (map (fn [x] (cljc/deftype-walk x fset mset this)) (drop 2 m))]\n"
@@ -7809,6 +7844,23 @@ static const char *PRELUDE =
     /* cljc has no var objects: #'x => (var x) resolves to x's value (or nil if
        unbound) — enough for #'fn references in data-reader tables etc. */
     "(defmacro var [s] `(cljc/resolve-maybe ~(str s)))\n"
+    /* resolve/ns-resolve: cljc has no var objects, so these return the bound
+       VALUE (or nil) rather than a var. */
+    "(defn resolve ([sym] (cljc/resolve-maybe (str sym))) ([_ns sym] (cljc/resolve-maybe (str sym))))\n"
+    "(def ns-resolve resolve)\n"
+    "(defn requiring-resolve [sym] (cljc/resolve-maybe (str sym)))\n"
+    /* ad-hoc hierarchies: cljc multimethods don't use them, so these are inert */
+    "(defn derive [& _] nil)\n"
+    "(defn underive [& _] nil)\n"
+    "(defn make-hierarchy [] {})\n"
+    "(defn ident? [x] (or (symbol? x) (keyword? x)))\n"
+    "(defn qualified-symbol? [x] (and (symbol? x) (str/includes? (str x) \"/\")))\n"
+    "(defn simple-symbol? [x] (and (symbol? x) (not (str/includes? (str x) \"/\"))))\n"
+    "(defn qualified-keyword? [x] (and (keyword? x) (str/includes? (str x) \"/\")))\n"
+    "(defn simple-keyword? [x] (and (keyword? x) (not (str/includes? (str x) \"/\"))))\n"
+    "(defn qualified-ident? [x] (and (ident? x) (str/includes? (str x) \"/\")))\n"
+    "(defn simple-ident? [x] (and (ident? x) (not (str/includes? (str x) \"/\"))))\n"
+    "(def global-hierarchy (atom {}))\n"
     "(defn cljc/edn-paths [f]\n"
     "  (try (let [m (read-string (slurp f))]\n"
     "         (when (and (map? m) (vector? (:paths m))) (:paths m)))\n"
@@ -8556,6 +8608,16 @@ CljcEnv *cljc_new_env(void) {
         "    `(do (swap! cljc/multi-tables update '~name assoc ~dval\n"
         "                (fn ~params ~@body))\n"
         "         '~name)))\n"
+        /* multimethod API: cljc has no dispatch hierarchy, so preferences are
+           moot; the rest operate on the flat method table. */
+        "(defn prefer-method [& _] nil)\n"
+        "(defn remove-method [mm dval] (swap! cljc/multi-tables update mm dissoc dval) mm)\n"
+        "(defn get-method [mm dval] (get (get @cljc/multi-tables mm) dval))\n"
+        "(defn methods [mm] (get @cljc/multi-tables mm))\n"
+        /* print-method/print-dup: Clojure printing multimethods libraries extend
+           (cljc prints via print_to; these just need to exist + be defmethod-able) */
+        "(defmulti print-method (fn [x & _] (type x)))\n"
+        "(defmulti print-dup (fn [x & _] (type x)))\n"
         /* protocols: each method dispatches on (type (first args)) */
         "(defmacro defprotocol [pname & sigs]\n"
         "  `(do ~@(map (fn [sig]\n"
@@ -8563,6 +8625,9 @@ CljcEnv *cljc_new_env(void) {
         "                  `(defmulti ~m (fn [& args#] (type (first args#))))))\n"
         "              sigs)\n"
         "       (def ~pname '~(mapv first sigs))))\n"
+        /* definterface: cljc has no host interfaces — bind the name to a type
+           keyword so deftype/instance?/extend references to it resolve. */
+        "(defmacro definterface [iname & sigs] `(def ~iname ~(keyword (str iname))))\n"
         "(defmacro extend-type [t & impls]\n"
         /* Skip interleaved protocol-name symbols (Clojure syntax: (extend-type
            T Proto (m [this] ..) ..)); cljc dispatches per method. A keyword type
@@ -8604,7 +8669,8 @@ CljcEnv *cljc_new_env(void) {
            Protocol method bodies are field-rewritten and registered like
            deftype's. */
         "(defmacro defrecord [rname fields & specs]\n"
-        "  (let [kw    (keyword (str rname))\n"
+        "  (let [rname (cljc/field-sym rname)\n"
+        "        kw    (keyword (str rname))\n"
         "        fsyms (mapv cljc/field-sym fields)\n"
         "        fset  (set fsyms)\n"
         "        ms    (filter list? specs)\n"

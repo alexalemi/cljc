@@ -98,11 +98,11 @@
 (defn cljc/json-escape [s]
   (reduce (fn [acc c]
             (str acc (case c
-                       "\"" "\\\""
-                       "\\" "\\\\"
-                       "\n" "\\n"
-                       "\t" "\\t"
-                       "\r" "\\r"
+                       \" "\\\""
+                       \\ "\\\\"
+                       \newline "\\n"
+                       \tab "\\t"
+                       \return "\\r"
                        c)))
           "" (seq s)))
 

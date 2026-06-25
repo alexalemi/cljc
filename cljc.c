@@ -98,6 +98,7 @@ typedef enum {
     CLJC_SYMBOL,    /* interned */
     CLJC_KEYWORD,   /* interned, stored without leading ':' */
     CLJC_STRING,
+    CLJC_CHAR,      /* a single character — codepoint in as.chr (immediate, no GC) */
     CLJC_LIST,      /* singly-linked cons; CLJC_NIL terminates */
     CLJC_VECTOR,
     CLJC_MAP,       /* v0: assoc-array with copy-on-write; HAMT later */
@@ -126,6 +127,7 @@ struct Cljc {
     union {
         bool b;
         int64_t i;
+        int32_t chr;    /* CLJC_CHAR codepoint */
         double d;
         const char *sym;
         /* Wider view of the same symbol cell: name aliases .sym; root_cache
@@ -401,7 +403,7 @@ static void *xrealloc(void *p, size_t n) {
 /* ───── Constructors ─────────────────────────────────────────────────── */
 
 static Cljc *alloc(CljcTag t) {
-    Cljc *v = cell_alloc(t != CLJC_INT && t != CLJC_DOUBLE);
+    Cljc *v = cell_alloc(t != CLJC_INT && t != CLJC_DOUBLE && t != CLJC_CHAR);
     v->tag = t;
     return v;
 }
@@ -419,6 +421,15 @@ static Cljc *mk_int(int64_t i) {
     return v;
 }
 static Cljc *mk_double(double d)     { Cljc *v = alloc(CLJC_DOUBLE); v->as.d = d; return v; }
+/* Byte-valued chars (0..255) are preallocated and immortal — string seqs
+ * (which yield one char per byte) then allocate nothing. */
+static Cljc smallchars[256];
+static Cljc *mk_char(int32_t cp) {
+    if (cp >= 0 && cp < 256) return &smallchars[cp];
+    Cljc *v = alloc(CLJC_CHAR);
+    v->as.chr = cp;
+    return v;
+}
 static Cljc *mk_bool(bool b)         { return b ? TRUE : FALSE; }
 static const char *cur_reader_ns;   /* set while require loads a library */
 static Cljc *mk_sym(const char *s) {
@@ -1054,6 +1065,7 @@ static uint32_t cljc_hash(Cljc *v) {
             return mix64(bits);
         }
         case CLJC_STRING:  return fnv1a(v->as.str, strlen(v->as.str));
+        case CLJC_CHAR:    return mix64((uint64_t)(uint32_t)v->as.chr) ^ 0x9b3d6f2au;
         case CLJC_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
         case CLJC_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
         case CLJC_LAZY:
@@ -1965,23 +1977,35 @@ static Cljc *read_form(const char **p) {
         return mk_cons(mk_sym(intern("with-meta", 9)),
                        mk_cons(form, mk_cons(m, NIL)));
     }
-    if (c == '\\') {  /* char literal => 1-char string (no char type) */
+    if (c == '\\') {  /* char literal => CLJC_CHAR */
         (*p)++;
         const char *start = *p;
         while (is_sym_char((unsigned char)**p)) (*p)++;
         size_t n = (size_t)(*p - start);
-        if (n == 0) { (*p)++; return mk_str(*p - 1, 1); }  /* \( etc */
-        if (n == 1) return mk_str(start, 1);
-        if (n == 5 && !memcmp(start, "space", 5)) return mk_str(" ", 1);
-        if (n == 7 && !memcmp(start, "newline", 7)) return mk_str("\n", 1);
-        if (n == 3 && !memcmp(start, "tab", 3)) return mk_str("\t", 1);
-        if (n == 6 && !memcmp(start, "return", 6)) return mk_str("\r", 1);
-        if (n == 8 && !memcmp(start, "formfeed", 8)) return mk_str("\f", 1);
-        if (n == 9 && !memcmp(start, "backspace", 9)) return mk_str("\b", 1);
+        if (n == 0) { (*p)++; return mk_char((unsigned char)*(*p - 1)); }  /* \( etc */
+        if (n == 1) return mk_char((unsigned char)start[0]);
+        if (n == 5 && !memcmp(start, "space", 5)) return mk_char(' ');
+        if (n == 7 && !memcmp(start, "newline", 7)) return mk_char('\n');
+        if (n == 3 && !memcmp(start, "tab", 3)) return mk_char('\t');
+        if (n == 6 && !memcmp(start, "return", 6)) return mk_char('\r');
+        if (n == 8 && !memcmp(start, "formfeed", 8)) return mk_char('\f');
+        if (n == 9 && !memcmp(start, "backspace", 9)) return mk_char('\b');
+        if (start[0] == 'u' && n == 5) {             /* \uXXXX hex codepoint */
+            int32_t cp = 0;
+            for (size_t i = 1; i < n; i++) {
+                char d = start[i]; int hv;
+                if (d >= '0' && d <= '9') hv = d - '0';
+                else if (d >= 'a' && d <= 'f') hv = d - 'a' + 10;
+                else if (d >= 'A' && d <= 'F') hv = d - 'A' + 10;
+                else cljc_error("bad \\u char literal");
+                cp = cp * 16 + hv;
+            }
+            return mk_char(cp);
+        }
         if (start[0] == 'o' && n >= 2 && n <= 4) {   /* \oNNN octal */
-            char ch = 0;
-            for (size_t i = 1; i < n; i++) ch = (char)(ch * 8 + (start[i] - '0'));
-            return mk_str(&ch, 1);
+            int32_t cp = 0;
+            for (size_t i = 1; i < n; i++) cp = cp * 8 + (start[i] - '0');
+            return mk_char(cp);
         }
         cljc_error("unsupported char literal");
     }
@@ -2596,7 +2620,8 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
         case CLJC_BOOL:
             vmc_emit(c, form->as.b ? VOP_TRUE : VOP_FALSE, 0);
             return;
-        case CLJC_INT: case CLJC_DOUBLE: case CLJC_STRING: case CLJC_KEYWORD:
+        case CLJC_INT: case CLJC_DOUBLE: case CLJC_STRING: case CLJC_CHAR:
+        case CLJC_KEYWORD:
         case CLJC_FN: case CLJC_NATIVE: case CLJC_MAP: case CLJC_SET:
             /* map/set literals with computed elements are rare in hot
              * bodies; constant ones are common — non-constant fall back */
@@ -3395,7 +3420,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL:
-        case CLJC_STRING: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
+        case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
         case CLJC_CHUNK:   /* internal; self-evaluates if it ever leaks */
@@ -3982,6 +4007,35 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                 sb_putc(sb, '"');
             } else sb_puts(sb, v->as.str);
             break;
+        case CLJC_CHAR: {
+            int32_t cp = v->as.chr;
+            if (readably) {
+                /* round-trips through the reader: named, then printable
+                 * ASCII as \x, else \uXXXX. */
+                switch (cp) {
+                    case '\n': sb_puts(sb, "\\newline"); break;
+                    case ' ':  sb_puts(sb, "\\space"); break;
+                    case '\t': sb_puts(sb, "\\tab"); break;
+                    case '\r': sb_puts(sb, "\\return"); break;
+                    case '\f': sb_puts(sb, "\\formfeed"); break;
+                    case '\b': sb_puts(sb, "\\backspace"); break;
+                    default:
+                        if (cp >= 33 && cp < 127) { sb_putc(sb, '\\'); sb_putc(sb, (char)cp); }
+                        else { char tmp[8]; snprintf(tmp, sizeof tmp, "\\u%04X", cp); sb_puts(sb, tmp); }
+                }
+            } else {                       /* (str \a) => "a": UTF-8 encode */
+                if (cp < 0x80) sb_putc(sb, (char)cp);
+                else if (cp < 0x800) {
+                    sb_putc(sb, (char)(0xC0 | (cp >> 6)));
+                    sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+                } else {
+                    sb_putc(sb, (char)(0xE0 | (cp >> 12)));
+                    sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+                    sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+                }
+            }
+            break;
+        }
         case CLJC_LIST: {
             sb_putc(sb, '(');
             bool first = true;
@@ -4289,6 +4343,7 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         case CLJC_SYMBOL: return a->as.sym == b->as.sym;
         case CLJC_KEYWORD: return a->as.kw == b->as.kw;
         case CLJC_STRING: return strcmp(a->as.str, b->as.str) == 0;
+        case CLJC_CHAR: return a->as.chr == b->as.chr;
         case CLJC_MAP: {
             if (a->as.map.count != b->as.map.count) return false;
             for (Cljc *e = map_entry_list(a); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
@@ -4424,6 +4479,9 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
         ? argv[2] : NULL;
     if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
+    } else if (coll && coll->tag == CLJC_STRING) {
+        if (n >= 0 && (size_t)n < strlen(coll->as.str))
+            return mk_char((unsigned char)coll->as.str[n]);   /* (nth "abc" 1) => \b */
     } else if (coll && (coll->tag == CLJC_LIST || coll->tag == CLJC_LAZY)) {
         /* advance argv[0] so a deep index into a lazy seq stays O(1) live */
         for (Cljc *l = seq1_slot(&argv[0]); l && l->tag == CLJC_LIST;
@@ -4536,6 +4594,7 @@ TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE))
 TYPE_PRED(int_p,     v != NIL && v->tag == CLJC_INT)
 TYPE_PRED(double_p,  v != NIL && v->tag == CLJC_DOUBLE)
 TYPE_PRED(string_p,  v != NIL && v->tag == CLJC_STRING)
+TYPE_PRED(char_p,    v != NIL && v->tag == CLJC_CHAR)
 TYPE_PRED(keyword_p, v != NIL && v->tag == CLJC_KEYWORD)
 TYPE_PRED(symbol_p,  v != NIL && v->tag == CLJC_SYMBOL)
 TYPE_PRED(fn_p,      v != NIL && (v->tag == CLJC_FN || v->tag == CLJC_NATIVE))
@@ -4609,9 +4668,9 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
             return vec_nth(coll, (size_t)k->as.i);
     } else if (coll != NIL && coll->tag == CLJC_STRING && k->tag == CLJC_INT) {
-        size_t len = strlen(coll->as.str);   /* (get s i) => 1-char string */
+        size_t len = strlen(coll->as.str);   /* (get s i) => char */
         if (k->as.i >= 0 && (size_t)k->as.i < len)
-            return mk_str(coll->as.str + k->as.i, 1);
+            return mk_char((unsigned char)coll->as.str[k->as.i]);
     }
     return dflt;
 }
@@ -4809,10 +4868,10 @@ static Cljc *to_seq(Cljc *v) {
         return out;
     }
     if (v->tag == CLJC_STRING) {
-        /* Strings seq into 1-char strings — no char type (divergence). */
+        /* Strings seq into chars (one per byte, matching byte-oriented count). */
         Cljc *out = NIL, **t = &out;
         for (const char *c = v->as.str; *c; c++) {
-            *t = mk_cons(mk_str(c, 1), NIL);
+            *t = mk_cons(mk_char((unsigned char)*c), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
@@ -5535,9 +5594,10 @@ static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *v = argv[0];
     if (v != NIL && v->tag == CLJC_INT) return v;
+    if (v != NIL && v->tag == CLJC_CHAR) return mk_int((int64_t)v->as.chr);  /* (int \a) => 97 */
     if (v != NIL && v->tag == CLJC_DOUBLE) return mk_int((int64_t)v->as.d);
     if (v != NIL && v->tag == CLJC_STRING && v->as.str[0])
-        return mk_int((int64_t)(unsigned char)v->as.str[0]);  /* (int \a) => 97 */
+        return mk_int((int64_t)(unsigned char)v->as.str[0]);  /* lenient: (int "a") */
     cljc_error("int: expected a number or character");
     return NIL;
 }
@@ -5573,6 +5633,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_INT: n = "int"; break;
         case CLJC_DOUBLE: n = "double"; break;
         case CLJC_STRING: n = "string"; break;
+        case CLJC_CHAR: n = "char"; break;
         case CLJC_KEYWORD: n = "keyword"; break;
         case CLJC_SYMBOL: n = "symbol"; break;
         case CLJC_LIST: n = "list"; break;
@@ -5750,6 +5811,7 @@ static int cmp_values(Cljc *a, Cljc *b) {
     if (a->tag != b->tag) cljc_error("compare: incomparable types");
     switch (a->tag) {
         case CLJC_STRING:  return strcmp(a->as.str, b->as.str);
+        case CLJC_CHAR:    return a->as.chr - b->as.chr;
         case CLJC_KEYWORD: return strcmp(a->as.kw, b->as.kw);
         case CLJC_SYMBOL:  return strcmp(a->as.sym, b->as.sym);
         case CLJC_BOOL:    return (int)a->as.b - (int)b->as.b;
@@ -5839,6 +5901,8 @@ static Cljc *prim_name(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_keyword(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    /* (keyword \a) => nil, like Clojure — keyword rejects chars. */
+    if (argv[0] != NIL && argv[0]->tag == CLJC_CHAR) return NIL;
     const char *n = as_named(argv[0], "keyword");
     return mk_kw(intern(n, strlen(n)));
 }
@@ -6746,24 +6810,15 @@ static Cljc *prim_bit_flip(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_int(as_int(argv[0], "bit-flip") ^ ((int64_t)1 << (as_int(argv[1], "bit-flip") & 63)));
 }
 
-/* (char 97) → "a" — code point to (UTF-8) one-char string; strings pass
- * through, so (char (first "abc")) works in char-as-string cljc. */
+/* (char 97) → \a — code point to char. A char passes through; a 1-char
+ * string is accepted leniently (its first byte). */
 static Cljc *prim_char(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
-    if (argv[0] != NIL && argv[0]->tag == CLJC_STRING) return argv[0];
-    int64_t c = as_int(argv[0], "char");
-    char b[4];
-    int n = 0;
-    if (c < 0x80) b[n++] = (char)c;
-    else if (c < 0x800) {
-        b[n++] = (char)(0xC0 | (c >> 6));
-        b[n++] = (char)(0x80 | (c & 0x3F));
-    } else {
-        b[n++] = (char)(0xE0 | (c >> 12));
-        b[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
-        b[n++] = (char)(0x80 | (c & 0x3F));
-    }
-    return mk_str(b, (size_t)n);
+    (void)env; (void)nargs;
+    Cljc *v = argv[0];
+    if (v != NIL && v->tag == CLJC_CHAR) return v;
+    if (v != NIL && v->tag == CLJC_STRING && v->as.str[0])
+        return mk_char((unsigned char)v->as.str[0]);
+    return mk_char((int32_t)as_int(v, "char"));
 }
 
 /* (str/replace-first s match repl) — first occurrence only, literal match. */
@@ -7384,7 +7439,6 @@ static const char *PRELUDE =
     "(defn distinct? [& xs] (= (count xs) (count (set xs))))\n"
     /* arbitrary-precision variants: int64 here (overflow wraps, v0) */
     "(def *' *) (def +' +) (def -' -) (def inc' inc) (def dec' dec)\n"
-    "(defn char? [x] (and (string? x) (= 1 (count x))))\n"
     /* deftype, tolerated: defines a Name. constructor returning a plain map
      * of fields; interface method bodies are ignored. Enough for files that
      * define a type they rarely use to still load. */
@@ -7608,6 +7662,11 @@ CljcEnv *cljc_new_env(void) {
             smallints[i - SMALLINT_MIN].gcmark = 1;  /* permanently marked */
             smallints[i - SMALLINT_MIN].as.i = i;
         }
+        for (int i = 0; i < 256; i++) {
+            smallchars[i].tag = CLJC_CHAR;
+            smallchars[i].gcmark = 1;             /* permanently marked */
+            smallchars[i].as.chr = i;
+        }
         NIL = alloc(CLJC_NIL);
         /* Self-referential cons fields: walking off the end of any form
          * (e.g. (def) with no args) yields NIL instead of reading
@@ -7752,6 +7811,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "int?",    prim_int_p);
     cljc_define_native(e, "double?", prim_double_p);
     cljc_define_native(e, "string?", prim_string_p);
+    cljc_define_native(e, "char?",   prim_char_p);
     cljc_define_native(e, "keyword?", prim_keyword_p);
     cljc_define_native(e, "symbol?", prim_symbol_p);
     cljc_define_native(e, "fn?",     prim_fn_p);

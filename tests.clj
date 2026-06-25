@@ -613,9 +613,9 @@
 (assert= :v3 (fn-using-redef))             ; calls see the latest def
 
 ; ── AoC-portability compat additions ──
-(assert= (list "a" "b" "c") (seq "abc"))             ; strings seq as 1-char strings
+(assert= (list \a \b \c) (seq "abc"))             ; strings seq into chars
 (assert= nil (seq ""))
-(assert= "h" (first "hello"))
+(assert= \h (first "hello"))
 (assert= 42 (parse-long "42"))
 (assert= -7 (parse-long "-7"))
 (assert= nil (parse-long "4x"))
@@ -630,7 +630,7 @@
 (assert= [3 4] (max-key count [1 2] [3 4]))          ; ties: LAST wins, like Clojure
 (assert= :b (max-key (constantly 1) :a :b))
 (assert= :b (min-key (constantly 1) :a :b))
-(assert= {"l" 2 "h" 1 "e" 1 "o" 1} (frequencies (seq "hello")))
+(assert= {\l 2 \h 1 \e 1 \o 1} (frequencies (seq "hello")))
 
 ; ── perf round 2: recur spill path (>3 args goes to the heap) ──
 (assert= 100014 (loop [a 1 b 2 c 3 d 4 e 5]
@@ -653,10 +653,26 @@
 (assert= 42 (docd 21))
 (defmacro docd-m "macro docstring" [x] `(+ ~x 1))
 (assert= 4 (docd-m 3))
-(assert= "a" \a)
-(assert= " " \space)
-(assert= "\n" \newline)
+(assert= "a" (str \a))
+(assert= " " (str \space))
+(assert= "\n" (str \newline))
 (assert= 3 (count (filter #(= % \a) (seq "banana"))))
+; ── char type ──
+(assert= true (char? \a))
+(assert= false (char? "a"))                          ; a char is NOT a 1-char string
+(assert= \h (first "hello"))                         ; first/nth/seq over strings yield chars
+(assert= \l (nth "hello" 2))
+(assert= \o (last "hello"))
+(assert= \b (get "abc" 1))
+(assert= 97 (int \a))
+(assert= \a (char 97))
+(assert= "abc" (apply str [\a \b \c]))               ; (str char) round-trips
+(assert= \a (read-string (pr-str \a)))               ; readable char round-trips
+(assert= \newline (read-string "\\newline"))
+(assert= 233 (int \u00e9))                   ; \uXXXX hex codepoint
+(assert= true (< (compare \a \b) 0))                 ; chars are comparable
+(assert= (list \a \b \c) (sort "cab"))
+(assert= nil (keyword \a))                            ; (keyword char) => nil, like Clojure
 (assert= [1 2] ^:private [1 2])
 (assert= {:private true} (meta ^:private [1 2]))
 (assert= :ours #?(:clj :jvm :cljc :ours :default :other))
@@ -934,7 +950,7 @@
 (def r-obj (reify RTest (r-go [_] :reified)))
 (assert= :reified (r-go r-obj))
 (assert= [1 2] (subvec [0 1 2 3] 1 3))
-(assert= "\f" \formfeed)
+(assert= "\f" (str \formfeed))
 (assert= 11 (int \o013))
 
 ; ── lazy-tail truncation bug (the reify reproducer, now fixed) ──
@@ -1129,8 +1145,8 @@
 (assert= 4 (bit-and-not 5 1))
 
 ; missing-builtins batch
-(assert= "a" (char 97))
-(assert= "a" (char "a"))
+(assert= \a (char 97))
+(assert= \a (char "a"))
 (assert= '(1 3 6) (reductions + [1 2 3]))
 (assert= '(10 11 13) (reductions + 10 [1 2]))
 (assert= true ((every-pred pos? odd?) 3 5))

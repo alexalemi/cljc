@@ -1339,12 +1339,20 @@
 (assert= 0 (:exit (sh "./cljc /tmp/cljc-judge-e2e.clj")))
 (sh "rm -f /tmp/cljc-judge-e2e.clj /tmp/cljc-judge-e2e.clj.tested")
 
+; project config: :paths from deps.edn/bb.edn feed *load-path*
+(spit "/tmp/cljc-deps-test.edn" "{:paths [\"a\" \"b\"] :deps {x {:mvn/version \"1\"}}}")
+(assert= ["a" "b"] (cljc/edn-paths "/tmp/cljc-deps-test.edn"))
+(assert= nil (cljc/edn-paths "/tmp/cljc-no-such-file.edn"))      ; missing -> nil
+(spit "/tmp/cljc-deps-test.edn" "{:deps {x {:mvn/version \"1\"}}}")
+(assert= nil (cljc/edn-paths "/tmp/cljc-deps-test.edn"))         ; no :paths -> nil
+(sh "rm -f /tmp/cljc-deps-test.edn")
+
 ; def docstrings, get-on-string, FIFO queue, lazy n-coll mapcat
 (def cljc-doc-probe "the docstring" 42)
 (assert= 42 cljc-doc-probe)
 (def cljc-str-probe "just-a-value")
 (assert= "just-a-value" cljc-str-probe)
-(assert= "b" (get "abc" 1))
+(assert= \b (get "abc" 1))
 (assert= nil (get "abc" 9))
 (assert= :d (get "abc" 9 :d))
 (assert= 1 (peek (conj clojure.lang.PersistentQueue/EMPTY 1 2 3)))     ; FIFO front

@@ -7544,11 +7544,23 @@ static const char *PRELUDE =
     "(def java.awt.Color/YELLOW 0) (def java.awt.Color/ORANGE 0)\n"
     "(defn File. [path] path)\n"
     "(defn ImageIO/write [img fmt file] true)\n"
+    /* :paths from a project's deps.edn / bb.edn (cwd) feed *load-path*, so the
+       SAME config that drives clj and bb also tells cljc where to find code.
+       Only :paths is honoured — cljc has no Maven/git resolver, so :deps,
+       :tasks, :aliases are ignored. Read errors degrade to nil (no paths). */
+    "(defn cljc/edn-paths [f]\n"
+    "  (try (let [m (read-string (slurp f))]\n"
+    "         (when (and (map? m) (vector? (:paths m))) (:paths m)))\n"
+    "       (catch Exception e nil)))\n"
+    "(defn cljc/project-paths []\n"
+    "  (mapcat cljc/edn-paths [\"deps.edn\" \"bb.edn\"]))\n"
     "(def *load-path*\n"
-    "  (vec (concat [\".\" \"vendor\"]\n"
-    "               (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
-    "                 (str/split p \":\"))\n"
-    "               [(cljc/sharedir*) (str (cljc/sharedir*) \"/vendor\")])))\n"
+    "  (vec (distinct (concat [\".\"]\n"
+    "                         (cljc/project-paths)\n"
+    "                         [\"vendor\"]\n"
+    "                         (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
+    "                           (str/split p \":\"))\n"
+    "                         [(cljc/sharedir*) (str (cljc/sharedir*) \"/vendor\")]))))\n"
     "(def cljc/loaded-namespaces (atom #{}))\n"
     "(defn cljc/spec-opt [spec k]\n"
     "  (loop [s (seq (rest spec))]\n"

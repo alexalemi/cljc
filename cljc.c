@@ -1779,6 +1779,17 @@ static const char *sym_name(Cljc *v, const char *what) {
     return v->as.sym;
 }
 
+/* Peel reader metadata off a def/defmacro name: (def ^:private x ..) reads the
+ * name as (with-meta x m) — possibly stacked. Metadata is not retained. */
+static Cljc *peel_meta_sym(Cljc *v) {
+    while (v != NIL && v->tag == CLJC_LIST &&
+           v->as.cons.head->tag == CLJC_SYMBOL &&
+           !strcmp(v->as.cons.head->as.sym, "with-meta") &&
+           v->as.cons.tail != NIL)
+        v = v->as.cons.tail->as.cons.head;
+    return v;
+}
+
 static int64_t as_int(Cljc *v, const char *what) {
     if (v == NULL || v->tag != CLJC_INT) cljc_error("%s: expected an integer", what);
     return v->as.i;
@@ -2358,6 +2369,22 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
     }
     for (Binding *b = root->bindings; b; b = b->next)
         if (b->name == name) return b;
+    /* clojure.core / cljs.core / clojure.lang qualified names resolve to the
+     * bare global (cljc's core lives in the flat global namespace). Lets code
+     * (and macroexpansions) that fully-qualify core refer to cljc's builtins. */
+    {
+        const char *slash = strchr(name, '/');
+        if (slash && slash != name) {
+            size_t plen = (size_t)(slash - name);
+            if ((plen == 12 && !memcmp(name, "clojure.core", 12)) ||
+                (plen == 9  && !memcmp(name, "cljs.core", 9)) ||
+                (plen == 12 && !memcmp(name, "clojure.lang", 12))) {
+                const char *bare = intern(slash + 1, strlen(slash + 1));
+                for (Binding *b = root->bindings; b; b = b->next)
+                    if (b->name == bare) return b;
+            }
+        }
+    }
     /* alias fallback: m/foo -> <full-ns>/foo -> bare foo; the qualified
      * def must win over any bare global (two passes) */
     {
@@ -3620,32 +3647,35 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     if (s == SYM_NS) {
                         /* (ns name (:require [a.b :as x] ...)) — load the
                          * :require clauses; everything else is tolerated. */
-                        static const char *KW_REQ;
-                        if (!KW_REQ) KW_REQ = intern("require", 7);
+                        static const char *KW_REQ, *KW_IMPORT;
+                        if (!KW_REQ) { KW_REQ = intern("require", 7);
+                                       KW_IMPORT = intern("import", 6); }
                         for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
                             Cljc *cl = c->as.cons.head;
-                            /* a clause is (:require ...) or [:require ...] */
+                            /* clause head keyword -> which per-spec handler */
+                            const char *kw = NULL;
                             if (cl != NIL && cl->tag == CLJC_LIST &&
-                                cl->as.cons.head->tag == CLJC_KEYWORD &&
-                                cl->as.cons.head->as.kw == KW_REQ) {
+                                cl->as.cons.head->tag == CLJC_KEYWORD)
+                                kw = cl->as.cons.head->as.kw;
+                            else if (cl != NIL && cl->tag == CLJC_VECTOR && vec_len(cl) > 0 &&
+                                     vec_nth(cl, 0)->tag == CLJC_KEYWORD)
+                                kw = vec_nth(cl, 0)->as.kw;
+                            const char *callee_name =
+                                kw == KW_REQ    ? "cljc/require-one" :
+                                kw == KW_IMPORT ? "cljc/import-one"  : NULL;
+                            if (!callee_name) continue;
+                            Cljc *callee = env_lookup_maybe(env, callee_name);
+                            if (!callee) continue;
+                            if (cl->tag == CLJC_LIST) {
                                 for (Cljc *sp = cl->as.cons.tail; sp && sp->tag == CLJC_LIST;
                                      sp = sp->as.cons.tail) {
-                                    Cljc *callee = env_lookup_maybe(env, "cljc/require-one");
-                                    if (callee) {
-                                        Cljc *one[1] = {sp->as.cons.head};
-                                        apply(env, callee, one, 1);
-                                    }
+                                    Cljc *one[1] = {sp->as.cons.head};
+                                    apply(env, callee, one, 1);
                                 }
-                            } else if (cl != NIL && cl->tag == CLJC_VECTOR &&
-                                       vec_len(cl) > 0 &&
-                                       vec_nth(cl, 0)->tag == CLJC_KEYWORD &&
-                                       vec_nth(cl, 0)->as.kw == KW_REQ) {
+                            } else {
                                 for (uint32_t vi = 1; vi < vec_len(cl); vi++) {
-                                    Cljc *callee = env_lookup_maybe(env, "cljc/require-one");
-                                    if (callee) {
-                                        Cljc *one[1] = {vec_nth(cl, vi)};
-                                        apply(env, callee, one, 1);
-                                    }
+                                    Cljc *one[1] = {vec_nth(cl, vi)};
+                                    apply(env, callee, one, 1);
                                 }
                             }
                         }
@@ -3731,7 +3761,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     /* (defmacro name [params] body...) — a fn flagged so that
                      * eval calls it on unevaluated forms and re-evals the result. */
                     need_args(rest, 2, "defmacro");
-                    const char *name = sym_name(rest->as.cons.head, "defmacro");
+                    const char *name = sym_name(peel_meta_sym(rest->as.cons.head), "defmacro");
                     Cljc *mbody = rest->as.cons.tail;
                     if (mbody->as.cons.head->tag == CLJC_STRING &&
                         mbody->as.cons.tail != NIL)
@@ -5594,6 +5624,35 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
     const char *name = as_str(argv[0], "resolve-maybe");
     Cljc *v = env_lookup_maybe(env, name);
     return v ? v : NIL;
+}
+
+/* (macroexpand-1 form) — if form is a call to a macro, return its one-step
+ * expansion (args unevaluated); otherwise return form unchanged. */
+static Cljc *prim_macroexpand_1(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    Cljc *form = argv[0];
+    if (form == NIL || form->tag != CLJC_LIST) return form;
+    Cljc *head = form->as.cons.head;
+    if (head == NIL || head->tag != CLJC_SYMBOL) return form;
+    /* resolve head like resolve_symbol (locals, then root with home-ns), but
+     * non-throwing — so a namespaced macro (loaded under (ns ..)) is found. */
+    Cljc *fn = NULL;
+    for (CljcEnv *e = env; e->parent; e = e->parent) {
+        Cljc **p = env_local_find(e, head->as.symc.name);
+        if (p) { fn = *p; break; }
+    }
+    if (!fn) {
+        Binding *b = head->as.symc.root_cache;
+        if (!b) b = root_find(env_root(env), head->as.symc.name, head->as.symc.home_ns);
+        if (b) fn = b->value;
+    }
+    if (!fn || fn->tag != CLJC_FN || !fn->as.fn.is_macro) return form;
+    size_t base = vsp;
+    for (Cljc *a = form->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+        vpush(a->as.cons.head);
+    Cljc *expansion = apply(env, fn, &vstack[base], (int)(vsp - base));
+    vsp = base;
+    return expansion;
 }
 
 static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7487,15 +7546,55 @@ static const char *PRELUDE =
     /* deftype, tolerated: defines a Name. constructor returning a plain map
      * of fields; interface method bodies are ignored. Enough for files that
      * define a type they rarely use to still load. */
-    "(defmacro deftype [tname fields & _]\n"
-    /* strip field metadata (^:volatile-mutable etc.) the reader wrapped as
-       (with-meta sym m); cljc's deftype is just a map constructor. */
-    "  (let [fs (mapv (fn [f]\n"
-    "                   (loop [f f]\n"
-    "                     (if (and (list? f) (= 'with-meta (first f))) (recur (second f)) f)))\n"
-    "                 fields)]\n"
-    "    `(defn ~(symbol (str tname \".\")) [~@fs]\n"
-    "       ~(zipmap (map keyword fs) fs))))\n"
+    /* Real deftype: an instance is a map tagged {:cljc/type :T} (so `type` and
+       protocol multimethods dispatch on it) whose MUTABLE fields are atoms.
+       Method bodies are rewritten so a field read becomes (:f this) — deref'd
+       for mutable fields — and (set! f v) becomes (reset! (:f this) v), then
+       registered as defmethods on :T. Field metadata (^:unsynchronized-mutable
+       etc.) marks a field mutable; bare fields are immutable values. */
+    "(defn cljc/field-sym [f]\n"
+    "  (loop [f f] (if (and (list? f) (= 'with-meta (first f))) (recur (second f)) f)))\n"
+    "(defn cljc/field-mut? [f]\n"
+    "  (loop [f f]\n"
+    "    (if (and (list? f) (= 'with-meta (first f)))\n"
+    "      (let [m (nth f 2 nil)]\n"
+    "        (if (and (map? m) (or (:unsynchronized-mutable m) (:volatile-mutable m) (:mutable m)))\n"
+    "          true (recur (second f))))\n"
+    "      false)))\n"
+    "(defn cljc/deftype-walk [form fset mset this]\n"
+    /* fully macroexpand this node first, so macros that GENERATE field reads or
+       (set! field ..) (e.g. tools.reader's update!) are rewritten too */
+    "  (let [form (loop [f form] (let [e (macroexpand-1 f)] (if (= e f) f (recur e))))]\n"
+    "  (cond\n"
+    "    (and (symbol? form) (contains? fset form))\n"
+    "      (let [a (list (keyword (str form)) this)]\n"
+    "        (if (contains? mset form) (list 'deref a) a))\n"
+    "    (and (list? form) (= 'set! (first form)) (symbol? (second form))\n"
+    "         (contains? mset (second form)))\n"
+    "      (list 'reset! (list (keyword (str (second form))) this)\n"
+    "            (cljc/deftype-walk (nth form 2) fset mset this))\n"
+    "    (list? form)   (apply list (map (fn [x] (cljc/deftype-walk x fset mset this)) form))\n"
+    "    (vector? form) (mapv (fn [x] (cljc/deftype-walk x fset mset this)) form)\n"
+    "    (map? form)    (into {} (map (fn [kv] [(cljc/deftype-walk (first kv) fset mset this)\n"
+    "                                           (cljc/deftype-walk (second kv) fset mset this)]) form))\n"
+    "    :else form)))\n"
+    "(defmacro deftype [tname fields & specs]\n"
+    "  (let [tkw   (keyword (str tname))\n"
+    "        fsyms (mapv cljc/field-sym fields)\n"
+    "        fset  (set fsyms)\n"
+    "        mset  (set (filter some? (map (fn [f] (when (cljc/field-mut? f) (cljc/field-sym f))) fields)))\n"
+    "        ms    (filter list? specs)\n"
+    "        kvs   (mapcat (fn [s] [(keyword (str s)) (if (contains? mset s) (list 'atom s) s)]) fsyms)]\n"
+    "    `(do\n"
+    "       (def ~tname ~tkw)\n"
+    "       (defn ~(symbol (str tname \".\")) ~fsyms\n"
+    "         (hash-map :cljc/type ~tkw ~@kvs))\n"
+    "       ~@(map (fn [m]\n"
+    "                (let [mname (first m) params (vec (second m)) this (first (second m))\n"
+    "                      body (map (fn [x] (cljc/deftype-walk x fset mset this)) (drop 2 m))]\n"
+    "                  `(defmethod ~mname ~tkw ~params ~@body)))\n"
+    "              ms)\n"
+    "       ~tkw)))\n"
     /* PersistentQueue: a vector tagged {:cljc/queue true} — conj at the
      * back (meta survives), peek/pop at the FRONT (true FIFO; pop is
      * O(n), fine at puzzle scale). */
@@ -7563,6 +7662,21 @@ static const char *PRELUDE =
     "(def java.awt.Color/RED 0) (def java.awt.Color/GREEN 0)\n"
     "(def java.awt.Color/BLUE 0) (def java.awt.Color/GRAY 0)\n"
     "(def java.awt.Color/YELLOW 0) (def java.awt.Color/ORANGE 0)\n"
+    /* host-class stubs so libraries that extend protocols to / dispatch on JVM
+       classes load (cljc never has instances of them; each resolves to a
+       distinct keyword token). Mainly for tools.reader's java.io.* readers. */
+    "(def java.io.PushbackReader :java.io.PushbackReader)\n"
+    "(def java.io.Reader :java.io.Reader)\n"
+    "(def java.io.Writer :java.io.Writer)\n"
+    "(def java.io.InputStream :java.io.InputStream)\n"
+    "(def java.io.BufferedReader :java.io.BufferedReader)\n"
+    "(def clojure.lang.LineNumberingPushbackReader :clojure.lang.LineNumberingPushbackReader)\n"
+    /* map host classes to cljc's actual type-keyword dispatch values so a
+       protocol extension to e.g. String actually fires for cljc strings, and
+       Object becomes the multimethod :default catch-all. */
+    "(def Object :default) (def String :string) (def CharSequence :string)\n"
+    "(def Character :char) (def Boolean :bool) (def Number :int)\n"
+    "(def Long :int) (def Integer :int) (def Double :double)\n"
     "(defn File. [path] path)\n"
     "(defn ImageIO/write [img fmt file] true)\n"
     /* :paths from a project's deps.edn / bb.edn feed *load-path*, so the SAME
@@ -7571,6 +7685,15 @@ static const char *PRELUDE =
        find the project root), resolving its :paths relative to that dir. Only
        :paths is honoured — cljc has no Maven/git resolver, so :deps, :tasks,
        :aliases are ignored. Read errors degrade to nil (no paths). */
+    /* &env compat shim: cljc doesn't pass a per-expansion macro environment,
+       but portable libraries reference &env to detect cljs-vs-clj at expansion
+       time (macrovich: (:ns &env) is truthy on cljs). A global empty map makes
+       those macros take the clj branch — which is what cljc wants. Not a real
+       lexical &env (it has no locals); enough for the common pattern. */
+    "(def &env {})\n"
+    /* runtime version vars some libraries (tools.reader) gate features on */
+    "(def *clojure-version* {:major 1 :minor 11 :incremental 0 :qualifier nil})\n"
+    "(defn clojure-version [] \"1.11.0\")\n"
     "(defn cljc/edn-paths [f]\n"
     "  (try (let [m (read-string (slurp f))]\n"
     "         (when (and (map? m) (vector? (:paths m))) (:paths m)))\n"
@@ -7595,6 +7718,16 @@ static const char *PRELUDE =
     "    (cond (nil? s) nil\n"
     "          (= k (first s)) (second s)\n"
     "          :else (recur (nnext s)))))\n"
+    /* (:import clojure.lang.Foo (java.io Bar Baz)) — bind each short class name
+       to a keyword token so code that names the class loads. cljc has no real
+       classes; the value just needs to be a stable, distinct placeholder. */
+    "(defn cljc/import-one [spec]\n"
+    "  (if (or (list? spec) (vector? spec) (seq? spec))\n"
+    "    (let [pkg (str (first spec))]\n"
+    "      (doseq [c (rest spec)]\n"
+    "        (eval (list 'def (symbol (str c)) (keyword (str pkg \".\" c))))))\n"
+    "    (let [s (str spec)]\n"
+    "      (eval (list 'def (symbol (last (str/split s #\"\\.\"))) (keyword s))))))\n"
     "(defn cljc/require-one [spec]\n"
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
     "    (when-let [a (and (vector? spec) (cljc/spec-opt spec :as))]\n"
@@ -7821,6 +7954,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/in-ns*", prim_in_ns);
     cljc_define_native(e, "cljc/ns-publics*", prim_ns_publics);
     cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
+    cljc_define_native(e, "macroexpand-1", prim_macroexpand_1);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
     cljc_define_native(e, "cljc/onto",          prim_onto);
@@ -8306,9 +8440,19 @@ CljcEnv *cljc_new_env(void) {
         "              sigs)\n"
         "       (def ~pname '~(mapv first sigs))))\n"
         "(defmacro extend-type [t & impls]\n"
-        "  `(do ~@(map (fn [[m params & body]]\n"
-        "                `(defmethod ~m ~t ~(vec params) ~@body))\n"
-        "              impls)))\n"
+        /* Skip interleaved protocol-name symbols (Clojure syntax: (extend-type
+           T Proto (m [this] ..) ..)); cljc dispatches per method. A keyword type
+           (cljc-native, e.g. :string) dispatches directly; a symbol type (host
+           class / deftype name) is resolved to its dispatch value at runtime and
+           SKIPPED if unresolved — so extensions to classes/protocol-interfaces
+           cljc lacks are quietly ignored rather than erroring. */
+        "  (let [ms (filter list? impls)]\n"
+        "    (if (keyword? t)\n"
+        "      `(do ~@(map (fn [[m params & body]] `(defmethod ~m ~t ~(vec params) ~@body)) ms))\n"
+        "      `(when-let [tv# (cljc/resolve-maybe ~(str t))]\n"
+        "         ~@(map (fn [[m params & body]]\n"
+        "                  `(swap! cljc/multi-tables update '~m assoc tv# (fn ~(vec params) ~@body)))\n"
+        "                ms)))))\n"
         /* (extend-protocol P T1 (m [x] ...) (m2 [x] ...) T2 (m [x] ...)) —
            grouped by TYPE; expands to one extend-type per type. The protocol
            name is ignored (cljc methods dispatch globally on type). */
@@ -8321,6 +8465,13 @@ CljcEnv *cljc_new_env(void) {
         "                   :else\n"                        /* a type symbol/keyword -> new group */
         "                     (recur (rest s) (if cur (conj acc cur) acc) [(first s)])))]\n"
         "    `(do ~@(map (fn [g] `(extend-type ~(first g) ~@(rest g))) groups))))\n"
+        /* (extend AType AProtocol {:method (fn [this ..] ..) ..} ..) — the
+           low-level extend fn. Registers each method-map entry as a method on
+           AType (dispatch value); the protocol arg is ignored. */
+        "(defn extend [t & proto+maps]\n"
+        "  (doseq [pm (partition 2 proto+maps)]\n"
+        "    (doseq [e (second pm)]\n"
+        "      (swap! cljc/multi-tables update (symbol (name (first e))) assoc t (second e)))))\n"
         "(defn satisfies? [proto x]\n"
         "  (every? (fn [m] (contains? (get @cljc/multi-tables m) (type x))) proto))\n"
         /* records: maps tagged with :cljc/type */

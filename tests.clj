@@ -688,8 +688,17 @@
   :vector (area [v] (reduce + v)))
 (assert= 16 (area 4))
 (assert= 6 (area [1 2 3]))
-(deftype CompatPt [^:mutable px py])                 ; metadata on a deftype field
-(assert= {:px 1 :py 2} (CompatPt. 1 2))
+; real deftype: mutable field (set!) + protocol method dispatch on the type
+(defprotocol Bumpable (bump! [x]) (cur [x]))
+(deftype Cntr [^:unsynchronized-mutable c]
+  Bumpable (bump! [this] (set! c (inc c)) c) (cur [this] c))
+(def cntr-inst (Cntr. 10))
+(bump! cntr-inst) (bump! cntr-inst)
+(assert= 12 (cur cntr-inst))
+(assert= :Cntr (type cntr-inst))
+(deftype CompatPt [^:mutable px py])
+(assert= 2 (:py (CompatPt. 1 2)))                    ; immutable field: a direct value
+(assert= 1 (deref (:px (CompatPt. 1 2))))            ; mutable field: an atom
 (assert= nil (comment (this is ignored)))
 (assert= 11 (loop [[a b] [1 10] acc 0] (if a (recur [b nil] (+ acc a)) acc)))
 (assert= 6 (loop [{:keys [n total]} {:n 3 :total 0}]
@@ -1251,8 +1260,8 @@
 (assert= true (== 1 1.0))
 (assert= true (distinct? 1 2 3))
 (assert= false (distinct? 1 1))
-(deftype CljcProbeT [a b])
-(assert= {:a 1 :b 2} (CljcProbeT. 1 2))
+(deftype CljcProbeT [a b])                            ; plain (immutable) deftype
+(assert= [1 2 :CljcProbeT] [(:a (CljcProbeT. 1 2)) (:b (CljcProbeT. 1 2)) (type (CljcProbeT. 1 2))])
 (assert= [] clojure.lang.PersistentQueue/EMPTY)
 (assert= [:b 2] (peek {:a 5 :b 2 :c 9}))
 (assert= {:a 5} (pop {:a 5 :b 2}))

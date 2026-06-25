@@ -2295,14 +2295,17 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
                     if (spec == NIL || spec->tag != CLJC_VECTOR)
                         cljc_error("destructure: :keys needs a vector of symbols");
                     for (size_t j = 0; j < vec_len(spec); j++) {
-                        const char *nm = sym_name(vec_nth(spec, j), ":keys");
+                        /* {:keys [a b]} or the keyword shorthand {:keys [:a :b]} */
+                        Cljc *elt = vec_nth(spec, j);
+                        const char *nm = (elt != NIL && elt->tag == CLJC_KEYWORD)
+                                         ? elt->as.kw : sym_name(elt, ":keys");
                         Cljc *kw = mk_kw(nm);
                         Cljc *v = NIL;
                         bool found = value != NIL && value->tag == CLJC_MAP &&
                                      map_find(value, kw, &v);
                         if (!found && defaults && defaults->tag == CLJC_MAP) {
                             Cljc *d;
-                            if (map_find(defaults, vec_nth(spec, j), &d))
+                            if (map_find(defaults, mk_sym(intern(nm, strlen(nm))), &d))
                                 v = eval(scope, d);
                         }
                         env_define(scope, nm, v);

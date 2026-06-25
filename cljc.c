@@ -2026,6 +2026,11 @@ static Cljc *read_form(const char **p) {
         return mk_cons(mk_sym(intern("**reader-splice**", 17)),
                        mk_cons(NIL, NIL));   /* splices zero elements */
     }
+    if (c == '#' && (*p)[1] == '\'') {  /* #'x => (var x) */
+        *p += 2;
+        Cljc *form = read_form(p);
+        return mk_cons(mk_sym(intern("var", 3)), mk_cons(form, NIL));
+    }
     if (c == '#' && (*p)[1] == '#') {  /* ##Inf ##-Inf ##NaN */
         *p += 2;
         if (!strncmp(*p, "Inf", 3))  { *p += 3; return mk_double(INFINITY); }
@@ -3800,7 +3805,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 }
                 if (s == SYM_DO) return eval_body(env, rest);
                 if (s == SYM_DEF) {
-                    need_args(rest, 2, "def");
+                    need_args(rest, 1, "def");
                     Cljc *namef = rest->as.cons.head;
                     /* (def ^:dynamic x v): the reader wrapped the name as
                      * (with-meta x m) — unwrap; def meta is not retained.
@@ -3813,6 +3818,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         namef = namef->as.cons.tail->as.cons.head;
                     const char *name = sym_name(namef, "def");
                     Cljc *valf = rest->as.cons.tail;
+                    /* (def name): no value — an unbound-var declaration => nil */
+                    if (valf == NIL) { env_define_root(env_root(env), name, NIL); return NIL; }
                     /* (def name "docstring" value): skip the docstring */
                     if (valf->as.cons.tail != NIL &&
                         valf->as.cons.tail->tag == CLJC_LIST &&
@@ -4105,6 +4112,18 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             break;
         }
         case CLJC_MAP: {
+            /* a StringBuilder ({:cljc/type :StringBuilder :v <atom-of-string>})
+             * renders as its accumulated content — so (str sb) gives the token */
+            Cljc *ty;
+            if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty) &&
+                ty == mk_kw(intern("StringBuilder", 13))) {
+                Cljc *vv;
+                if (map_find(v, mk_kw(intern("v", 1)), &vv) && vv != NIL &&
+                    vv->tag == CLJC_ATOM && vv->as.atom.value != NIL &&
+                    vv->as.atom.value->tag == CLJC_STRING)
+                    sb_puts(sb, vv->as.atom.value->as.str);
+                break;
+            }
             sb_putc(sb, '{');
             bool first = true;
             for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
@@ -5621,9 +5640,12 @@ static Cljc *prim_ns_publics(CljcEnv *env, Cljc **argv, int nargs) {
  * if unbound. Used by `cljc -m` to find a namespace's -main without throwing. */
 static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
     (void)nargs;
-    const char *name = as_str(argv[0], "resolve-maybe");
-    Cljc *v = env_lookup_maybe(env, name);
-    return v ? v : NIL;
+    const char *raw = as_str(argv[0], "resolve-maybe");
+    const char *name = intern(raw, strlen(raw));
+    /* root_find handles the (require :as) alias + clojure.core fallbacks, so
+     * a qualified name like edn/read-char* resolves to its real binding. */
+    Binding *b = root_find(env_root(env), name, NULL);
+    return b ? b->value : NIL;
 }
 
 /* (macroexpand-1 form) — if form is a call to a macro, return its one-step
@@ -5875,8 +5897,10 @@ static Cljc *prim_atom(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
-    return as_atom(argv[0], "deref")->as.atom.value;
+    (void)env; (void)nargs;
+    Cljc *v = argv[0];
+    if (v != NIL && v->tag == CLJC_ATOM) return v->as.atom.value;
+    return v;   /* cljc has no var objects: @#'fn (var -> value) derefs to itself */
 }
 
 static Cljc *prim_reset(CljcEnv *env, Cljc **argv, int nargs) {
@@ -6013,7 +6037,15 @@ static Cljc *prim_keyword(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_symbol(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    const char *n = as_named(argv[0], "symbol");
+    /* (symbol name) or (symbol ns name) — a nil ns yields the bare name */
+    if (nargs >= 2 && argv[0] != NIL) {
+        const char *ns = as_named(argv[0], "symbol");
+        const char *nm = as_named(argv[1], "symbol");
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s/%s", ns, nm);
+        return mk_sym(intern(buf, strlen(buf)));
+    }
+    const char *n = as_named(nargs >= 2 ? argv[1] : argv[0], "symbol");
     return mk_sym(intern(n, strlen(n)));
 }
 
@@ -7562,9 +7594,12 @@ static const char *PRELUDE =
     "          true (recur (second f))))\n"
     "      false)))\n"
     "(defn cljc/deftype-walk [form fset mset this]\n"
-    /* fully macroexpand this node first, so macros that GENERATE field reads or
-       (set! field ..) (e.g. tools.reader's update!) are rewritten too */
-    "  (let [form (loop [f form] (let [e (macroexpand-1 f)] (if (= e f) f (recur e))))]\n"
+    /* macroexpand this node so macros that GENERATE field reads or (set! field
+       ..) (e.g. tools.reader's update!) are rewritten too — but STOP at a set!
+       form so it stays a set! for the rewrite below (set! is itself a macro). */
+    "  (let [form (loop [f form]\n"
+    "               (if (and (list? f) (= 'set! (first f))) f\n"
+    "                 (let [e (macroexpand-1 f)] (if (= e f) f (recur e)))))]\n"
     "  (cond\n"
     "    (and (symbol? form) (contains? fset form))\n"
     "      (let [a (list (keyword (str form)) this)]\n"
@@ -7608,7 +7643,6 @@ static const char *PRELUDE =
     "      (throw (ex-info (str \"MessageDigest: only MD5 (got \" algo \")\") {}))))\n"
     "(defn .getBytes [s] s)\n"
     "(defn .digest [algo s] (cljc/md5* s))\n"   /* → 32-char hex string */
-    "(defn BigInteger. [signum x] x)\n"         /* hex passes through */
     "(defn .indexOf [coll x]\n"
     "  (if (string? coll)\n"
     "    (or (str/index-of coll x) -1)\n"
@@ -7623,6 +7657,52 @@ static const char *PRELUDE =
     "(defn Character/digit [c radix]\n"
     "  (let [i (str/index-of cljc/digit-chars (str/lower-case (str c)))]\n"
     "    (if (and i (< i radix)) i -1)))\n"
+    "(defn Character/isWhitespace [c]\n"
+    "  (let [n (int c)] (or (= n 32) (= n 9) (= n 10) (= n 13) (= n 12) (= n 11))))\n"
+    "(defn Character/isDigit [c] (let [n (int c)] (and (>= n 48) (<= n 57))))\n"
+    "(defn Character/valueOf [c] c)\n"
+    /* StringBuilder: an atom holding a string; the .methods code uses to build
+       tokens. .length/.charAt/.toString also accept a plain string. */
+    "(defn StringBuilder. ([] {:cljc/type :StringBuilder :v (atom \"\")})\n"
+    "  ([s] {:cljc/type :StringBuilder :v (atom (str s))}))\n"
+    "(defn cljc/sb-str [o] (if (and (map? o) (= :StringBuilder (:cljc/type o))) (deref (:v o)) (str o)))\n"
+    "(defn .append [sb x] (swap! (:v sb) str x) sb)\n"
+    "(defn .toString [o] (cljc/sb-str o))\n"
+    "(defn .length [o] (count (cljc/sb-str o)))\n"
+    "(defn .charAt [o i] (nth (cljc/sb-str o) i))\n"
+    "(defn .deleteCharAt [sb i]\n"
+    "  (let [s (deref (:v sb))] (reset! (:v sb) (str (subs s 0 i) (subs s (inc i))))) sb)\n"
+    "(defn .setLength [sb n] (reset! (:v sb) (subs (deref (:v sb)) 0 n)) sb)\n"
+    /* java.util.regex Matcher over cljc's own regex: re-matches returns the
+       whole match (no groups) or a [whole g1 g2 ..] vector. */
+    "(defn .matcher [pat s] (atom {:pat pat :s s :groups nil}))\n"
+    "(defn .matches [m]\n"
+    "  (let [r (re-matches (:pat (deref m)) (:s (deref m)))]\n"
+    "    (swap! m assoc :groups (cond (vector? r) r (string? r) [r] :else nil))\n"
+    "    (boolean r)))\n"
+    "(defn .group [m n] (when-let [g (:groups (deref m))] (nth g n nil)))\n"
+    /* BigInteger / BigInt / Numbers: cljc integers are all int64, so collapse
+       the bignum machinery (used by tools.reader's match-int) to plain ints. */
+    /* two Java ctors: (String val, int radix) parses; (int signum, byte[] mag)
+       is the MD5 idiom — pass the magnitude through for %0..x formatting. */
+    "(defn BigInteger.\n"
+    "  ([s] (parse-long (str s)))\n"
+    "  ([a b] (if (string? a) (Integer/parseInt a (int b)) b)))\n"
+    "(defn .bitLength [n] 1)\n"          /* always < 64 -> the long path */
+    "(defn .negate [n] (- n))\n"
+    "(defn .longValue [n] n)\n"
+    "(defn .intValue [n] n)\n"
+    "(def BigInt/fromBigInteger identity)\n"
+    "(def Numbers/reduceBigInt identity)\n"
+    /* java.lang.String instance methods over cljc strings */
+    "(defn .endsWith [s suf] (str/ends-with? (str s) suf))\n"
+    "(defn .startsWith [s pre] (str/starts-with? (str s) pre))\n"
+    "(defn .substring ([s a] (subs (str s) a)) ([s a b] (subs (str s) a b)))\n"
+    "(defn .contains [s x] (str/includes? (str s) x))\n"
+    "(defn .trim [s] (str/trim (str s)))\n"
+    "(defn array-map [& kvs] (apply hash-map kvs))\n"
+    "(defn Double/parseDouble [s] (parse-double (str s)))\n"
+    "(defn Float/parseFloat [s] (parse-double (str s)))\n"
     "(defn Integer/parseInt\n"
     "  ([s] (parse-long s))\n"
     "  ([s radix]\n"
@@ -7694,6 +7774,18 @@ static const char *PRELUDE =
     /* runtime version vars some libraries (tools.reader) gate features on */
     "(def *clojure-version* {:major 1 :minor 11 :incremental 0 :qualifier nil})\n"
     "(defn clojure-version [] \"1.11.0\")\n"
+    /* proxy: no JVM classes to subclass — stub to nil so (def x (proxy ..))
+       loads (the object is unused unless its host methods are called). */
+    "(defmacro proxy [& _] nil)\n"
+    /* set! on a var/symbol rebinds the global (cljc vars are mutable globals);
+       set! on a deftype field is rewritten to reset! before this is reached. */
+    "(defmacro set! [place val] (if (symbol? place) `(def ~place ~val) val))\n"
+    /* (Object.) is used as a unique sentinel; a fresh atom is a clean identity
+       object that never equals read data. */
+    "(defn Object. [] (atom nil))\n"
+    /* cljc has no var objects: #'x => (var x) resolves to x's value (or nil if
+       unbound) — enough for #'fn references in data-reader tables etc. */
+    "(defmacro var [s] `(cljc/resolve-maybe ~(str s)))\n"
     "(defn cljc/edn-paths [f]\n"
     "  (try (let [m (read-string (slurp f))]\n"
     "         (when (and (map? m) (vector? (:paths m))) (:paths m)))\n"
@@ -7722,13 +7814,15 @@ static const char *PRELUDE =
        to a keyword token so code that names the class loads. cljc has no real
        classes; the value just needs to be a stable, distinct placeholder. */
     "(defn cljc/import-one [spec]\n"
+    "  (when spec\n"
     "  (if (or (list? spec) (vector? spec) (seq? spec))\n"
     "    (let [pkg (str (first spec))]\n"
     "      (doseq [c (rest spec)]\n"
     "        (eval (list 'def (symbol (str c)) (keyword (str pkg \".\" c))))))\n"
     "    (let [s (str spec)]\n"
-    "      (eval (list 'def (symbol (last (str/split s #\"\\.\"))) (keyword s))))))\n"
+    "      (eval (list 'def (symbol (last (str/split s #\"\\.\"))) (keyword s)))))))\n"
     "(defn cljc/require-one [spec]\n"
+    "  (when spec\n"   /* a #?(:cljs ..)-only spec reads as nil under cljc */
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
     "    (when-let [a (and (vector? spec) (cljc/spec-opt spec :as))]\n"
     "      (cljc/alias* (str a) (str nsname)))\n"
@@ -7745,8 +7839,8 @@ static const char *PRELUDE =
     "            (try (load-file hit)\n"
     "                 (finally (cljc/in-ns* old)))))))\n"
     "    (when-let [refers (and (vector? spec) (cljc/spec-opt spec :refer))]\n"
-    "      (doseq [r refers]\n"
-    "        (eval (list 'def r (symbol (str nsname \"/\" r))))))))\n"
+    "      (doseq [r (if (= refers :all) (map symbol (cljc/ns-publics* (str nsname))) refers)]\n"
+    "        (eval (list 'def r (symbol (str nsname \"/\" r)))))))))\n"
     "(defmacro require [& specs]\n"
     "  `(do ~@(map (fn [s] `(cljc/require-one ~s)) specs) nil))\n"
     "(defn cljc/use-one [spec]\n"
@@ -8429,9 +8523,15 @@ CljcEnv *cljc_new_env(void) {
         "                 (throw (ex-info (str \"No method in \" '~name\n"
         "                                      \" for \" (pr-str dv#)) {})))))))))\n"
         "(defmacro defmethod [name dval params & body]\n"
-        "  `(do (swap! cljc/multi-tables update '~name assoc ~dval\n"
-        "              (fn ~params ~@body))\n"
-        "       '~name))\n"
+        /* skip a host-class dispatch value (dotted / $-inner-class) that cljc
+           can't resolve — it would never match anyway; bare typos still error */
+        "  (if (and (symbol? dval)\n"
+        "           (or (str/includes? (str dval) \".\") (str/includes? (str dval) \"$\"))\n"
+        "           (not (cljc/resolve-maybe (str dval))))\n"
+        "    nil\n"
+        "    `(do (swap! cljc/multi-tables update '~name assoc ~dval\n"
+        "                (fn ~params ~@body))\n"
+        "         '~name)))\n"
         /* protocols: each method dispatches on (type (first args)) */
         "(defmacro defprotocol [pname & sigs]\n"
         "  `(do ~@(map (fn [sig]\n"
@@ -8475,12 +8575,26 @@ CljcEnv *cljc_new_env(void) {
         "(defn satisfies? [proto x]\n"
         "  (every? (fn [m] (contains? (get @cljc/multi-tables m) (type x))) proto))\n"
         /* records: maps tagged with :cljc/type */
-        "(defmacro defrecord [rname fields]\n"
-        "  (let [kw (keyword (str rname))]\n"
-        "    `(defn ~(symbol (str \"->\" rname)) ~fields\n"
-        "       (assoc (zipmap ~(mapv keyword (map str fields))\n"
-        "                      ~fields)\n"
-        "              :cljc/type ~kw))))\n"
+        /* defrecord: like deftype but immutable (fields are direct values, no
+           atoms) and with both ->R (positional) and map->R (from a map) ctors.
+           Protocol method bodies are field-rewritten and registered like
+           deftype's. */
+        "(defmacro defrecord [rname fields & specs]\n"
+        "  (let [kw    (keyword (str rname))\n"
+        "        fsyms (mapv cljc/field-sym fields)\n"
+        "        fset  (set fsyms)\n"
+        "        ms    (filter list? specs)\n"
+        "        kvs   (mapcat (fn [s] [(keyword (str s)) s]) fsyms)]\n"
+        "    `(do\n"
+        "       (def ~rname ~kw)\n"
+        "       (defn ~(symbol (str \"->\" rname)) ~fsyms (hash-map :cljc/type ~kw ~@kvs))\n"
+        "       (defn ~(symbol (str \"map->\" rname)) [m] (assoc m :cljc/type ~kw))\n"
+        "       ~@(map (fn [m]\n"
+        "                (let [mn (first m) params (vec (second m)) this (first (second m))\n"
+        "                      body (map (fn [x] (cljc/deftype-walk x fset #{} this)) (drop 2 m))]\n"
+        "                  `(defmethod ~mn ~kw ~params ~@body)))\n"
+        "              ms)\n"
+        "       ~kw)))\n"
         "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\\n"
         "(defmacro reify [& clauses]\n"
         "  (let [t (keyword (str (gensym)))\n"

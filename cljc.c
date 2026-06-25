@@ -2249,6 +2249,7 @@ static const char *sym_amp(void) {
  *   {a :k}            → bind a to (get value :k)
  *   {:keys [a b] :or {a 1} :as m}
  * :or defaults are forms, evaluated in `scope` when the key is missing. */
+static Cljc *kvseq_to_map(Cljc *s);
 static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
     if (pattern != NIL && pattern->tag == CLJC_SYMBOL) {
         env_define(scope, pattern->as.sym, value);
@@ -2266,7 +2267,10 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
             if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) {
                 if (i + 1 >= vec_len(pattern))
                     cljc_error("destructure: & needs a binding form");
-                destructure(scope, vec_nth(pattern, ++i), s);
+                Cljc *restpat = vec_nth(pattern, ++i);
+                destructure(scope, restpat,
+                            (restpat != NIL && restpat->tag == CLJC_MAP)
+                            ? kvseq_to_map(s) : s);
                 continue;
             }
             if (pe->tag == CLJC_KEYWORD && pe->as.kw == KW_AS) {
@@ -2342,6 +2346,21 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
 
 /* Bind an arity's params to argv. Each param may be any destructuring
  * pattern; '&' collects the remaining args as a (freshly built) list. */
+/* [& {:keys [a b]}] kwargs: turn the trailing args (k1 v1 k2 v2 ..) into a map
+ * so the map pattern can bind them. A lone trailing map is used as-is (the
+ * Clojure 1.11 (f {:a 1}) form). */
+static Cljc *kvseq_to_map(Cljc *s) {
+    if (s != NIL && s->tag == CLJC_LIST && s->as.cons.tail == NIL &&
+        s->as.cons.head != NIL && s->as.cons.head->tag == CLJC_MAP)
+        return s->as.cons.head;
+    Cljc *m = mk_map();
+    for (; s != NIL && s->tag == CLJC_LIST && s->as.cons.tail != NIL &&
+           s->as.cons.tail->tag == CLJC_LIST;
+         s = s->as.cons.tail->as.cons.tail)
+        m = map_assoc(m, s->as.cons.head, s->as.cons.tail->as.cons.head);
+    return m;
+}
+
 static void bind_params(CljcEnv *call, Cljc *params, Cljc **argv, int nargs) {
     Cljc *p = params;
     int i = 0;
@@ -2353,7 +2372,10 @@ static void bind_params(CljcEnv *call, Cljc *params, Cljc **argv, int nargs) {
                 *t = mk_cons(argv[j], NIL);
                 t = &(*t)->as.cons.tail;
             }
-            destructure(call, p->as.cons.tail->as.cons.head, restl);
+            Cljc *restpat = p->as.cons.tail->as.cons.head;
+            destructure(call, restpat,
+                        (restpat != NIL && restpat->tag == CLJC_MAP)
+                        ? kvseq_to_map(restl) : restl);
             return;
         }
         if (i >= nargs) cljc_error("not enough arguments");
@@ -3247,6 +3269,31 @@ static void fastcall_init(Cljc *fn) {
     fn->as.fn.fc_n = (uint8_t)n;
 }
 
+/* If `inst` is a deftype instance (:cljc/type-tagged map) whose type has a
+ * method `mname` registered in cljc/multi-tables, call it with the instance
+ * prepended to argv and store the result in *out; return true. Else false.
+ * This is how cljc bridges to protocol methods a host would dispatch via an
+ * interface — invoke (IFn), deref (IDeref), etc. */
+static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
+                                    Cljc **argv, int nargs, Cljc **out) {
+    if (inst == NIL || inst->tag != CLJC_MAP) return false;
+    Cljc *tykw;
+    if (!map_find(inst, mk_kw(intern("cljc/type", 9)), &tykw)) return false;
+    Binding *mtb = root_find(env_root(env), intern("cljc/deftype-methods", 20), NULL);
+    if (!mtb || mtb->value == NIL || mtb->value->tag != CLJC_ATOM) return false;
+    Cljc *tables = mtb->value->as.atom.value, *tab, *method;
+    if (tables == NIL || tables->tag != CLJC_MAP) return false;
+    if (!map_find(tables, mk_sym(intern(mname, strlen(mname))), &tab)) return false;
+    if (tab == NIL || tab->tag != CLJC_MAP) return false;
+    if (!map_find(tab, tykw, &method)) return false;
+    Cljc *iargv[256];
+    if (nargs + 1 > 256) cljc_error("too many args to %s", mname);
+    iargv[0] = inst;
+    for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
+    *out = apply(env, method, iargv, nargs + 1);
+    return true;
+}
+
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     cljc_check_stack();   /* raise a catchable error before the C stack overflows */
     if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
@@ -3332,28 +3379,10 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
         return a1;
     }
     if (fn->tag == CLJC_MAP) {
-        /* a deftype instance (a :cljc/type-tagged map) that implements `invoke`
-         * is callable: dispatch to its invoke method with the instance prepended
-         * (this is how SCI's Var-as-fn / fn objects become callable). */
-        Cljc *tykw;
-        if (map_find(fn, mk_kw(intern("cljc/type", 9)), &tykw)) {
-            Binding *mtb = root_find(env_root(env), intern("cljc/multi-tables", 17), NULL);
-            if (mtb && mtb->value != NIL && mtb->value->tag == CLJC_ATOM) {
-                Cljc *tables = mtb->value->as.atom.value, *invtab, *method;
-                if (tables != NIL && tables->tag == CLJC_MAP &&
-                    map_find(tables, mk_sym(intern("invoke", 6)), &invtab) &&
-                    invtab != NIL && invtab->tag == CLJC_MAP &&
-                    map_find(invtab, tykw, &method)) {
-                    Cljc *iargv[256];
-                    if (nargs + 1 > 256) cljc_error("too many args to invoke");
-                    iargv[0] = fn;
-                    for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
-                    return apply(env, method, iargv, nargs + 1);
-                }
-            }
-        }
-        /* otherwise a plain map used as a fn: (m key default) */
+        /* a deftype instance implementing `invoke` is callable (SCI's Var-as-fn
+         * / fn objects); otherwise it's a plain map used as a fn: (m key dflt) */
         Cljc *out;
+        if (dispatch_deftype_method(env, fn, "invoke", argv, nargs, &out)) return out;
         if (map_find(fn, a0, &out)) return out;
         return a1;
     }
@@ -6051,10 +6080,32 @@ static Cljc *prim_atom(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; (void)nargs;
+    (void)nargs;
     Cljc *v = argv[0];
     if (v != NIL && v->tag == CLJC_ATOM) return v->as.atom.value;
-    return v;   /* cljc has no var objects: @#'fn (var -> value) derefs to itself */
+    if (v != NIL && v->tag == CLJC_MAP) {
+        /* CljcDelay: force in C, independent of the multimethod table — a
+         * library that redefines `deref` as a defmulti resets that table, so
+         * delays must not depend on it. {:cljc/type :CljcDelay :f thunk :v val} */
+        Cljc *ty;
+        if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty) &&
+            ty == mk_kw(intern("CljcDelay", 9))) {
+            Cljc *fa = NIL, *va = NIL;
+            map_find(v, mk_kw(intern("f", 1)), &fa);
+            map_find(v, mk_kw(intern("v", 1)), &va);
+            if (fa != NIL && fa->tag == CLJC_ATOM && fa->as.atom.value != NIL) {
+                Cljc *val = apply(env, fa->as.atom.value, NULL, 0);
+                if (va != NIL && va->tag == CLJC_ATOM) va->as.atom.value = val;
+                fa->as.atom.value = NIL;
+                return val;
+            }
+            return (va != NIL && va->tag == CLJC_ATOM) ? va->as.atom.value : NIL;
+        }
+    }
+    /* a deftype implementing deref/IDeref (e.g. SCI's Var) */
+    Cljc *out;
+    if (dispatch_deftype_method(env, v, "deref", NULL, 0, &out)) return out;
+    return v;   /* otherwise identity: @#'fn (var -> value) derefs to itself */
 }
 
 static Cljc *prim_reset(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7807,7 +7858,7 @@ static const char *PRELUDE =
     "                                           body (map (fn [x] (cljc/deftype-walk x fset mset this)) (drop 2 m))]\n"
     "                                       `(~params ~@body)))\n"
     "                                   (second g))]\n"
-    "                  `(swap! cljc/multi-tables update '~mname assoc ~tkw (fn ~@arities))))\n"
+    "                  `(cljc/reg-method! '~mname ~tkw (fn ~@arities))))\n"
     "              (group-by first ms))\n"
     "       ~tkw)))\n"
     /* PersistentQueue: a vector tagged {:cljc/queue true} — conj at the
@@ -7918,8 +7969,102 @@ static const char *PRELUDE =
     "(defn sorted-map [& kvs] (apply hash-map kvs))\n"
     "(defn sorted-map-by [_cmp & kvs] (apply hash-map kvs))\n"
     "(defn sorted? [_] false)\n"
+    "(defn subseq [sc & _] (seq sc)) (defn rsubseq [sc & _] (seq (reverse sc)))\n"
     "(def clojure.edn/read-string read-string)\n"
     "(def clojure.edn/read read-string)\n"
+    /* ── clojure.core completeness (fns SCI and other libs enumerate) ── */
+    /* predicates */
+    "(defn any? [_] true)\n"
+    "(defn associative? [x] (or (map? x) (vector? x)))\n"
+    "(defn counted? [x] (or (vector? x) (map? x) (set? x) (string? x)))\n"
+    "(defn indexed? [x] (vector? x))\n"
+    "(defn seqable? [x] (or (nil? x) (coll? x) (string? x) (seq? x)))\n"
+    "(defn reversible? [x] (vector? x))\n"
+    "(defn ratio? [_] false) (defn rational? [x] (number? x)) (defn decimal? [_] false)\n"
+    "(defn float? [x] (double? x)) (defn integer? [x] (int? x))\n"
+    "(defn volatile? [x] (= :atom (type x))) (defn realized? [_] true)\n"
+    "(defn inst? [_] false) (defn uri? [_] false) (defn uuid? [_] false)\n"
+    "(defn object? [x] (some? x)) (defn special-symbol? [_] false)\n"
+    "(defn bytes? [_] false) (defn array? [_] false) (defn chunked-seq? [_] false)\n"
+    "(defn reader-conditional? [_] false) (defn tagged-literal? [_] false)\n"
+    "(defn undefined? [x] (nil? x)) (defn keyword-identical? [a b] (= a b))\n"
+    "(defn neg-int? [x] (and (int? x) (neg? x))) (defn pos-int? [x] (and (int? x) (pos? x)))\n"
+    /* numeric coercions (cljc ints are int64, no bignum/ratio) */
+    "(defn byte [x] (int x)) (defn short [x] (int x)) (defn long [x] (int x))\n"
+    "(defn num [x] x) (defn bigdec [x] x) (defn bigint [x] (int x)) (defn biginteger [x] (int x))\n"
+    "(defn rationalize [x] x) (defn numerator [x] x) (defn denominator [_] 1)\n"
+    "(defn double [x] (* 1.0 x)) (defn float [x] (* 1.0 x))\n"
+    /* unchecked math == checked in cljc */
+    "(def unchecked-add +) (def unchecked-subtract -) (def unchecked-multiply *)\n"
+    "(def unchecked-dec dec) (def unchecked-inc inc) (def unchecked-negate -)\n"
+    "(def unchecked-add-int +) (def unchecked-subtract-int -) (def unchecked-multiply-int *)\n"
+    "(def unchecked-dec-int dec) (def unchecked-inc-int inc) (def unchecked-negate-int -)\n"
+    "(def unchecked-divide-int quot) (def unchecked-remainder-int rem)\n"
+    "(def unchecked-int int) (def unchecked-long int) (def unchecked-byte int)\n"
+    "(def unchecked-short int) (def unchecked-char int)\n"
+    "(def unchecked-float float) (def unchecked-double double)\n"
+    /* arrays modelled as vectors */
+    "(defn to-array [coll] (vec coll))\n"
+    "(defn into-array ([coll] (vec coll)) ([_t coll] (vec coll)))\n"
+    "(defn make-array [_ & dims] (vec (repeat (first dims) nil)))\n"
+    "(defn object-array [x] (if (number? x) (vec (repeat x nil)) (vec x)))\n"
+    "(defn aclone [a] (vec a))\n"
+    "(def boolean-array vec) (def char-array vec) (def double-array vec)\n"
+    "(def long-array vec) (def int-array vec) (def float-array vec) (def short-array vec) (def byte-array vec)\n"
+    "(def booleans identity) (def chars identity) (def doubles identity) (def longs identity)\n"
+    "(def ints identity) (def floats identity) (def shorts identity) (def bytes identity)\n"
+    /* misc */
+    "(defn bounded-count [n coll] (loop [i 0 s (seq coll)] (if (and s (< i n)) (recur (inc i) (next s)) i)))\n"
+    "(defn comparator [f] (fn [a b] (cond (f a b) -1 (f b a) 1 :else 0)))\n"
+    "(defn shuffle [coll] (vec coll))\n"
+    "(defn replace [smap coll] (mapv (fn [x] (if (contains? smap x) (get smap x) x)) coll))\n"
+    "(defn replicate [n x] (repeat n x))\n"
+    "(defn nthnext [coll n] (loop [n n s (seq coll)] (if (and (pos? n) s) (recur (dec n) (next s)) s)))\n"
+    "(defn rseq [v] (seq (reverse v))) (defn supers [_] #{})\n"
+    "(defn munge [x] x) (defn namespace-munge [x] (str x))\n"
+    "(defn add-watch [r _ _] r) (defn remove-watch [r _] r)\n"
+    "(defn promise [] (atom nil)) (defn deliver [p v] (reset! p v) p)\n"
+    "(defn line-seq [rdr] (seq (str/split-lines (str rdr))))\n"
+    "(defn iterator-seq [x] (seq x)) (defn enumeration-seq [x] (seq x))\n"
+    "(defn array-seq [x] (seq x)) (defn xml-seq [x] (seq x))\n"
+    "(defn re-matcher [pat s] (.matcher pat s))\n"
+    "(defn re-groups [m] (:groups (deref m)))\n"
+    "(defn remove-all-methods [mm] (swap! cljc/multi-tables assoc mm {}) nil)\n"
+    "(defn prefers [_] {})\n"
+    "(defn ex-cause [e] (when (map? e) (:cause e)))\n"
+    "(defn tagged-literal [tag form] {:tag tag :form form})\n"
+    "(defn compare-and-set! [a old new] (if (= (deref a) old) (do (reset! a new) true) false))\n"
+    "(defn random-uuid [] \"00000000-0000-0000-0000-000000000000\")\n"
+    "(defn hash-ordered-coll [c] (hash (vec c))) (defn hash-unordered-coll [c] (hash (set c)))\n"
+    "(defn hash-combine [a b] (bit-xor (hash a) (hash b)))\n"
+    "(defn pop! [coll] coll) (defn random-sample ([_ coll] coll) ([_ coll _] coll))\n"
+    /* array element setters: cljc arrays are immutable vectors — return the value */
+    "(defn aset [a i v] v) (defn aset-int [_ _ v] v) (defn aset-long [_ _ v] v)\n"
+    "(defn aset-double [_ _ v] v) (defn aset-float [_ _ v] v) (defn aset-boolean [_ _ v] v)\n"
+    "(defn aset-byte [_ _ v] v) (defn aset-char [_ _ v] v) (defn aset-short [_ _ v] v)\n"
+    /* chunked-seq stubs (cljc seqs are unchunked) */
+    "(defn chunk-buffer [_] (atom [])) (defn chunk-append [b x] (swap! b conj x) nil)\n"
+    "(defn chunk [b] (deref b)) (defn chunk-cons [c s] (concat c s))\n"
+    "(defn chunk-first [s] (first s)) (defn chunk-rest [s] (rest s)) (defn chunk-next [s] (next s))\n"
+    /* misc remaining */
+    "(defn bean [_] {}) (defn demunge [x] (str x)) (defn seque ([coll] coll) ([_ coll] coll))\n"
+    "(defn update-proxy [& _] nil) (defn proxy-mappings [_] {}) (defn proxy-call-with-super [f _ _] (f))\n"
+    "(defn reader-conditional [form splicing?] {:form form :splicing? splicing?})\n"
+    "(defn inst-ms [_] 0) (defn to-array-2d [coll] (mapv vec coll))\n"
+    "(defn halt-when ([pred] (halt-when pred nil)) ([pred _] (fn [rf] rf)))\n"
+    "(defn print-str [& xs] (str/join \" \" (map str xs)))\n"
+    "(defn println-str [& xs] (str (str/join \" \" (map str xs)) \"\\n\"))\n"
+    "(defn test [_] :ok)\n"
+    "(def char-name-string {}) (def char-escape-string {})\n"
+    "(defn seq-to-map-for-destructuring [s] (if (map? s) s (apply hash-map s)))\n"
+    "(defmacro when-some [bindings & body]\n"
+    "  `(let [v# ~(second bindings)] (if (nil? v#) nil (let [~(first bindings) v#] ~@body))))\n"
+    "(defmacro if-some\n"
+    "  ([bindings then] `(if-some ~bindings ~then nil))\n"
+    "  ([bindings then else]\n"
+    "   `(let [v# ~(second bindings)] (if (nil? v#) ~else (let [~(first bindings) v#] ~then)))))\n"
+    "(defn ->Eduction [xform coll] (sequence xform coll))\n"
+    "(defn eduction [& args] (sequence (apply comp (butlast args)) (last args)))\n"
     "(defn str/triml [s]\n"
     "  (let [n (count s)] (loop [i 0] (if (and (< i n) (str/blank? (subs s i (inc i)))) (recur (inc i)) (subs s i)))))\n"
     "(defn str/trimr [s]\n"
@@ -8833,6 +8978,13 @@ CljcEnv *cljc_new_env(void) {
     /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
     cljc_eval_string(e,
         "(def cljc/multi-tables (atom {}))\n"
+        /* deftype protocol methods live in a SEPARATE registry the special
+           invoke/deref dispatch reads, so a library redefining a method name as
+           a defmulti (which resets multi-tables for that name) can't wipe them. */
+        "(def cljc/deftype-methods (atom {}))\n"
+        "(defn cljc/reg-method! [mname tkw f]\n"
+        "  (swap! cljc/multi-tables update mname assoc tkw f)\n"
+        "  (swap! cljc/deftype-methods update mname assoc tkw f))\n"
         /* Clojure signature: (defmulti name docstring? attr-map? dispatch-fn
            & options). Skip a leading docstring/attr-map; the next form is the
            dispatch fn; remaining key-vals are options (we honour :default). */
@@ -8842,7 +8994,11 @@ CljcEnv *cljc_new_env(void) {
         "        dispatch (first args)\n"
         "        opts (apply hash-map (rest args))\n"
         "        default (get opts :default :default)]\n"
-        "  `(do (swap! cljc/multi-tables assoc '~name {})\n"
+        /* preserve any methods already registered under this name: cljc's flat
+           globals share the table between deftype protocol methods and a later
+           (defmulti same-name) a library may declare (e.g. SCI redefining deref);
+           resetting would wipe deftype deref/invoke/etc. methods. */
+        "  `(do (swap! cljc/multi-tables update '~name (fn [t#] (or t# {})))\n"
         "       (def ~name\n"
         "         (let [d# ~dispatch]\n"
         "           (fn [& args#]\n"
@@ -8898,13 +9054,13 @@ CljcEnv *cljc_new_env(void) {
         "      `(do ~@(map (fn [g]\n"
         "                    (let [m (first (first g))\n"
         "                          arities (map (fn [form] `(~(vec (second form)) ~@(drop 2 form))) g)]\n"
-        "                      `(swap! cljc/multi-tables update '~m assoc ~t (fn ~@arities))))\n"
+        "                      `(cljc/reg-method! '~m ~t (fn ~@arities))))\n"
         "                  groups))\n"
         "      `(when-let [tv# (cljc/resolve-maybe ~(str t))]\n"
         "         ~@(map (fn [g]\n"
         "                  (let [m (first (first g))\n"
         "                        arities (map (fn [form] `(~(vec (second form)) ~@(drop 2 form))) g)]\n"
-        "                    `(swap! cljc/multi-tables update '~m assoc tv# (fn ~@arities))))\n"
+        "                    `(cljc/reg-method! '~m tv# (fn ~@arities))))\n"
         "                groups)))))\n"
         /* (extend-protocol P T1 (m [x] ...) (m2 [x] ...) T2 (m [x] ...)) —
            grouped by TYPE; expands to one extend-type per type. The protocol
@@ -8950,9 +9106,18 @@ CljcEnv *cljc_new_env(void) {
         "                                           body (map (fn [x] (cljc/deftype-walk x fset #{} this)) (drop 2 m))]\n"
         "                                       `(~params ~@body)))\n"
         "                                   (second g))]\n"
-        "                  `(swap! cljc/multi-tables update '~mn assoc ~kw (fn ~@arities))))\n"
+        "                  `(cljc/reg-method! '~mn ~kw (fn ~@arities))))\n"
         "              (group-by first ms))\n"
         "       ~kw)))\n"
+        /* delay/force: a deftype whose IDeref forces the thunk once, memoized
+           (cljc's deref dispatch handles @d). Defined here — after multi-tables
+           and the deftype machinery exist. */
+        "(deftype CljcDelay [^:unsynchronized-mutable f ^:unsynchronized-mutable v]\n"
+        "  clojure.lang.IDeref\n"
+        "  (deref [_] (when f (set! v (f)) (set! f nil)) v))\n"
+        "(defmacro delay [& body] `(CljcDelay. (fn [] ~@body) nil))\n"
+        "(defn delay? [x] (= :CljcDelay (type x)))\n"
+        "(defn force [x] (if (= :CljcDelay (type x)) (deref x) x))\n"
         "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\\n"
         "(defmacro reify [& clauses]\n"
         "  (let [t (keyword (str (gensym)))\n"

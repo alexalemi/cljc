@@ -344,6 +344,44 @@ static void cljc_throw_value(Cljc *v) {
     cljc_raise();
 }
 
+/* ───── C-stack depth guard ──────────────────────────────────────────────
+ * Exceptions here are setjmp/longjmp, which CANNOT recover from a real C
+ * stack overflow — that's a SIGSEGV, and the process just dies. So before
+ * each function application we check how much C-stack headroom is left and,
+ * while there's still room to unwind, raise an ordinary catchable error
+ * instead. This is what lets the nREPL / notebook report "stack overflow"
+ * rather than crash on runaway recursion. It matters most for csp
+ * coroutines: each go block runs on a fixed CORO_STACK_SIZE (1 MiB) C stack,
+ * far smaller than the main thread's (which main() raises toward 1 GiB), so
+ * the value-stack cap — a proxy for depth tuned to the main stack — never
+ * trips before the coro's real C stack is exhausted. */
+#define STACK_SAFETY_MARGIN (96u * 1024)   /* keep this much headroom free */
+static const char *main_stack_floor;       /* lowest safe SP on the main stack */
+
+static void stack_floor_init(const char *base) {
+    size_t budget = 8u * 1024 * 1024;       /* assume 8 MiB if rlimit unknown */
+#ifndef _WIN32
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
+        && rl.rlim_cur > STACK_SAFETY_MARGIN)
+        budget = (size_t)rl.rlim_cur;
+#endif
+    main_stack_floor = base - budget + STACK_SAFETY_MARGIN;
+}
+
+static void cljc_check_stack(void) {
+    char probe;
+    const char *sp = &probe;               /* approximate current stack pointer */
+    const char *floor;
+#ifdef CLJC_HAVE_CORO
+    if (coro_current)                       /* coro: stack is [stack, stack_top) */
+        floor = coro_current->stack + STACK_SAFETY_MARGIN;
+    else
+#endif
+        floor = main_stack_floor;
+    if (floor && sp < floor) cljc_error("stack overflow");
+}
+
 static void vpush(Cljc *v) {
     if (vsp >= vstack_cap) cljc_error("value stack overflow");
     vstack[vsp++] = v;
@@ -3072,6 +3110,7 @@ static void fastcall_init(Cljc *fn) {
 }
 
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
+    cljc_check_stack();   /* raise a catchable error before the C stack overflows */
     if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
     if (fn->tag == CLJC_FN) {
         /* volatile: when recur swaps argv to the sentinel's (possibly heap-
@@ -7089,7 +7128,10 @@ void cljc_set_embedded_files(const CljcEmbeddedFile *files, int n) {
  * main) before evaluating anything. Safe to call repeatedly — keeps the
  * highest address seen (downward-growing stacks). */
 void cljc_set_stack_base(void *p) {
-    if (!gc_stack_base || p > gc_stack_base) gc_stack_base = p;
+    if (!gc_stack_base || p > gc_stack_base) {
+        gc_stack_base = p;
+        stack_floor_init((const char *)p);   /* recompute the C-stack overflow floor */
+    }
 }
 
 /* Core functions and macros written in cljc itself. Evaluated once at env

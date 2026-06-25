@@ -677,6 +677,19 @@
 (assert= {:private true} (meta ^:private [1 2]))
 (assert= :ours #?(:clj :jvm :cljc :ours :default :other))
 (assert= :fallback #?(:clj :jvm :default :fallback))
+(assert= 1 #?(:clj 1 :cljs 2))                       ; :clj is a last resort (load clj-only .cljc)
+(assert= :p #?(:clj :j :default :p))                 ; but :default still beats :clj
+; Clojure-compat gaps (found bringing up SCI)
+(def ^:dynamic ^:no-doc ^:private *stacked-meta* 9)  ; stacked metadata on def
+(assert= 9 *stacked-meta*)
+(defprotocol Areable (area [s]))
+(extend-protocol Areable                             ; grouped-by-type protocol extension
+  :int (area [n] (* n n))
+  :vector (area [v] (reduce + v)))
+(assert= 16 (area 4))
+(assert= 6 (area [1 2 3]))
+(deftype CompatPt [^:mutable px py])                 ; metadata on a deftype field
+(assert= {:px 1 :py 2} (CompatPt. 1 2))
 (assert= nil (comment (this is ignored)))
 (assert= 11 (loop [[a b] [1 10] acc 0] (if a (recur [b nil] (+ acc a)) acc)))
 (assert= 6 (loop [{:keys [n total]} {:n 3 :total 0}]

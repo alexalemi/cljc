@@ -2023,27 +2023,40 @@ static Cljc *read_form(const char **p) {
         cljc_error("unknown ## literal (expected ##Inf, ##-Inf, ##NaN)");
     }
     if (c == '#' && (*p)[1] == '?') {
-        /* reader conditional: keep the :cljc or :default branch.
-         * #?@(...) splices the branch into the enclosing list — returned
-         * as a marker cons that read_list unpacks. */
+        /* reader conditional: pick a branch by PRIORITY :cljc > :default >
+         * :clj. :cljc always wins (cljc-specific); :default beats :clj so a
+         * portable #?(:clj java :default portable) still takes the portable
+         * branch; :clj is a last resort so cljc can still load clj-only
+         * conditionals like #?(:clj X :cljs Y) (taking X). #?@(...) splices the
+         * branch into the enclosing list — a marker cons read_list unpacks. */
         *p += 2;
         bool splicing = **p == '@';
         if (splicing) (*p)++;
         skip_ws(p);
         if (**p != '(') cljc_error("#? expects a list");
         Cljc *clauses = read_list(p, ')');
-        static const char *KW_CLJC, *KW_DEFAULT;
-        if (!KW_CLJC) { KW_CLJC = intern("cljc", 4); KW_DEFAULT = intern("default", 7); }
+        static const char *KW_CLJC, *KW_CLJ, *KW_DEFAULT;
+        if (!KW_CLJC) { KW_CLJC = intern("cljc", 4); KW_CLJ = intern("clj", 3);
+                        KW_DEFAULT = intern("default", 7); }
+        Cljc *b_cljc = NULL, *b_clj = NULL, *b_default = NULL;
         for (Cljc *l = clauses; l && l->tag == CLJC_LIST && l->as.cons.tail != NIL;
              l = l->as.cons.tail->as.cons.tail) {
             Cljc *k = l->as.cons.head;
-            if (k->tag == CLJC_KEYWORD && (k->as.kw == KW_CLJC || k->as.kw == KW_DEFAULT)) {
-                Cljc *branch = l->as.cons.tail->as.cons.head;
+            Cljc *branch = l->as.cons.tail->as.cons.head;
+            if (k->tag == CLJC_KEYWORD) {
+                if (k->as.kw == KW_CLJC && !b_cljc) b_cljc = branch;
+                else if (k->as.kw == KW_CLJ && !b_clj) b_clj = branch;
+                else if (k->as.kw == KW_DEFAULT && !b_default) b_default = branch;
+            }
+            if (l->as.cons.tail == NIL) break;
+        }
+        {
+            Cljc *branch = b_cljc ? b_cljc : b_default ? b_default : b_clj;
+            if (branch) {
                 if (!splicing) return branch;
                 return mk_cons(mk_sym(intern("**reader-splice**", 17)),
                                mk_cons(branch, NIL));
             }
-            if (l->as.cons.tail == NIL) break;
         }
         if (splicing)  /* no branch: splice nothing */
             return mk_cons(mk_sym(intern("**reader-splice**", 17)),
@@ -3760,11 +3773,13 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     need_args(rest, 2, "def");
                     Cljc *namef = rest->as.cons.head;
                     /* (def ^:dynamic x v): the reader wrapped the name as
-                     * (with-meta x m) — unwrap; def meta is not retained. */
-                    if (namef != NIL && namef->tag == CLJC_LIST &&
-                        namef->as.cons.head->tag == CLJC_SYMBOL &&
-                        !strcmp(namef->as.cons.head->as.sym, "with-meta") &&
-                        namef->as.cons.tail != NIL)
+                     * (with-meta x m) — unwrap; def meta is not retained.
+                     * Stacked metadata (^:dynamic ^:no-doc x) nests several
+                     * with-meta forms, so peel all of them. */
+                    while (namef != NIL && namef->tag == CLJC_LIST &&
+                           namef->as.cons.head->tag == CLJC_SYMBOL &&
+                           !strcmp(namef->as.cons.head->as.sym, "with-meta") &&
+                           namef->as.cons.tail != NIL)
                         namef = namef->as.cons.tail->as.cons.head;
                     const char *name = sym_name(namef, "def");
                     Cljc *valf = rest->as.cons.tail;
@@ -7473,8 +7488,14 @@ static const char *PRELUDE =
      * of fields; interface method bodies are ignored. Enough for files that
      * define a type they rarely use to still load. */
     "(defmacro deftype [tname fields & _]\n"
-    "  `(defn ~(symbol (str tname \".\")) [~@fields]\n"
-    "     ~(zipmap (map keyword fields) fields)))\n"
+    /* strip field metadata (^:volatile-mutable etc.) the reader wrapped as
+       (with-meta sym m); cljc's deftype is just a map constructor. */
+    "  (let [fs (mapv (fn [f]\n"
+    "                   (loop [f f]\n"
+    "                     (if (and (list? f) (= 'with-meta (first f))) (recur (second f)) f)))\n"
+    "                 fields)]\n"
+    "    `(defn ~(symbol (str tname \".\")) [~@fs]\n"
+    "       ~(zipmap (map keyword fs) fs))))\n"
     /* PersistentQueue: a vector tagged {:cljc/queue true} — conj at the
      * back (meta survives), peek/pop at the FRONT (true FIFO; pop is
      * O(n), fine at puzzle scale). */
@@ -8288,6 +8309,18 @@ CljcEnv *cljc_new_env(void) {
         "  `(do ~@(map (fn [[m params & body]]\n"
         "                `(defmethod ~m ~t ~(vec params) ~@body))\n"
         "              impls)))\n"
+        /* (extend-protocol P T1 (m [x] ...) (m2 [x] ...) T2 (m [x] ...)) —
+           grouped by TYPE; expands to one extend-type per type. The protocol
+           name is ignored (cljc methods dispatch globally on type). */
+        "(defmacro extend-protocol [p & specs]\n"
+        "  (let [groups (loop [s specs acc [] cur nil]\n"
+        "                 (cond\n"
+        "                   (empty? s) (if cur (conj acc cur) acc)\n"
+        "                   (list? (first s))\n"            /* method impl -> current group */
+        "                     (recur (rest s) acc (conj cur (first s)))\n"
+        "                   :else\n"                        /* a type symbol/keyword -> new group */
+        "                     (recur (rest s) (if cur (conj acc cur) acc) [(first s)])))]\n"
+        "    `(do ~@(map (fn [g] `(extend-type ~(first g) ~@(rest g))) groups))))\n"
         "(defn satisfies? [proto x]\n"
         "  (every? (fn [m] (contains? (get @cljc/multi-tables m) (type x))) proto))\n"
         /* records: maps tagged with :cljc/type */

@@ -9136,6 +9136,7 @@ static void usage(FILE *f) {
         "  judge [-a|-i] <files...>   inline snapshot tests: fill in/verify\n"
         "                             (test expr) results; -a apply, -i review\n"
         "  lint [files...]            reader syntax check, full error rendering\n"
+        "  fmt [check] <files...>     format with cljfmt (fix in place; check only)\n"
         "  bundle <file> <out>        script + runtime → one native binary\n"
         "  version                    print version\n"
         "  help                       this text\n",
@@ -9297,6 +9298,31 @@ int main(int argc, char **argv) {
         for (int i = 2; i < argc; i++) bad += lint_file(env, argv[i]);
         if (!bad) printf("%d file%s, no reader errors\n", argc - 2, argc == 3 ? "" : "s");
         return bad ? 1 : 0;
+    }
+    if (!strcmp(cmd, "fmt")) {
+        /* thin wrapper over cljfmt (https://github.com/weavejester/cljfmt):
+         *   cljc fmt <files>        -> cljfmt fix <files>   (format in place)
+         *   cljc fmt check <files>  -> cljfmt check <files>  (verb passes through)
+         * exec replaces this process, so cljfmt's streams and exit code are ours. */
+        int base = 2;
+        const char *verb = "fix";
+        if (argc > 2 && (!strcmp(argv[2], "fix") || !strcmp(argv[2], "check"))) {
+            verb = argv[2]; base = 3;
+        }
+        int n = argc - base;
+        if (n > 4090) { fputs("cljc fmt: too many arguments\n", stderr); return 1; }
+        char *av[4096];
+        int k = 0;
+        av[k++] = (char *)"cljfmt";
+        av[k++] = (char *)verb;
+        for (int i = base; i < argc; i++) av[k++] = argv[i];
+        av[k] = NULL;
+        execvp("cljfmt", av);
+        fprintf(stderr,
+            "cljc fmt: cljfmt not found on PATH.\n"
+            "  cljc fmt wraps cljfmt; install the native binary from\n"
+            "  https://github.com/weavejester/cljfmt (or `brew install cljfmt`).\n");
+        return 127;
     }
     if (!strcmp(cmd, "judge")) {
         /* inline snapshot tests; judge/main returns the exit code (2 on

@@ -5648,6 +5648,26 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
     return b ? b->value : NIL;
 }
 
+/* (cljc/eval-forms* src) — read and eval each top-level form in turn (NOT
+ * read-all-then-eval), so a leading (ns ..) is active when later forms are
+ * READ — their bare refs to ns-local defs then resolve. cur_reader_ns is
+ * saved/restored so loading a file doesn't leak its ns to the caller. */
+static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    const char *src = as_str(argv[0], "eval-forms");
+    const char *saved_ns = cur_reader_ns;
+    Cljc *last = NIL;
+    while (*src) {
+        skip_ws(&src);
+        if (!*src) break;
+        Cljc *form = read_form(&src);
+        if (!form) break;
+        last = eval(env, form);
+    }
+    cur_reader_ns = saved_ns;
+    return last;
+}
+
 /* (macroexpand-1 form) — if form is a call to a macro, return its one-step
  * expansion (args unevaluated); otherwise return form unchanged. */
 static Cljc *prim_macroexpand_1(CljcEnv *env, Cljc **argv, int nargs) {
@@ -8049,6 +8069,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/ns-publics*", prim_ns_publics);
     cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
     cljc_define_native(e, "macroexpand-1", prim_macroexpand_1);
+    cljc_define_native(e, "cljc/eval-forms*", prim_eval_forms);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
     cljc_define_native(e, "cljc/onto",          prim_onto);
@@ -8726,7 +8747,8 @@ CljcEnv *cljc_new_env(void) {
     "  (let [src (or (cljc/slurp-maybe path)\n"
     "                (some (fn [d] (cljc/slurp-maybe (str d \"/\" path))) *load-path*)\n"
     "                (throw (ex-info (str \"load-file: not found on *load-path*: \" path) {})))]\n"
-    "    (eval (read-string (str \"(do \" src \")\")))))\n");
+    /* incremental: a leading (ns ..) is active when later forms are read */
+    "    (cljc/eval-forms* src)))\n");
     return e;
 }
 

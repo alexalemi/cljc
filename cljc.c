@@ -3330,7 +3330,8 @@ static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
         cljc_error("fn params must be a vector");
     Cljc *params = NIL, **t = &params;
     for (size_t i = 0; i < vec_len(params_vec); i++) {
-        Cljc *p = vec_nth(params_vec, i);
+        Cljc *p = peel_meta_sym(vec_nth(params_vec, i));  /* drop ^:foo / ^{..} on a param */
+        if (p == NIL) continue;     /* a #?(:cljs ..)-only param elides to nil */
         bool is_amp = p->tag == CLJC_SYMBOL && p->as.sym == sym_amp();
         if (is_amp && i + 2 != vec_len(params_vec))
             cljc_error("fn params: & must be followed by exactly one binding");
@@ -3852,6 +3853,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                            !strcmp(namef->as.cons.head->as.sym, "with-meta") &&
                            namef->as.cons.tail != NIL)
                         namef = namef->as.cons.tail->as.cons.head;
+                    /* a #?(:cljs ..)-only def name elides to nil here — skip it */
+                    if (namef == NIL) return NIL;
                     const char *name = sym_name(namef, "def");
                     Cljc *valf = rest->as.cons.tail;
                     /* (def name): no value — an unbound-var declaration => nil */
@@ -7719,6 +7722,24 @@ static const char *PRELUDE =
     "  (let [n (int c)] (or (= n 32) (= n 9) (= n 10) (= n 13) (= n 12) (= n 11))))\n"
     "(defn Character/isDigit [c] (let [n (int c)] (and (>= n 48) (<= n 57))))\n"
     "(defn Character/valueOf [c] c)\n"
+    /* java.lang.System statics */
+    "(defn System/getenv ([] {}) ([k] (cljc/env* k)))\n"
+    "(defn System/getProperty ([k] nil) ([k d] d))\n"
+    "(defn System/exit [n] nil)\n"
+    "(defn System/currentTimeMillis [] 0)\n"
+    "(defn System/nanoTime [] 0)\n"
+    "(defn System/lineSeparator [] \"\\n\")\n"
+    /* java reflection: cljc has no classes — inert */
+    "(defn Class/forName [& _] nil)\n"
+    "(defn .getName [x] (str x))\n"
+    "(defn .getSimpleName [x] (str x))\n"
+    "(defn .getClass [x] (type x))\n"
+    /* primitive TYPE fields (reflection tables) -> cljc type keywords */
+    "(def Character/TYPE :char) (def Integer/TYPE :int) (def Long/TYPE :int)\n"
+    "(def Double/TYPE :double) (def Float/TYPE :double) (def Boolean/TYPE :bool)\n"
+    "(def Byte/TYPE :int) (def Short/TYPE :int) (def Void/TYPE nil)\n"
+    "(def Integer/MAX_VALUE 2147483647) (def Integer/MIN_VALUE -2147483648)\n"
+    "(def Long/MAX_VALUE 9223372036854775807) (def Long/MIN_VALUE -9223372036854775808)\n"
     /* StringBuilder: an atom holding a string; the .methods code uses to build
        tokens. .length/.charAt/.toString also accept a plain string. */
     "(defn StringBuilder. ([] {:cljc/type :StringBuilder :v (atom \"\")})\n"
@@ -7832,6 +7853,16 @@ static const char *PRELUDE =
     /* runtime version vars some libraries (tools.reader) gate features on */
     "(def *clojure-version* {:major 1 :minor 11 :incremental 0 :qualifier nil})\n"
     "(defn clojure-version [] \"1.11.0\")\n"
+    /* standard clojure.core dynamic vars libraries reference (cljc's printer /
+       reader don't consult most of these; they exist so code that names them
+       loads and can rebind them) */
+    "(def *unchecked-math* false) (def *warn-on-reflection* false)\n"
+    "(def *print-length* nil) (def *print-level* nil) (def *print-meta* false)\n"
+    "(def *print-readably* true) (def *read-eval* true) (def *flush-on-newline* true)\n"
+    "(def *assert* true) (def *data-readers* {}) (def *default-data-reader-fn* nil)\n"
+    "(def *math-context* nil) (def *file* \"NO_SOURCE_PATH\") (def *command-line-args* nil)\n"
+    "(def *ns* nil) (def *e nil) (def *1 nil) (def *2 nil) (def *3 nil)\n"
+    "(def *allow-unresolved-vars* false) (def *suppress-read* nil) (def *verbose-defrecords* false)\n"
     /* proxy: no JVM classes to subclass — stub to nil so (def x (proxy ..))
        loads (the object is unused unless its host methods are called). */
     "(defmacro proxy [& _] nil)\n"

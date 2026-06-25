@@ -9303,7 +9303,10 @@ int main(int argc, char **argv) {
          * load errors so editors can tell them from test failures) */
         set_args(env, argc, argv, 2);
         if (setjmp(err_jmp) != 0) { print_error(); return 2; }
-        const char *prog = "(load-file \"judge.clj\") (judge/main)";
+        /* require (not load-file) so the file's `(ns judge)` is active during
+         * the READ — its bare defns get home-ns "judge", so the runner's
+         * internal bare references resolve to judge/… . */
+        const char *prog = "(require '[judge]) (apply judge/-main *args*)";
         Cljc *last = NIL;
         while (*prog) {
             skip_ws(&prog);

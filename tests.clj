@@ -1311,23 +1311,25 @@
 (assert= 11 (count (re-matches #"(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)" "abcdefghij")))
 
 ; judge battery — scanner, element extents, correction building, end-to-end
-(load-file "judge.clj")
-(assert= 2 (count (cljc/judge-forms "(+ 1 2)\n;; note\n(def x 1)\n")))
-(assert= "(+ 1 2)" (:text (first (cljc/judge-forms "(+ 1 2)\n(def x 1)"))))
+(require '[judge])
+(assert= 2 (count (judge/judge-forms "(+ 1 2)\n;; note\n(def x 1)\n")))
+(assert= "(+ 1 2)" (:text (first (judge/judge-forms "(+ 1 2)\n(def x 1)"))))
 (assert= [{:start 0 :end 14 :text "(test (f)\n  9)"}]
-         (vec (cljc/judge-forms "(test (f)\n  9)\n")))
-(assert= 3 (count (cljc/judge-elements "(test (+ 1 2) 3)")))
-(assert= "(+ 1 2)" (let [[s e] (second (cljc/judge-elements "(test (+ 1 2) 3)"))]
+         (vec (judge/judge-forms "(test (f)\n  9)\n")))
+(assert= 3 (count (judge/judge-elements "(test (+ 1 2) 3)")))
+(assert= "(+ 1 2)" (let [[s e] (second (judge/judge-elements "(test (+ 1 2) 3)"))]
                      (subs "(test (+ 1 2) 3)" s e)))
-(assert= "3" (let [[s e] (nth (cljc/judge-elements "(test (+ 1 2) 3)") 2)]
+(assert= "3" (let [[s e] (nth (judge/judge-elements "(test (+ 1 2) 3)") 2)]
                (subs "(test (+ 1 2) 3)" s e)))
 (assert= "(test (+ 1 2) 3)"
-         (cljc/judge-correct "(test (+ 1 2))" (cljc/judge-elements "(test (+ 1 2))") nil ["3"] ""))
+         (judge/judge-correct "(test (+ 1 2))" (judge/judge-elements "(test (+ 1 2))") nil ["3"] ""))
 (assert= "(test (+ 1 2) 3)"
-         (cljc/judge-correct "(test (+ 1 2) 99)" (cljc/judge-elements "(test (+ 1 2) 99)") 2 ["3"] ""))
-(assert= "'(1 2)" (cljc/judge-pr (list 1 2)))
-(assert= "[1 2]" (cljc/judge-pr [1 2]))
-(assert= "\"s\"" (cljc/judge-pr "s"))
+         (judge/judge-correct "(test (+ 1 2) 99)" (judge/judge-elements "(test (+ 1 2) 99)") 2 ["3"] ""))
+(assert= "'(1 2)" (judge/judge-pr (list 1 2)))
+(assert= "[1 2]" (judge/judge-pr [1 2]))
+(assert= "\"s\"" (judge/judge-pr "s"))
+(assert= 1 (judge/judge-line-of "abc" 2))            ; line counting (char-aware)
+(assert= 2 (judge/judge-line-of "a\nb\nc" 2))
 ; end-to-end: fill, apply, recheck green; normal run is a no-op
 (spit "/tmp/cljc-judge-e2e.clj"
       "(require '[judge :refer [test trust]])\n(defn dbl [x] (* 2 x))\n(test (dbl 21))\n(test (dbl 2) 5)\n")

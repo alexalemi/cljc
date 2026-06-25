@@ -1348,6 +1348,14 @@
 (spit "/tmp/cljc-deps-test.edn" "{:deps {x {:mvn/version \"1\"}}}")
 (assert= nil (cljc/edn-paths "/tmp/cljc-deps-test.edn"))         ; no :paths -> nil
 (sh "rm -f /tmp/cljc-deps-test.edn")
+; walk-up: a deps.edn at the project root is found from a nested subdir, and
+; its :paths resolve so `require` locates the lib (verified via a subprocess;
+; $PWD captures this repo's cljc before we cd into the temp project).
+(sh "rm -rf /tmp/cljc-wu && mkdir -p /tmp/cljc-wu/p/lib /tmp/cljc-wu/p/a/b")
+(spit "/tmp/cljc-wu/p/deps.edn" "{:paths [\"lib\"]}")
+(spit "/tmp/cljc-wu/p/lib/wu.clj" "(ns wu)\n(defn ping [] :pong)\n")
+(assert= ":pong" (:out (sh "C=\"$PWD/cljc\"; cd /tmp/cljc-wu/p/a/b && \"$C\" -e \"(require '[wu]) (print (wu/ping))\"")))
+(sh "rm -rf /tmp/cljc-wu")
 
 ; def docstrings, get-on-string, FIFO queue, lazy n-coll mapcat
 (def cljc-doc-probe "the docstring" 42)

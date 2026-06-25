@@ -7544,16 +7544,23 @@ static const char *PRELUDE =
     "(def java.awt.Color/YELLOW 0) (def java.awt.Color/ORANGE 0)\n"
     "(defn File. [path] path)\n"
     "(defn ImageIO/write [img fmt file] true)\n"
-    /* :paths from a project's deps.edn / bb.edn (cwd) feed *load-path*, so the
-       SAME config that drives clj and bb also tells cljc where to find code.
-       Only :paths is honoured — cljc has no Maven/git resolver, so :deps,
-       :tasks, :aliases are ignored. Read errors degrade to nil (no paths). */
+    /* :paths from a project's deps.edn / bb.edn feed *load-path*, so the SAME
+       config that drives clj and bb also tells cljc where to find code. Walk
+       UP from the cwd to the nearest dir holding deps.edn/bb.edn (like clj/bb
+       find the project root), resolving its :paths relative to that dir. Only
+       :paths is honoured — cljc has no Maven/git resolver, so :deps, :tasks,
+       :aliases are ignored. Read errors degrade to nil (no paths). */
     "(defn cljc/edn-paths [f]\n"
     "  (try (let [m (read-string (slurp f))]\n"
     "         (when (and (map? m) (vector? (:paths m))) (:paths m)))\n"
     "       (catch Exception e nil)))\n"
     "(defn cljc/project-paths []\n"
-    "  (mapcat cljc/edn-paths [\"deps.edn\" \"bb.edn\"]))\n"
+    "  (loop [pre \"\"]\n"                       /* "" -> "../" -> "../../" ... */
+    "    (let [ps (mapcat (fn [n] (cljc/edn-paths (str pre n))) [\"deps.edn\" \"bb.edn\"])]\n"
+    "      (cond\n"
+    "        (seq ps) (map (fn [p] (str pre p)) ps)\n"   /* resolve to the config's dir */
+    "        (> (count pre) 60) nil\n"            /* stop after ~20 levels */
+    "        :else (recur (str pre \"../\"))))))\n"
     "(def *load-path*\n"
     "  (vec (distinct (concat [\".\"]\n"
     "                         (cljc/project-paths)\n"

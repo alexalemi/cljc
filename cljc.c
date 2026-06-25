@@ -3599,9 +3599,11 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         SYM_USE = intern("use", 3);
                         SYM_IMPORT = intern("import", 6);
                     }
-                    /* compat no-ops: flat globals already match the universal
-                     * (:require [clojure.string :as str]) alias convention */
-                    if (s == SYM_USE || s == SYM_IMPORT) return NIL;
+                    /* import is a compat no-op (flat globals already match the
+                     * universal alias convention); `use` is a real macro
+                     * (require + refer-all) defined in the preamble, so it must
+                     * fall through to macro resolution rather than short-circuit. */
+                    if (s == SYM_IMPORT) return NIL;
                     if (s == SYM_NS) {
                         /* (ns name (:require [a.b :as x] ...)) — load the
                          * :require clauses; everything else is tolerated. */
@@ -3647,7 +3649,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         }
                         return NIL;
                     }
-                    (void)SYM_REQUIRE;
+                    (void)SYM_REQUIRE; (void)SYM_USE;
                 }
                 {
                     static const char *SYM_BINDING, *SYM_WITH_REDEFS;
@@ -5549,6 +5551,34 @@ static Cljc *prim_in_ns(CljcEnv *env, Cljc **argv, int nargs) {
     cur_reader_ns = (v == NIL) ? NULL
         : intern(v->as.str, strlen(v->as.str));
     return old ? mk_str(old, strlen(old)) : NIL;
+}
+
+/* (cljc/ns-publics* "ns") — vector of the bare names (strings) of every root
+ * binding defined under the "ns/" prefix. Backs `use`, which refers them all. */
+static Cljc *prim_ns_publics(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    const char *ns = as_str(argv[0], "ns-publics*");
+    size_t nlen = strlen(ns);
+    Cljc *out = mk_empty_vec();
+    for (Binding *b = env_root(env)->bindings; b; b = b->next) {
+        const char *nm = b->name;
+        /* match "ns/<bare>" but not a deeper "ns/sub/..." qualified name */
+        if (strncmp(nm, ns, nlen) == 0 && nm[nlen] == '/') {
+            const char *bare = nm + nlen + 1;
+            if (*bare && !strchr(bare, '/'))
+                out = vec_conj1(out, mk_str(bare, strlen(bare)));
+        }
+    }
+    return out;
+}
+
+/* (cljc/resolve-maybe "name") — the value bound to that (string) name, or nil
+ * if unbound. Used by `cljc -m` to find a namespace's -main without throwing. */
+static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    const char *name = as_str(argv[0], "resolve-maybe");
+    Cljc *v = env_lookup_maybe(env, name);
+    return v ? v : NIL;
 }
 
 static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7546,6 +7576,19 @@ static const char *PRELUDE =
     "        (eval (list 'def r (symbol (str nsname \"/\" r))))))))\n"
     "(defmacro require [& specs]\n"
     "  `(do ~@(map (fn [s] `(cljc/require-one ~s)) specs) nil))\n"
+    "(defn cljc/use-one [spec]\n"
+    "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
+    "    (cljc/require-one nsname)\n"
+    "    (doseq [r (cljc/ns-publics* (str nsname))]\n"
+    "      (eval (list 'def (symbol r) (symbol (str nsname \"/\" r)))))))\n"
+    /* (use judge) / (use 'judge) / (use [judge ...]) — require then refer ALL
+       public names. Strips a leading quote so bare and quoted specs both work. */
+    "(defmacro use [& specs]\n"
+    "  `(do ~@(map (fn [s]\n"
+    "                (let [s (if (and (seq? s) (= (first s) (quote quote))) (second s) s)]\n"
+    "                  `(cljc/use-one (quote ~s))))\n"
+    "              specs)\n"
+    "       nil))\n"
     "(defmacro declare [& names]\n"
     "  `(do ~@(map (fn [n] `(def ~n nil)) names)))\n"
     "(defn boolean [x] (if x true false))\n"
@@ -7736,6 +7779,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "meta",       prim_meta);
     cljc_define_native(e, "cljc/alias*", prim_alias);
     cljc_define_native(e, "cljc/in-ns*", prim_in_ns);
+    cljc_define_native(e, "cljc/ns-publics*", prim_ns_publics);
+    cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
     cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
     cljc_define_native(e, "cljc/onto",          prim_onto);
@@ -9068,6 +9113,7 @@ static void usage(FILE *f) {
         "\n"
         "subcommands:\n"
         "  run <file> [args]          run a script (explicit form)\n"
+        "  -m <namespace> [args]      require the ns, call its -main (like bb -m)\n"
         "  eval <expr...>             evaluate, print the last value (alias -e)\n"
         "  repl                       interactive REPL\n"
         "  nrepl [port]               nREPL server for editors (default 7888)\n"
@@ -9187,6 +9233,22 @@ int main(int argc, char **argv) {
         if (argc < 3) { fputs("usage: cljc run <file.clj> [args]\n", stderr); return 1; }
         set_args(env, argc, argv, 3);
         return run_script(env, argv[2]);
+    }
+    if (!strcmp(cmd, "-m") || !strcmp(cmd, "--main")) {
+        /* cljc -m <ns> [args] — require the namespace, then call its -main
+         * with the remaining args (as strings), like `bb -m` / `clojure -m`. */
+        if (argc < 3) { fputs("usage: cljc -m <namespace> [args]\n", stderr); return 1; }
+        const char *ns = argv[2];
+        set_args(env, argc, argv, 3);   /* args after the ns land in *args* */
+        char prog[1024];
+        snprintf(prog, sizeof prog,
+                 "(require '[%s])"
+                 "(let [m (or (cljc/resolve-maybe \"%s/-main\")"
+                 "            (cljc/resolve-maybe \"-main\"))]"
+                 "  (if m (apply m *args*)"
+                 "    (throw (ex-info \"no -main found in %s\" {}))))",
+                 ns, ns, ns);
+        return run_subprogram(env, prog, false);
     }
     if (!strcmp(cmd, "eval") || !strcmp(cmd, "-e")) {
         if (argc < 3) { fputs("usage: cljc eval <expr...>\n", stderr); return 1; }

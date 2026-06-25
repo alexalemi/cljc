@@ -1064,6 +1064,33 @@
 (assert= true (str/includes? (clerk/render-value [{:a 1} {:a 2}]) "<th>"))
 (assert= "<div class=\"raw\"><b>x</b></div>" (clerk/render-value "<b>x</b>"))
 (assert= true (str/includes? (clerk/render-value [1 2 3]) "class=\"value\""))
+; incremental render cache: re-render evaluates only changed cells + dependents
+(def clerk-log (atom []))
+(spit "/tmp/cljc-nb.clj"
+      ";; # t\n(def na 1)\n(def nb (do (swap! clerk-log conj :b) (* na 10)))\n(def nc (do (swap! clerk-log conj :c) 9))\n")
+(clerk/render-file "/tmp/cljc-nb.clj" false)
+(assert= [:b :c] @clerk-log)                          ; first render: both cells run
+(reset! clerk-log [])
+(clerk/render-file "/tmp/cljc-nb.clj" false)
+(assert= [] @clerk-log)                               ; unchanged: nothing re-runs
+(spit "/tmp/cljc-nb.clj"
+      ";; # t\n(def na 2)\n(def nb (do (swap! clerk-log conj :b) (* na 10)))\n(def nc (do (swap! clerk-log conj :c) 9))\n")
+(reset! clerk-log [])
+(clerk/render-file "/tmp/cljc-nb.clj" false)
+(assert= [:b] @clerk-log)                             ; edit na: only dependent nb re-runs
+(sh "rm -f /tmp/cljc-nb.clj")
+; redefinition ordering across renders: a later cell's redef wins; editing the
+; earlier def keeps the later one winning; removing the redef falls back
+(spit "/tmp/cljc-nb.clj" ";; #\n(defn rf [] 1)\n(defn rf [] 2)\n(def rres (rf))\n")
+(clerk/render-file "/tmp/cljc-nb.clj" false)
+(assert= 2 rres)                                      ; B's redef wins
+(spit "/tmp/cljc-nb.clj" ";; #\n(defn rf [] 5)\n(defn rf [] 2)\n(def rres (rf))\n")
+(clerk/render-file "/tmp/cljc-nb.clj" false)
+(assert= 2 rres)                                      ; edit A: B's redef still wins (not 5)
+(spit "/tmp/cljc-nb.clj" ";; #\n(defn rf [] 5)\n(def junk 7)\n(def rres (rf))\n")
+(clerk/render-file "/tmp/cljc-nb.clj" false)
+(assert= 5 rres)                                      ; remove B's redef: falls back to A
+(sh "rm -f /tmp/cljc-nb.clj")
 
 ; defonce
 (defonce cljc-defonce-probe (atom 0))

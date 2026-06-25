@@ -105,6 +105,81 @@
                    (catch Exception e (reset! err (ex-message e)))))]
     {:value @val :error @err :out out}))
 
+;; ── incremental cache ──
+;; Live editing re-renders the whole file on every save; naively that
+;; re-evaluates every cell each time. We cache each code cell's eval RESULT
+;; under a content key that folds in the cell text PLUS the keys of the earlier
+;; cells it depends on — a cell depends on an earlier one when it refers to a
+;; symbol that one defines (the def name is in a cell's refs too, so a redef
+;; depends on the earlier def). So editing a cell re-runs it and everything
+;; downstream, while untouched cells are reused.
+;;
+;; To keep the shared mutable env correct in CELL ORDER regardless of what
+;; changed, a cached simple-def cell REPLAYS its binding each render (rebinds
+;; the name to the cached value, no recompute) — so a later redef always wins,
+;; and removing a redef falls back to the earlier def. Expression cells have no
+;; env effect, so a cache hit just reuses them; macro/type/multi-form defs
+;; (which we can't replay by value) recompute. Net: only changed cells and
+;; their dependents recompute, but a def's expensive body never re-runs when
+;; unchanged. Keyed by text (not value), so a whitespace edit to a dependency
+;; still invalidates dependents: safe, just less optimal than nippy Clerk.
+
+(def clerk/eval-cache (atom {}))
+
+(defn clerk/syms-in
+  "Every symbol appearing anywhere in a read form (an over-approx of refs)."
+  [form]
+  (cond
+    (symbol? form) #{form}
+    (or (list? form) (vector? form) (set? form))
+      (reduce (fn [a f] (into a (clerk/syms-in f))) #{} (seq form))
+    (map? form)
+      (reduce (fn [a kv] (into (into a (clerk/syms-in (first kv)))
+                               (clerk/syms-in (second kv)))) #{} (seq form))
+    :else #{}))
+
+(def clerk/def-heads
+  #{'def 'defn 'defn- 'defmacro 'defonce 'defmulti 'defrecord 'deftype})
+
+(defn clerk/form-defs
+  "Top-level names a form defines (for dependency tracking), or nil."
+  [form]
+  (when (and (list? form) (symbol? (first form)))
+    (cond
+      (contains? clerk/def-heads (first form))
+        (when (symbol? (second form)) #{(second form)})
+      (= 'declare (first form)) (set (filter symbol? (rest form)))
+      :else nil)))
+
+(defn clerk/cell-analyze
+  "{:defs #{names} :refs #{symbols}} for a cell's source (read errors -> empty)."
+  [text]
+  (let [forms (try (read-string (str "[" text "\n]")) (catch Exception e []))]
+    {:defs (reduce (fn [a f] (into a (or (clerk/form-defs f) #{}))) #{} forms)
+     :refs (reduce (fn [a f] (into a (clerk/syms-in f))) #{} forms)}))
+
+(defn clerk/cell-key [text dep-keys]
+  (hash [text (vec (sort dep-keys))]))
+
+(defn clerk/simple-def-name
+  "If a cell is exactly one simple def (def/defn/defn-/defonce name ...), the
+  name — whose value we can re-assert from cache without recomputing the body.
+  Expression cells and macro/type/multi-form defs return nil."
+  [text]
+  (let [forms (try (read-string (str "[" text "\n]")) (catch Exception e []))]
+    (when (= 1 (count forms))
+      (let [f (first forms)]
+        (when (and (list? f)
+                   (contains? #{'def 'defn 'defn- 'defonce} (first f))
+                   (symbol? (second f)))
+          (second f))))))
+
+(defn clerk/replay-def!
+  "Re-assert name -> cached value WITHOUT recomputing the body. Quote so any
+  value (including a fn) binds literally."
+  [name value]
+  (eval (list 'def name (list 'quote value))))
+
 ;; ── html escaping + markdown subset ──
 
 (defn clerk/escape [s]
@@ -309,23 +384,32 @@
 
 ;; ── cell + page rendering ──
 
-(defn clerk/render-cell [c]
+(defn clerk/render-md [c]
+  (str "<section class=\"cell md\">" (clerk/md->html (:text c)) "</section>"))
+
+(defn clerk/render-code
+  "Render an ALREADY-evaluated code cell (result r) to HTML."
+  [c r]
+  (let [dirs (:dirs c)]
+    (str "<section class=\"cell code" (when (:error r) " bad") "\">"
+         (when-not (get dirs "hide-code")
+           (str "<pre class=\"src\">" (clerk/hl (:text c)) "</pre>"))
+         (when (seq (:out r))
+           (str "<pre class=\"out\">" (clerk/escape (:out r)) "</pre>"))
+         (cond
+           (:error r) (str "<pre class=\"err\">" (clerk/escape (:error r)) "</pre>")
+           (get dirs "hide-result") ""
+           (nil? (:value r)) ""
+           (fn? (:value r)) ""          ; defn cells: the source is the story
+           :else (clerk/render-value (:value r)))
+         "</section>")))
+
+(defn clerk/render-cell
+  "Render a single cell with no caching (md, or eval+render a code cell)."
+  [c]
   (if (= (:kind c) :md)
-    (str "<section class=\"cell md\">" (clerk/md->html (:text c)) "</section>")
-    (let [r (clerk/eval-cell (:text c))
-          dirs (:dirs c)]
-      (str "<section class=\"cell code" (when (:error r) " bad") "\">"
-           (when-not (get dirs "hide-code")
-             (str "<pre class=\"src\">" (clerk/hl (:text c)) "</pre>"))
-           (when (seq (:out r))
-             (str "<pre class=\"out\">" (clerk/escape (:out r)) "</pre>"))
-           (cond
-             (:error r) (str "<pre class=\"err\">" (clerk/escape (:error r)) "</pre>")
-             (get dirs "hide-result") ""
-             (nil? (:value r)) ""
-             (fn? (:value r)) ""        ; defn cells: the source is the story
-             :else (clerk/render-value (:value r)))
-           "</section>"))))
+    (clerk/render-md c)
+    (clerk/render-code c (clerk/eval-cell (:text c)))))
 
 (def cljc/clerk-css "
 body{background:#f8f8f8;color:#383838;margin:0;
@@ -370,8 +454,42 @@ th{background:#efeeea}
        "</body></html>"))
 
 (defn clerk/render-file [path live?]
+  ;; Walk cells in order, threading the prior code cells' {:defs :key}. Each
+  ;; code cell's eval is cached by a key folding in its text + the keys of the
+  ;; earlier cells it depends on, so a save re-runs only changed cells and
+  ;; their downstream dependents (clerk/eval-cached). Markdown re-renders each
+  ;; time — it's cheap and pure.
   (let [cells (clerk/parse (slurp path))]
-    (clerk/page path (str/join "" (map clerk/render-cell cells)) live?)))
+    (loop [cs cells, priors [], acc []]
+      (if (empty? cs)
+        (clerk/page path (str/join "" acc) live?)
+        (let [c (first cs)]
+          (if (= (:kind c) :md)
+            (recur (rest cs) priors (conj acc (clerk/render-md c)))
+            (let [{:keys [defs refs]} (clerk/cell-analyze (:text c))
+                  rname (clerk/simple-def-name (:text c))
+                  dep-keys (->> priors
+                                (filter (fn [p] (some (fn [r] (contains? (:defs p) r)) refs)))
+                                (mapv :key))
+                  k (clerk/cell-key (:text c) dep-keys)
+                  cached (@clerk/eval-cache k)
+                  ev (fn [] (let [res (clerk/eval-cell (:text c))]
+                              (swap! clerk/eval-cache assoc k res) res))
+                  r (cond
+                      ;; cached simple def: re-assert its binding cheaply (no
+                      ;; recompute), keeping the env in cell order — so a later
+                      ;; redef wins, and removing a redef falls back correctly
+                      (and cached rname) (do (clerk/replay-def! rname (:value cached)) cached)
+                      ;; macro/type/multi-form def: can't replay by value, so
+                      ;; recompute to keep the env correct (these are cheap)
+                      (and (seq defs) (not rname)) (ev)
+                      ;; cached pure expression: reuse (it has no env effect)
+                      cached cached
+                      ;; cache miss: evaluate and store
+                      :else (ev))]
+              (recur (rest cs)
+                     (conj priors {:defs defs :key k})
+                     (conj acc (clerk/render-code c r))))))))))
 
 ;; ── static build ──
 

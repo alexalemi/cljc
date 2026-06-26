@@ -6276,8 +6276,15 @@ static const char *as_named(Cljc *v, const char *what) {
 }
 
 static Cljc *prim_name(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
+    (void)env; (void)nargs;
     const char *n = as_named(argv[0], "name");
+    /* a symbol/keyword ns/foo has name "foo"; a string and the lone "/" division
+     * symbol are returned verbatim. */
+    if (argv[0] != NIL && argv[0]->tag != CLJC_STRING) {
+        const char *slash = strchr(n, '/');
+        if (slash && slash != n && slash[1] != '\0')
+            return mk_str(slash + 1, strlen(slash + 1));
+    }
     return mk_str(n, strlen(n));
 }
 
@@ -6297,11 +6304,11 @@ static const char *symbol_name_of(Cljc *x) {
                      x->tag == CLJC_KEYWORD))
         return as_named(x, "symbol");
     if (x == NIL) return as_named(x, "symbol");   /* keep the Clojure-like error */
-    SBuf sb = {0};
-    print_to(&sb, x, false);
-    const char *s = intern(sb.data ? sb.data : "", sb.data ? strlen(sb.data) : 0);
-    free(sb.data);
-    return s;
+    /* A non-named value where Clojure would have a Var (e.g. (symbol (resolve
+     * s))). Give it a qualified, deliberately non-(clojure|cljs).core name so
+     * callers that branch on (namespace it) treat it as a foreign var rather
+     * than a core one — and it never looks like a bare resolvable symbol. */
+    return intern("cljc.opaque/var", 15);
 }
 
 static Cljc *prim_symbol(CljcEnv *env, Cljc **argv, int nargs) {

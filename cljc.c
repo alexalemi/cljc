@@ -1943,6 +1943,29 @@ static Cljc *read_string(const char **p) {
                 case '0':  sb_putc(&sb, '\0'); break;
                 case '\\': sb_putc(&sb, '\\'); break;
                 case '"':  sb_putc(&sb, '"');  break;
+                case 'u': {  /* \uXXXX — UTF-8 encode into the byte string */
+                    int cp = 0, k = 0;
+                    for (; k < 4; k++) {
+                        char h = (*p)[1 + k];
+                        int d = (h >= '0' && h <= '9') ? h - '0'
+                              : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                              : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                        if (d < 0) break;
+                        cp = cp * 16 + d;
+                    }
+                    if (k == 0) cljc_error("invalid \\u escape");
+                    if (cp < 0x80) sb_putc(&sb, (char)cp);
+                    else if (cp < 0x800) {
+                        sb_putc(&sb, (char)(0xC0 | (cp >> 6)));
+                        sb_putc(&sb, (char)(0x80 | (cp & 0x3F)));
+                    } else {
+                        sb_putc(&sb, (char)(0xE0 | (cp >> 12)));
+                        sb_putc(&sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+                        sb_putc(&sb, (char)(0x80 | (cp & 0x3F)));
+                    }
+                    *p += k;  /* past hex digits; outer (*p)++ eats the last */
+                    break;
+                }
                 case '\0': cljc_error("unterminated string");
                 default:   cljc_error("unsupported escape: \\%c", **p);
             }
@@ -3947,6 +3970,28 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             if (!b)
                                 for (Binding *x = root->bindings; x; x = x->next)
                                     if (x->name == nm) { b = x; break; }
+                            /* aliased dynamic var like cfg/-star-v-star-: resolve
+                             * the alias to its full ns, else the bare var name */
+                            if (!b) {
+                                const char *slash = strchr(nm, '/');
+                                if (slash && slash != nm) {
+                                    const char *pre = intern(nm, (size_t)(slash - nm));
+                                    const char *base = slash + 1;
+                                    for (int ai = 0; ai < n_aliases && !b; ai++)
+                                        if (alias_table[ai] == pre) {
+                                            char qb[256];
+                                            snprintf(qb, sizeof qb, "%s/%s", alias_ns[ai], base);
+                                            const char *q = intern(qb, strlen(qb));
+                                            for (Binding *x = root->bindings; x; x = x->next)
+                                                if (x->name == q) { b = x; break; }
+                                        }
+                                    if (!b) {
+                                        const char *bb = intern(base, strlen(base));
+                                        for (Binding *x = root->bindings; x; x = x->next)
+                                            if (x->name == bb) { b = x; break; }
+                                    }
+                                }
+                            }
                             if (!b) cljc_error("binding: unable to resolve %s", nm);
                             slots[i] = b;
                             saved[i] = b->value;
@@ -5166,6 +5211,11 @@ static Cljc *to_seq(Cljc *v) {
     }
     if (v->tag == CLJC_SET) return set_element_list(v);
     if (v->tag == CLJC_MAP) {
+        /* A deftype implementing Seqable (its own `seq` method, e.g. instaparse's
+         * AutoFlattenSeq): use it instead of seqing the field map. */
+        Cljc *sq;
+        if (dispatch_deftype_method(gc_root_envs[0], v, "seq", NULL, 0, &sq))
+            return (sq == NIL || sq == v) ? NIL : to_seq(sq);
         /* Maps seq into [k v] entry vectors. */
         Cljc *out = NIL, **t = &out;
         for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
@@ -5610,6 +5660,7 @@ static RxChain rx_parse_alt(RxC *c) {
 /* ── matcher ── */
 
 static const char *rx_str_begin;
+static bool rx_dotall;   /* (?s): . matches newline too. Set by rx_compile. */
 static const char *rx_match_end;
 static const char *rx_cap_s[RX_MAX_GROUPS], *rx_cap_e[RX_MAX_GROUPS];
 static long rx_steps;          /* backtracking budget per match attempt */
@@ -5621,7 +5672,7 @@ static bool rx_m(Rx *r, const char *s) {
     if (!r) { rx_match_end = s; return true; }
     switch (r->type) {
         case RX_CHAR:  return *s == r->ch && rx_m(r->next, s + 1);
-        case RX_ANY:   return *s && *s != '\n' && rx_m(r->next, s + 1);
+        case RX_ANY:   return *s && (rx_dotall || *s != '\n') && rx_m(r->next, s + 1);
         case RX_CLASS: return *s && rx_bit_test(r, (unsigned char)*s) && rx_m(r->next, s + 1);
         case RX_BOL:   return s == rx_str_begin && rx_m(r->next, s);
         case RX_EOL:   return *s == '\0' && rx_m(r->next, s);
@@ -5666,14 +5717,54 @@ static bool rx_m(Rx *r, const char *s) {
 }
 
 /* Compile into a malloc'd pool; caller frees pool. */
+/* Handle inline flag groups (?x)(?s)(?i)(?m): extract the flags, drop the
+ * (?flags) tokens, and in extended mode (x) strip unescaped whitespace and
+ * #-to-end-of-line comments. Char classes and escaped pairs are copied raw.
+ * Returns a malloc'd cleaned pattern; *dotall reports the (?s) flag. */
+static char *rx_preprocess(const char *p, bool *dotall) {
+    *dotall = false;
+    char *out = xmalloc(strlen(p) + 1);
+    size_t o = 0;
+    bool extended = false, in_class = false;
+    for (size_t i = 0; p[i]; ) {
+        char ch = p[i];
+        if (ch == '\\' && p[i + 1]) { out[o++] = p[i++]; out[o++] = p[i++]; continue; }
+        if (in_class) { if (ch == ']') in_class = false; out[o++] = p[i++]; continue; }
+        if (ch == '[') { in_class = true; out[o++] = p[i++]; continue; }
+        if (ch == '(' && p[i + 1] == '?') {           /* maybe a flag-only group */
+            size_t j = i + 2;
+            while (p[j] && strchr("ixsmu", p[j])) j++;
+            if (p[j] == ')' && j > i + 2) {           /* (?flags) — apply and drop */
+                for (size_t k = i + 2; k < j; k++) {
+                    if (p[k] == 's') *dotall = true;
+                    if (p[k] == 'x') extended = true;
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        if (extended) {
+            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') { i++; continue; }
+            if (ch == '#') { while (p[i] && p[i] != '\n') i++; continue; }
+        }
+        out[o++] = p[i++];
+    }
+    out[o] = '\0';
+    return out;
+}
+
 static Rx *rx_compile(const char *pattern, Rx **pool_out, int *ngroups_out) {
     RxC c;
-    c.p = pattern;
+    bool dotall;
+    char *clean = rx_preprocess(pattern, &dotall);
+    rx_dotall = dotall;
+    c.p = clean;
     c.pool = xmalloc(sizeof(Rx) * RX_MAX_NODES);
     c.npool = 0;
     c.ngroups = 1;  /* group 0 = whole match */
     RxChain top = rx_parse_alt(&c);
-    if (*c.p) { free(c.pool); cljc_error("regex: unexpected )"); }
+    if (*c.p) { free(c.pool); free(clean); cljc_error("regex: unexpected )"); }
+    free(clean);  /* nodes copied what they need; chars no longer referenced */
     *pool_out = c.pool;
     *ngroups_out = c.ngroups;
     return top.h;  /* may be NULL: empty pattern matches everywhere */
@@ -5686,12 +5777,16 @@ static Rx *rx_compile(const char *pattern, Rx **pool_out, int *ngroups_out) {
  * whole parse is treated as one alternation and EOL is chained after. */
 static Rx *rx_compile_full(const char *pattern, Rx **pool_out, int *ngroups_out) {
     RxC c;
-    c.p = pattern;
+    bool dotall;
+    char *clean = rx_preprocess(pattern, &dotall);
+    rx_dotall = dotall;
+    c.p = clean;
     c.pool = xmalloc(sizeof(Rx) * RX_MAX_NODES);
     c.npool = 0;
     c.ngroups = 1;
     RxChain top = rx_parse_alt(&c);
-    if (*c.p) { free(c.pool); cljc_error("regex: unexpected )"); }
+    if (*c.p) { free(c.pool); free(clean); cljc_error("regex: unexpected )"); }
+    free(clean);
     Rx *eol = rx_node(&c, RX_EOL);
     if (top.t) top.t->next = eol;
     *pool_out = c.pool;
@@ -5753,6 +5848,23 @@ static Cljc *prim_re_matches(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *r = NIL;
     if (rx_m(prog, s))
         r = rx_result(s, ngroups);
+    free(pool);
+    return r;
+}
+
+/* Front-anchored match (Java Matcher.lookingAt): match at position 0 only, NOT
+ * required to reach the end. Returns the matched prefix (string, or [whole g1..]
+ * when there are groups) or nil. Backs instaparse's re-match-at-front. */
+static Cljc *prim_re_match_front(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    char *pat = as_str(argv[0], "cljc/re-match-front");
+    char *s = as_str(argv[1], "cljc/re-match-front");
+    Rx *pool; int ngroups;
+    Rx *prog = rx_compile(pat, &pool, &ngroups);
+    rx_str_begin = s;
+    rx_reset_caps();
+    Cljc *r = NIL;
+    if (rx_m(prog, s)) r = rx_result(s, ngroups);
     free(pool);
     return r;
 }
@@ -8020,6 +8132,14 @@ static const char *PRELUDE =
     "(defn System/currentTimeMillis [] 0)\n"
     "(defn System/nanoTime [] 0)\n"
     "(defn System/lineSeparator [] \"\\n\")\n"
+    /* *in* / with-in-str + a LispReader$StringReader shim: instaparse unescapes
+     * grammar strings by reading them through the JVM reader. cljc has no such
+     * machinery, but unescaping a string literal IS what read-string does, so
+     * the StringReader collapses to (read-string (str "\"" *in*)). */
+    "(def ^:dynamic *in* nil)\n"
+    "(defmacro with-in-str [s & body] `(binding [*in* ~s] ~@body))\n"
+    "(defn clojure.lang.LispReader$StringReader. [] (fn [& _] (read-string (str \"\\\"\" *in*))))\n"
+    "(defn java.util.LinkedList. [] [])\n"
     /* java reflection: cljc has no classes — inert */
     "(defn Class/forName [& _] nil)\n"
     "(defn .getName [x] (str x))\n"
@@ -8058,19 +8178,38 @@ static const char *PRELUDE =
     "(defn cljc/sb-str [o] (if (and (map? o) (= :StringBuilder (:cljc/type o))) (deref (:v o)) (str o)))\n"
     "(defn .append [sb x] (swap! (:v sb) str x) sb)\n"
     "(defn .toString [o] (cljc/sb-str o))\n"
-    "(defn .length [o] (count (cljc/sb-str o)))\n"
-    "(defn .charAt [o i] (nth (cljc/sb-str o) i))\n"
+    /* A deftype that implements an interface method whose name collides with a
+       built-in string .method (e.g. CharSequence length/charAt/subSequence on
+       instaparse's Segment): prefer the deftype's own method for instances. */
+    "(defn cljc/dt-method [mname o]\n"
+    "  (when (and (map? o) (get o :cljc/type))\n"
+    "    (get-in (deref cljc/deftype-methods) [mname (get o :cljc/type)])))\n"
+    /* coerce any CharSequence (a string, or a deftype like Segment with
+       length/charAt) to a plain string — cljc's regex needs a real string */
+    "(defn cljc/cs->str [s]\n"
+    "  (if (and (map? s) (get s :cljc/type))\n"
+    "    (apply str (map (fn [i] (.charAt s i)) (range (.length s))))\n"
+    "    (str s)))\n"
+    "(defn .length [o] (if-let [m (cljc/dt-method 'length o)] (m o) (count (cljc/sb-str o))))\n"
+    "(defn .charAt [o i] (if-let [m (cljc/dt-method 'charAt o)] (m o i) (nth (cljc/sb-str o) i)))\n"
     "(defn .deleteCharAt [sb i]\n"
     "  (let [s (deref (:v sb))] (reset! (:v sb) (str (subs s 0 i) (subs s (inc i))))) sb)\n"
     "(defn .setLength [sb n] (reset! (:v sb) (subs (deref (:v sb)) 0 n)) sb)\n"
     /* java.util.regex Matcher over cljc's own regex: re-matches returns the
        whole match (no groups) or a [whole g1 g2 ..] vector. */
-    "(defn .matcher [pat s] (atom {:pat pat :s s :groups nil}))\n"
+    "(defn .matcher [pat s] (atom {:pat pat :s (cljc/cs->str s) :groups nil}))\n"
     "(defn .matches [m]\n"
     "  (let [r (re-matches (:pat (deref m)) (:s (deref m)))]\n"
     "    (swap! m assoc :groups (cond (vector? r) r (string? r) [r] :else nil))\n"
     "    (boolean r)))\n"
-    "(defn .group [m n] (when-let [g (:groups (deref m))] (nth g n nil)))\n"
+    /* Matcher.lookingAt: match anchored at the front (a prefix, not the whole
+       string). Stores groups like .matches so .group reads them. */
+    "(defn .lookingAt [m]\n"
+    "  (let [r (cljc/re-match-front (:pat (deref m)) (:s (deref m)))]\n"
+    "    (swap! m assoc :groups (cond (vector? r) r (string? r) [r] :else nil))\n"
+    "    (boolean r)))\n"
+    "(defn .group ([m] (.group m 0))\n"
+    "  ([m n] (when-let [g (:groups (deref m))] (nth g n nil))))\n"
     /* BigInteger / BigInt / Numbers: cljc integers are all int64, so collapse
        the bignum machinery (used by tools.reader's match-int) to plain ints. */
     /* two Java ctors: (String val, int radix) parses; (int signum, byte[] mag)
@@ -8088,6 +8227,8 @@ static const char *PRELUDE =
     "(defn .endsWith [s suf] (str/ends-with? (str s) suf))\n"
     "(defn .startsWith [s pre] (str/starts-with? (str s) pre))\n"
     "(defn .substring ([s a] (subs (str s) a)) ([s a b] (subs (str s) a b)))\n"
+    "(defn .subSequence [s a b]\n"
+    "  (if-let [m (cljc/dt-method 'subSequence s)] (m s a b) (subs (str s) a b)))\n"
     "(defn .contains [s x]\n"
     "  (cond (string? s) (str/includes? s (str x))\n"
     "        (or (set? s) (map? s)) (contains? s x)\n"
@@ -8234,6 +8375,11 @@ static const char *PRELUDE =
     "(def Long/toString Integer/toString)\n"
     "(defn Integer/toBinaryString [n] (Integer/toString n 2))\n"
     "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
+    "(defn RuntimeException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
+    "(defn Exception. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
+    "(defn IllegalArgumentException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
+    "(defn IllegalStateException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
+    "(defn UnsupportedOperationException. [msg] (ex-info (str msg) {}))\n"
     /* mutable arrays, as transient vectors (assoc! mutates in place) */
     "(defn int-array [x] (transient (vec (if (int? x) (repeat x 0) x))))\n"
     "(def byte-array int-array)\n"
@@ -8687,6 +8833,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "disj",      prim_disj);
     cljc_define_native(e, "set?",      prim_set_p);
     cljc_define_native(e, "re-find",    prim_re_find);
+    cljc_define_native(e, "cljc/re-match-front", prim_re_match_front);
     cljc_define_native(e, "re-matches", prim_re_matches);
     cljc_define_native(e, "re-seq",     prim_re_seq);
     cljc_define_native(e, "re-replace",  prim_re_replace);

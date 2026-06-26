@@ -1867,16 +1867,18 @@ static Cljc *read_atom(const char **p) {
         int64_t sign = 1;
         char *d = buf;
         if (*d == '+' || *d == '-') { if (*d == '-') sign = -1; d++; }
-        /* hex: 0x1F / 0XFF */
+        /* hex: 0x1F / 0XFF — parse UNSIGNED then cast, so a full-width literal
+         * like 0xbf58476d1ce4e5b9 wraps to its signed long value (Java-like)
+         * instead of clamping to LLONG_MAX. */
         if (d[0] == '0' && (d[1] == 'x' || d[1] == 'X') && d[2])
-            return mk_int(sign * (int64_t)strtoll(d + 2, NULL, 16));
+            return mk_int(sign * (int64_t)strtoull(d + 2, NULL, 16));
         /* radix: 2r1010, 16rFF, 36rZ (Clojure's <radix>r<digits>) */
         char *rp = strchr(d, 'r'); if (!rp) rp = strchr(d, 'R');
         if (rp && rp != d && rp[1]) {
             *rp = '\0';
             long radix = strtol(d, NULL, 10);
             if (radix >= 2 && radix <= 36)
-                return mk_int(sign * (int64_t)strtoll(rp + 1, NULL, (int)radix));
+                return mk_int(sign * (int64_t)strtoull(rp + 1, NULL, (int)radix));
             *rp = 'r';
         }
         bool is_float = false;
@@ -2116,7 +2118,7 @@ static Cljc *read_form(const char **p) {
         (*p)++;
         Cljc *body = read_form(p);
         int maxn = 0;
-        bool pct = false, pctn = false, variadic = false;
+        bool pct = false, variadic = false;
         /* scan for %-symbols (iterative worklist over nested collections) */
         Cljc *work[256]; int wn = 0;
         bool overflow = false;
@@ -2129,7 +2131,6 @@ static Cljc *read_form(const char **p) {
                 if (s[1] == '\0') { pct = true; if (maxn < 1) maxn = 1; }
                 else if (s[1] == '&' && s[2] == '\0') variadic = true;
                 else if (s[1] >= '1' && s[1] <= '9' && s[2] == '\0') {
-                    pctn = true;
                     if (s[1] - '0' > maxn) maxn = s[1] - '0';
                 }
             } else if (f->tag == CLJC_LIST) {
@@ -2148,18 +2149,24 @@ static Cljc *read_form(const char **p) {
         }
         if (wn >= 253) overflow = true;
         if (overflow) cljc_error("#(): body too complex to scan for %% params");
-        if (pct && pctn) cljc_error("#(): use %% or %%1, not both");
         Cljc *items[11];
         size_t ni = 0;
+        /* params are always %1..%maxn; bare % is an alias for %1 (Clojure), so a
+         * body mixing % and %1 is fine — we bind % via a let below. */
         for (int i = 1; i <= maxn; i++) {
             char nm[4] = {'%', (char)('0' + i), 0, 0};
-            items[ni++] = mk_sym(intern(i == 1 && pct ? "%" : nm, i == 1 && pct ? 1 : 2));
+            items[ni++] = mk_sym(intern(nm, 2));
         }
         if (variadic) {
             items[ni++] = mk_sym(intern("&", 1));
             items[ni++] = mk_sym(intern("%&", 2));
         }
         Cljc *params = mk_vector(items, ni);
+        if (pct) {   /* (let [% %1] body) so bare % refers to the first param */
+            Cljc *bv2[2] = { mk_sym(intern("%", 1)), mk_sym(intern("%1", 2)) };
+            body = mk_cons(mk_sym(intern("let", 3)),
+                           mk_cons(mk_vector(bv2, 2), mk_cons(body, NIL)));
+        }
         return mk_cons(mk_sym(intern("fn", 2)),
                        mk_cons(params, mk_cons(body, NIL)));
     }
@@ -2748,6 +2755,27 @@ static bool vmc_contains_recur(Cljc *form) {
 /* tail = this form's value is the enclosing fn's result (so a call here is a
  * proper tail call → VOP_TAILCALL, which trampolines in apply instead of
  * recursing). Propagated through if/do/let/loop/when/cond result positions. */
+/* clojure.core/let, cljs.core/let, or <alias>/let (alias naming a *.core ns)
+ * all name the bare special form `let`. Returns the bare name for such a head,
+ * else the name unchanged. Lets qualified core specials dispatch as specials. */
+static const char *strip_core_qualifier(const char *s) {
+    const char *slash = strchr(s, '/');
+    if (!slash || slash == s) return s;
+    size_t plen = (size_t)(slash - s);
+    bool core = (plen == 12 && !memcmp(s, "clojure.core", 12)) ||
+                (plen == 9  && !memcmp(s, "cljs.core", 9));
+    if (!core) {
+        const char *pre = intern(s, plen);
+        for (int i = 0; i < n_aliases; i++)
+            if (alias_table[i] == pre) {
+                core = !strcmp(alias_ns[i], "clojure.core") ||
+                       !strcmp(alias_ns[i], "cljs.core");
+                break;
+            }
+    }
+    return core ? intern(slash + 1, strlen(slash + 1)) : s;
+}
+
 static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail);
 
 static void vmc_body(VmC *c, CljcEnv *cenv, Cljc *body, bool tail) {  /* do semantics */
@@ -2818,7 +2846,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
     Cljc *head = form->as.cons.head;
     Cljc *rest = form->as.cons.tail;
     if (head != NIL && head->tag == CLJC_SYMBOL) {
-        const char *s = head->as.sym;
+        const char *s = strip_core_qualifier(head->as.sym);
         /* (.-field obj) / an undefined (.foo x) field access: deopt to the
          * tree-walker, which resolves it as a deftype field read */
         if ((s[0] == '.' && s[1] == '-' && s[2]) ||
@@ -3665,7 +3693,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
 
             /* Special forms — dispatch by interned symbol pointer. */
             if (head->tag == CLJC_SYMBOL) {
-                const char *s = head->as.sym;
+                const char *s = strip_core_qualifier(head->as.sym);
                 /* (.-field obj): deftype field access -> field of the instance
                  * map (cljc represents a deftype instance as a tagged map) */
                 if (s[0] == '.' && s[1] == '-' && s[2] &&
@@ -3735,9 +3763,11 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                           f->as.cons.head->tag == CLJC_SYMBOL)
                                          ? f->as.cons.head->as.sym : NULL;
                         if (fh == SYM_CATCH) {
-                            if (catch_clause) cljc_error("try: only one catch clause is supported");
                             if (finally_clause) cljc_error("try: catch must precede finally");
-                            catch_clause = f;
+                            /* catch is untyped here, so the FIRST catch handles
+                             * any exception; extra (catch ..) clauses for other
+                             * classes are accepted and skipped. */
+                            if (!catch_clause) catch_clause = f;
                         } else if (fh == SYM_FINALLY) {
                             if (finally_clause) cljc_error("try: only one finally clause is allowed");
                             finally_clause = f;
@@ -5031,9 +5061,11 @@ static Cljc *prim_rest(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_second(CljcEnv *env, Cljc **argv, int nargs) {
+    /* (first (rest x)) — go through first so a LAZY rest (e.g. a partition
+     * group) is realized rather than reading an unforced cons head. */
     Cljc *r = prim_rest(env, argv, nargs);
-    if (r == NIL) return NIL;
-    return r->as.cons.head;
+    Cljc *fargv[1] = { r };
+    return prim_first(env, fargv, 1);
 }
 
 static Cljc *prim_cons(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7873,6 +7905,14 @@ static const char *PRELUDE =
     "        (if (and (map? m) (or (:unsynchronized-mutable m) (:volatile-mutable m) (:mutable m)))\n"
     "          true (recur (second f))))\n"
     "      false)))\n"
+    /* symbols bound by a binding pattern (so deftype-walk can drop them from
+       fset — a local shadows a same-named field). */
+    "(defn cljc/binding-syms [pat]\n"
+    "  (cond (symbol? pat) (if (= pat '&) #{} #{pat})\n"
+    "        (vector? pat) (reduce into #{} (map cljc/binding-syms pat))\n"
+    "        (map? pat) (into (set (concat (:keys pat) (when (symbol? (:as pat)) [(:as pat)])))\n"
+    "                         (mapcat cljc/binding-syms (filter (complement keyword?) (keys pat))))\n"
+    "        :else #{}))\n"
     "(defn cljc/deftype-walk [form fset mset this]\n"
     /* macroexpand this node so macros that GENERATE field reads or (set! field
        ..) (e.g. tools.reader's update!) are rewritten too — but STOP at a set!
@@ -7888,6 +7928,16 @@ static const char *PRELUDE =
     "         (contains? mset (second form)))\n"
     "      (list 'reset! (list (keyword (str (second form))) this)\n"
     "            (cljc/deftype-walk (nth form 2) fset mset this))\n"
+    /* let, let-star and loop: binding NAMES shadow fields. Walk each value with
+       the fields visible at that point, then walk the body with shadowed fields
+       removed, so (loop [state state] ..) keeps the loop var a local. */
+    "    (and (list? form) (contains? #{'let 'let* 'loop} (first form)) (vector? (second form)))\n"
+    "      (let [acc (reduce (fn [a [b v]]\n"
+    "                          {:fs (reduce disj (:fs a) (cljc/binding-syms b))\n"
+    "                           :bs (conj (:bs a) b (cljc/deftype-walk v (:fs a) mset this))})\n"
+    "                        {:fs fset :bs []} (partition 2 (second form)))]\n"
+    "        (apply list (first form) (vec (:bs acc))\n"
+    "               (map (fn [x] (cljc/deftype-walk x (:fs acc) mset this)) (drop 2 form))))\n"
     "    (list? form)   (apply list (map (fn [x] (cljc/deftype-walk x fset mset this)) form))\n"
     "    (vector? form) (mapv (fn [x] (cljc/deftype-walk x fset mset this)) form)\n"
     "    (map? form)    (into {} (map (fn [kv] [(cljc/deftype-walk (first kv) fset mset this)\n"
@@ -7973,6 +8023,22 @@ static const char *PRELUDE =
     "(def Byte/TYPE :int) (def Short/TYPE :int) (def Void/TYPE nil)\n"
     "(def Integer/MAX_VALUE 2147483647) (def Integer/MIN_VALUE -2147483648)\n"
     "(def Long/MAX_VALUE 9223372036854775807) (def Long/MIN_VALUE -9223372036854775808)\n"
+    "(def Byte/MIN_VALUE -128) (def Byte/MAX_VALUE 127)\n"
+    "(def Short/MIN_VALUE -32768) (def Short/MAX_VALUE 32767)\n"
+    "(def Character/MIN_VALUE 0) (def Character/MAX_VALUE 65535)\n"
+    "(def Character/MAX_CODE_POINT 1114111)\n"
+    "(def Double/POSITIVE_INFINITY ##Inf) (def Double/NEGATIVE_INFINITY ##-Inf)\n"
+    "(def Double/NaN ##NaN) (def Double/MAX_VALUE 1.7976931348623157E308) (def Double/MIN_VALUE 4.9E-324)\n"
+    "(defn Double/isNaN [x] (not= x x)) (defn Double/isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
+    "(defn Long/bitCount [n]\n"
+    "  (loop [n n c 0] (if (zero? n) c (recur (unsigned-bit-shift-right n 1) (+ c (bit-and n 1))))))\n"
+    "(def bit-count Long/bitCount)\n"
+    "(defn Long/numberOfLeadingZeros [n]\n"
+    "  (if (zero? n) 64 (loop [n n c 0] (if (neg? n) c (recur (bit-shift-left n 1) (inc c))))))\n"
+    "(defn Long/numberOfTrailingZeros [n]\n"
+    "  (if (zero? n) 64 (loop [n n c 0] (if (odd? n) c (recur (unsigned-bit-shift-right n 1) (inc c))))))\n"
+    "(defn Integer/numberOfLeadingZeros [n] (- (Long/numberOfLeadingZeros (bit-and n 0xFFFFFFFF)) 32))\n"
+    "(def Integer/bitCount Long/bitCount)\n"
     /* StringBuilder: an atom holding a string; the .methods code uses to build
        tokens. .length/.charAt/.toString also accept a plain string. */
     "(defn StringBuilder. ([] {:cljc/type :StringBuilder :v (atom \"\")})\n"
@@ -8010,7 +8076,10 @@ static const char *PRELUDE =
     "(defn .endsWith [s suf] (str/ends-with? (str s) suf))\n"
     "(defn .startsWith [s pre] (str/starts-with? (str s) pre))\n"
     "(defn .substring ([s a] (subs (str s) a)) ([s a b] (subs (str s) a b)))\n"
-    "(defn .contains [s x] (str/includes? (str s) x))\n"
+    "(defn .contains [s x]\n"
+    "  (cond (string? s) (str/includes? s (str x))\n"
+    "        (or (set? s) (map? s)) (contains? s x)\n"
+    "        :else (boolean (some (fn [e] (= e x)) s))))\n"
     "(defn .trim [s] (str/trim (str s)))\n"
     "(defn array-map [& kvs] (apply hash-map kvs))\n"
     "(defn Double/parseDouble [s] (parse-double (str s)))\n"
@@ -9166,6 +9235,7 @@ CljcEnv *cljc_new_env(void) {
         "    `(do\n"
         "       (def ~rname ~kw)\n"
         "       (defn ~(symbol (str \"->\" rname)) ~fsyms (hash-map :cljc/type ~kw ~@kvs))\n"
+        "       (def ~(symbol (str rname \".\")) ~(symbol (str \"->\" rname)))\n"
         "       (defn ~(symbol (str \"map->\" rname)) [m] (assoc m :cljc/type ~kw))\n"
         "       ~@(map (fn [g]\n"
         "                (let [mn (first g)\n"

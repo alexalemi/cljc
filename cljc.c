@@ -2265,7 +2265,9 @@ static Cljc *read_form(const char **p) {
     if (c == '@') {
         (*p)++;
         Cljc *form = read_form(p);
-        return mk_cons(mk_sym(intern("deref", 5)), mk_cons(form, NIL));
+        /* @x is clojure.core/deref (qualified, like Clojure) so a namespace that
+         * shadows `deref` with its own (e.g. malli's ref deref) doesn't capture it */
+        return mk_cons(mk_sym(intern("clojure.core/deref", 18)), mk_cons(form, NIL));
     }
     return read_atom(p);
 }
@@ -4208,17 +4210,18 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         Cljc *r = eval_body(scope, body);
                         if (!(r && r->tag == CLJC_RECUR)) { free(names); return r; }
 
-                        /* Rebind in place: loop slots are mutable locals that get
-                         * fresh values each pass (Clojure semantics). */
                         if (r->as.recur.n != nparams)
                             cljc_error("recur arity mismatch: expected %zu, got %d",
                                        nparams, (int)r->as.recur.n);
                         Cljc **rvals = r->as.recur.spill
                             ? (Cljc **)r->as.recur.iv[0] : r->as.recur.iv;
-                        for (size_t i = 0; i < nparams; i++) {
-                            Cljc **p = env_local_find(scope, names[i]);
-                            if (p) *p = rvals[i];
-                        }
+                        /* Fresh binding frame each pass — a body that closes over a
+                         * loop var (e.g. (loop [x ..] (recur (conj acc (fn [] x))))
+                         * must capture THIS iteration's value, not see it mutated by
+                         * later passes. Old frames stay intact for their closures. */
+                        scope = env_new(env);
+                        for (size_t i = 0; i < nparams; i++)
+                            env_define(scope, names[i], rvals[i]);
                     }
                 }
                 {
@@ -7948,7 +7951,10 @@ static const char *PRELUDE =
     /* c resolves to a type keyword (deftype name, or a host-class stub/keyword);
        compare against the value's (type x). Unknown host classes are keywords
        that simply won't match, so instance? on them is false, as before. */
-    "(defn instance? [c x] (= c (type x)))\n"
+    /* a protocol resolves to a vector of its method symbols (see defprotocol);
+       instance? against one means "does x's type implement it" = satisfies?.
+       A host/deftype class resolves to a type keyword: plain type equality. */
+    "(defn instance? [c x] (if (vector? c) (satisfies? c x) (= c (type x))))\n"
     "(defn nnext [s] (next (next s)))\n"
     "(defn find [m k] (when (contains? m k) [k (get m k)]))\n"
     "(defn reduced [x] (cons '**reduced** (cons x nil)))\n"
@@ -8385,6 +8391,15 @@ static const char *PRELUDE =
     "(def byte-array int-array)\n"
     "(def long-array int-array)\n"
     "(def object-array int-array)\n"
+    "(defn LazilyPersistentVector/createOwning [oa] (vec oa))\n"
+    "(defn PersistentArrayMap/createWithCheck [arr]\n"
+    "  (let [v (vec arr) m (apply hash-map v)]\n"
+    "    (when-not (= (* 2 (count m)) (count v)) (throw (ex-info \"Duplicate key\" {})))\n"
+    "    m))\n"
+    /* java.util.HashMap: a mutable map as an atom holding a persistent map */
+    "(defn HashMap. ([] (atom {})) ([_] (atom {})) ([_ _] (atom {})))\n"
+    "(defn .putAll [hm m] (swap! hm merge m) hm)\n"
+    "(defn .put [hm k v] (swap! hm assoc k v) v)\n"
     "(defn aget [a i] (a i))\n"
     "(defn aset [a i v] (assoc! a i v) v)\n"
     "(defn alength [a] (count a))\n"
@@ -8486,15 +8501,17 @@ static const char *PRELUDE =
     "  (let [iv (some (fn [m] (when (= 'initialValue (first m)) m)) methods)]\n"
     "    (if iv `(atom ~(first (drop 2 iv))) `(atom nil))))\n"
     "(defn .get\n"
-    "  ([x] (if (= :atom (type x)) (deref x) x))\n"
-    "  ([m k] (get m k)) ([m k d] (get m k d)))\n"
+    "  ([x] (if (= :atom (type x)) (deref x) x))\n"   /* IDeref/future .get */
+    "  ([m k] (get (if (= :atom (type m)) (deref m) m) k))\n"   /* incl. HashMap */
+    "  ([m k d] (get (if (= :atom (type m)) (deref m) m) k d)))\n"
     /* clojure.lang.{Associative,Indexed,IDeref,Map} interop (sci.impl.faster) */
     "(defn .assoc [m k v] (assoc m k v))\n"
     "(defn .nth ([c i] (nth c i)) ([c i d] (nth c i d)))\n"
+    "(defn .count [c] (count c))\n"
     "(defn .valAt ([m k] (get m k)) ([m k d] (get m k d)))\n"
     "(defn .deref [r] (deref r))\n"
     "(defn .idx [x] (:idx x))\n"   /* BindingNode field via (.idx node) in :clj */
-    "(defn .containsKey [m k] (contains? m k))\n"
+    "(defn .containsKey [m k] (contains? (if (= (type m) :atom) (deref m) m) k))\n"
     "(defn .entryAt [m k] (find m k))\n"
     "(defn .set [x v] (when (= :atom (type x)) (reset! x v)) nil)\n"
     "(defn .remove [& _] nil)\n"
@@ -8710,6 +8727,12 @@ static const char *PRELUDE =
     "(defn flatten [coll]\n"  /* sequential?: lazy sub-seqs flatten too */
     "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
+    "(defn ifn? [x] (or (fn? x) (keyword? x) (symbol? x) (map? x) (set? x) (vector? x)))\n"
+    "(defn var? [_] false)\n"   /* cljc has no first-class var objects */
+    /* java.util.Iterator over any seqable, as a seq cursor in an atom */
+    "(defn .iterator [coll] (atom (seq coll)))\n"
+    "(defn .hasNext [it] (boolean (seq (deref it))))\n"
+    "(defn .next [it] (let [s (seq (deref it))] (reset! it (rest s)) (first s)))\n"
     /* trampoline: call f; while it returns a fn, keep calling it (stack-safe
      * via recur). Clojure's idiom for mutual recursion without proper TCO. */
     "(defn trampoline\n"
@@ -9380,8 +9403,12 @@ CljcEnv *cljc_new_env(void) {
         "  (doseq [pm (partition 2 proto+maps)]\n"
         "    (doseq [e (second pm)]\n"
         "      (swap! cljc/multi-tables update (symbol (name (first e))) assoc t (second e)))))\n"
+        /* A type satisfies a protocol if it participates in it. cljc tracks
+           per-method registration, so test whether x's type implements ANY of
+           the protocol's methods — a reify/extend may legally omit some (they'd
+           throw only if called), and `every?` would wrongly reject it. */
         "(defn satisfies? [proto x]\n"
-        "  (every? (fn [m] (contains? (get @cljc/multi-tables m) (type x))) proto))\n"
+        "  (boolean (some (fn [m] (contains? (get @cljc/multi-tables m) (type x))) proto)))\n"
         /* records: maps tagged with :cljc/type */
         /* defrecord: like deftype but immutable (fields are direct values, no
            atoms) and with both ->R (positional) and map->R (from a map) ctors.
@@ -9421,17 +9448,25 @@ CljcEnv *cljc_new_env(void) {
         "(defn delay? [x] (= :CljcDelay (type x)))\n"
         "(defn force [x] (if (= :CljcDelay (type x)) (deref x) x))\n"
         "(defn record? [x] (and (map? x) (contains? x :cljc/type)))\\n"
+        /* reify: a form's type keyword t is fixed at macroexpand time, so EVERY
+           instance of one (reify ..) form shares t. Methods must therefore live
+           PER INSTANCE (in :cljc/impls), not in the global method table keyed by
+           t — else a second instance's methods clobber the first's. We register
+           one delegating dispatch method per (proto-method, t) that forwards to
+           the receiver's own impl, and store each instance's closures in it. */
+        "(defn cljc/reg-reify-method! [mname t]\n"
+        "  (when-not (contains? (get (deref cljc/multi-tables) mname) t)\n"
+        "    (swap! cljc/multi-tables update mname\n"
+        "           (fn [tb] (assoc (or tb {}) t\n"
+        "                       (fn [& args] (apply (get (:cljc/impls (first args)) mname) args)))))))\n"
         "(defmacro reify [& clauses]\n"
         "  (let [t (keyword (str (gensym)))\n"
-        "        impls (loop [cs clauses acc (list)]\n"
-        "                (cond (empty? cs) (reverse acc)\n"
-        "                      (list? (first cs))\n"
-        "                      (recur (rest cs)\n"
-        "                             (cons (let [[m params & body] (first cs)]\n"
-        "                                     (concat (list (quote defmethod) m t (vec params)) body))\n"
-        "                                   acc))\n"
-        "                      :else (recur (rest cs) acc)))]\n"
-        "    (concat (list (quote do)) impls (list {:cljc/type t}))))\n");
+        "        ms (filter list? clauses)\n"
+        "        regs (map (fn [m] (list 'cljc/reg-reify-method! (list 'quote (first m)) t)) ms)\n"
+        "        impls (mapcat (fn [m] (list (list 'quote (first m))\n"
+        "                                    (cons 'fn (cons (vec (second m)) (drop 2 m))))) ms)\n"
+        "        inst (list 'hash-map :cljc/type t :cljc/impls (cons 'hash-map impls))]\n"
+        "    (concat (list 'do) regs (list inst))))\n");
     /* FFI glue generator — declare C signatures as data, compile, load:
      * (ffi/define [[:double cos [:double]] [:int getpid []]]
      *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */

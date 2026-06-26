@@ -113,6 +113,9 @@ typedef enum {
     CLJC_CHUNK,     /* internal: compiled bytecode for one fn arity body */
     CLJC_CORO,      /* stackful coroutine (coro/new): own C stack + vstack segment */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
+    CLJC_EMPTY,     /* the empty list () — a distinct singleton: truthy, seq?/list?
+                     * true, (= () nil) false, but seq/to_seq of it is NIL so the
+                     * seq machinery and cons-traversal still terminate cleanly */
 } CljcTag;
 
 typedef struct Cljc Cljc;
@@ -243,7 +246,7 @@ static size_t vec_len(Cljc *v);
 static Cljc *vec_nth(Cljc *v, size_t i);
 static char *as_str(Cljc *v, const char *what);
 static int64_t as_int(Cljc *v, const char *what);
-static Cljc *NIL, *TRUE, *FALSE;
+static Cljc *NIL, *TRUE, *FALSE, *EMPTY;
 
 /* ───── Error handling ───────────────────────────────────────────────── */
 
@@ -907,7 +910,7 @@ static void gc_collect(void) {
     jmp_buf regs;
     setjmp(regs);
 
-    gc_mark(NIL); gc_mark(TRUE); gc_mark(FALSE);
+    gc_mark(NIL); gc_mark(TRUE); gc_mark(FALSE); gc_mark(EMPTY);
     gc_mark(cur_exc);  /* exception value may be in flight between throw and catch */
     for (size_t vi = 0; vi < vsp; vi++) gc_mark(vstack[vi]);
     for (int i = 0; i < gc_n_root_envs; i++) gc_mark_env(gc_root_envs[i]);
@@ -1079,6 +1082,7 @@ static uint32_t cljc_hash(Cljc *v) {
         case CLJC_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
         case CLJC_LAZY:
             return cljc_hash(to_seq(v));
+        case CLJC_EMPTY:   /* () hashes like an empty list/vector (= () []) */
         case CLJC_LIST: {
             uint32_t h = 1;
             for (Cljc *l = v; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
@@ -1995,7 +1999,7 @@ static Cljc *read_form(const char **p) {
     skip_ws(p);
     char c = **p;
     if (c == '\0') return NULL;
-    if (c == '(') return read_list(p, ')');
+    if (c == '(') { Cljc *l = read_list(p, ')'); return l == NIL ? EMPTY : l; }
     if (c == '[') {
         /* v0: treat [ … ] as a list tagged for vector semantics later. For
          * now use the list reader and rewrap. Persistent vectors arrive
@@ -3636,7 +3640,7 @@ static Cljc *eval(CljcEnv *env, Cljc *form) {
 static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
-        case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL:
+        case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL: case CLJC_EMPTY:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
@@ -4242,6 +4246,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
     if (v == NULL || v == NIL) { sb_puts(sb, "nil"); return; }
     switch (v->tag) {
         case CLJC_NIL: sb_puts(sb, "nil"); break;
+        case CLJC_EMPTY: sb_puts(sb, "()"); break;
         case CLJC_BOOL: sb_puts(sb, v->as.b ? "true" : "false"); break;
         case CLJC_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
         case CLJC_DOUBLE: {
@@ -4367,7 +4372,8 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             print_to(sb, v->as.atom.value, readably);
             sb_putc(sb, ']');
             break;
-        case CLJC_LAZY:   print_to(sb, to_seq(v), readably); break;  /* realizes! */
+        case CLJC_LAZY: { Cljc *s = to_seq(v);   /* realizes! empty seq prints () */
+            print_to(sb, s == NIL ? EMPTY : s, readably); break; }
         case CLJC_RECUR:  sb_puts(sb, "#<recur>"); break;
         case CLJC_CHUNK:  sb_puts(sb, "#<chunk>"); break;
         case CLJC_FREE:   sb_puts(sb, "#<freed!>"); break;  /* seeing this is a GC bug */
@@ -4596,8 +4602,8 @@ static bool seq_eq(Cljc *a, Cljc *b) {
 static bool cljc_eq(Cljc *a, Cljc *b) {
     if (a == b) return true;
     if (a == NULL || b == NULL) return false;
-    bool a_seq = a->tag == CLJC_LIST || a->tag == CLJC_VECTOR || a->tag == CLJC_LAZY;
-    bool b_seq = b->tag == CLJC_LIST || b->tag == CLJC_VECTOR || b->tag == CLJC_LAZY;
+    bool a_seq = a->tag == CLJC_LIST || a->tag == CLJC_VECTOR || a->tag == CLJC_LAZY || a->tag == CLJC_EMPTY;
+    bool b_seq = b->tag == CLJC_LIST || b->tag == CLJC_VECTOR || b->tag == CLJC_LAZY || b->tag == CLJC_EMPTY;
     if (a_seq && b_seq)  /* to_seq also surfaces lazy tails hidden in lists */
         return seq_eq(a->tag == CLJC_VECTOR ? a : to_seq(a),
                       b->tag == CLJC_VECTOR ? b : to_seq(b));
@@ -4723,7 +4729,7 @@ static Cljc *prim_not(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    if (argv[0] == NIL) return mk_int(0);
+    if (argv[0] == NIL || argv[0]->tag == CLJC_EMPTY) return mk_int(0);
     /* read the tag as an int — keeping no Cljc* head copy. A live local holding
      * argv[0] would conservatively pin the whole realized chain through the walk
      * below (count O(n) live); the int dispatch leaves nothing for the scan. */
@@ -4775,9 +4781,10 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *r = argv[0];  /* nil works: conj onto nil yields a list */
     for (int i = 1; i < nargs; i++) {
         Cljc *x = argv[i];
-        if (r == NIL || r->tag == CLJC_LIST || r->tag == CLJC_LAZY) {
+        if (r == NIL || r->tag == CLJC_LIST || r->tag == CLJC_LAZY ||
+            r->tag == CLJC_EMPTY) {
             Cljc *prev = r;                         /* lazy: cons keeps it lazy */
-            r = mk_cons(x, r);                      /* lists grow at the front */
+            r = mk_cons(x, r->tag == CLJC_EMPTY ? NIL : r);  /* () conjs to (x) */
             if (prev != NIL && prev->tag == CLJC_LIST &&
                 !is_arities_meta(prev->meta))   /* internal marker stays */
                 r->meta = prev->meta;
@@ -4864,7 +4871,7 @@ static Cljc *prim_apply(CljcEnv *env, Cljc **argv, int nargs) {
 TYPE_PRED(nil_p,     v == NIL)
 TYPE_PRED(map_p,     v != NIL && v->tag == CLJC_MAP)
 TYPE_PRED(set_p,     v != NIL && v->tag == CLJC_SET)
-TYPE_PRED(list_p,    v != NIL && v->tag == CLJC_LIST)
+TYPE_PRED(list_p,    v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_EMPTY))
 TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
 TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE))
 TYPE_PRED(int_p,     v != NIL && v->tag == CLJC_INT)
@@ -4881,7 +4888,7 @@ TYPE_PRED(neg_p,     as_num(v) < 0)
 static Cljc *prim_empty_p(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     Cljc *v = argv[0];
-    if (v == NIL) return TRUE;
+    if (v == NIL || v->tag == CLJC_EMPTY) return TRUE;
     if (v->tag == CLJC_LIST) return FALSE;  /* a cons is never empty */
     if (v->tag == CLJC_LAZY) return mk_bool(seq1(v) == NIL);
     if (v->tag == CLJC_VECTOR) return mk_bool(vec_len(v) == 0);
@@ -5042,6 +5049,7 @@ static Cljc *prim_rem(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_list(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    if (nargs == 0) return EMPTY;   /* (list) => () */
     Cljc *out = NIL;
     for (int i = nargs - 1; i >= 0; i--) out = mk_cons(argv[i], out);
     return out;
@@ -5057,7 +5065,9 @@ static Cljc *prim_first(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_rest(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     Cljc *s = seq1(argv[0]);
-    return s == NIL ? NIL : s->as.cons.tail;  /* tail may be lazy */
+    if (s == NIL) return EMPTY;                 /* (rest ()) / (rest nil) => () */
+    Cljc *t = s->as.cons.tail;                  /* tail may be lazy */
+    return (t == NIL) ? EMPTY : t;              /* a finished list rests to () */
 }
 
 static Cljc *prim_second(CljcEnv *env, Cljc **argv, int nargs) {
@@ -5094,7 +5104,7 @@ static Cljc *lazy_force(Cljc *l) {
  * tail may itself be lazy. This is what keeps pipelines lazy. */
 static Cljc *seq1(Cljc *v) {
     for (;;) {
-        if (v == NULL || v == NIL) return NIL;
+        if (v == NULL || v == NIL || v->tag == CLJC_EMPTY) return NIL;
         if (v->tag == CLJC_LIST) return v;
         if (v->tag == CLJC_LAZY) { v = lazy_force(v); continue; }
         return to_seq(v);  /* finite collections materialize */
@@ -5109,7 +5119,7 @@ static Cljc *seq1(Cljc *v) {
 static Cljc *seq1_slot(Cljc **slot) {
     Cljc *v = *slot;
     for (;;) {
-        if (v == NULL || v == NIL) return NIL;
+        if (v == NULL || v == NIL || v->tag == CLJC_EMPTY) return NIL;
         if (v->tag == CLJC_LIST) { *slot = v; return v; }
         if (v->tag == CLJC_LAZY) {
             *slot = v;             /* keep the cell being forced rooted... */
@@ -5123,7 +5133,7 @@ static Cljc *seq1_slot(Cljc **slot) {
 /* Normalize any seqable to a FULLY REALIZED plain list (eager consumers).
  * Plain lists pass through untouched unless a lazy tail hides inside. */
 static Cljc *to_seq(Cljc *v) {
-    if (v == NIL) return NIL;
+    if (v == NIL || v->tag == CLJC_EMPTY) return NIL;
     if (v->tag == CLJC_LAZY || v->tag == CLJC_LIST) {
         if (v->tag == CLJC_LIST) {  /* fast path: no lazy tails => as-is */
             Cljc *l = v;
@@ -5263,9 +5273,10 @@ static Cljc *prim_drop(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_reverse(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     Cljc *out = NIL;
+    bool any = false;
     for (Cljc *l = to_seq(argv[0]); l && l->tag == CLJC_LIST; l = l->as.cons.tail)
-        out = mk_cons(l->as.cons.head, out);
-    return out;
+        { out = mk_cons(l->as.cons.head, out); any = true; }
+    return any ? out : EMPTY;   /* (reverse []) => () */
 }
 
 static Cljc *prim_last(CljcEnv *env, Cljc **argv, int nargs) {
@@ -5308,7 +5319,8 @@ static Cljc *prim_seq(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_seq_p(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     Cljc *v = argv[0];
-    return mk_bool(v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_LAZY));
+    return mk_bool(v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_LAZY ||
+                                v->tag == CLJC_EMPTY));
 }
 
 /* ───── Regex engine ─────────────────────────────────────────────────── */
@@ -6026,7 +6038,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_CHAR: n = "char"; break;
         case CLJC_KEYWORD: n = "keyword"; break;
         case CLJC_SYMBOL: n = "symbol"; break;
-        case CLJC_LIST: n = "list"; break;
+        case CLJC_LIST: case CLJC_EMPTY: n = "list"; break;
         case CLJC_LAZY: n = "lazy-seq"; break;
         case CLJC_VECTOR: n = "vector"; break;
         case CLJC_SET: n = "set"; break;
@@ -6280,7 +6292,7 @@ static Cljc *prim_sort(CljcEnv *env, Cljc **argv, int nargs) {
     g_sort_env = env; g_sort_fn = fn;
     qsort(arr, n, sizeof(Cljc *), sort_adapter);  /* elements stay rooted via coll */
     g_sort_fn = NULL;
-    Cljc *out = NIL;
+    Cljc *out = n == 0 ? EMPTY : NIL;   /* (sort []) => () */
     for (size_t j = n; j > 0; j--) out = mk_cons(arr[j - 1], out);
     free(arr);
     return out;
@@ -7362,7 +7374,7 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *v = argv[0];
     if (v == NIL) return NIL;
     switch (v->tag) {
-        case CLJC_LIST:   return NIL;
+        case CLJC_LIST: case CLJC_LAZY: case CLJC_EMPTY: return EMPTY;  /* (empty '(1 2)) => () */
         case CLJC_VECTOR: return mk_empty_vec();
         case CLJC_MAP:    return mk_map();
         case CLJC_SET:    return mk_set();
@@ -8588,6 +8600,9 @@ CljcEnv *cljc_new_env(void) {
         NIL->as.cons.tail = NIL;
         TRUE = alloc(CLJC_BOOL);  TRUE->as.b = true;
         FALSE = alloc(CLJC_BOOL); FALSE->as.b = false;
+        EMPTY = alloc(CLJC_EMPTY);
+        EMPTY->as.cons.head = NIL;   /* (first ()) => nil */
+        EMPTY->as.cons.tail = EMPTY; /* (rest ())  => ()   */
     }
     CljcEnv *e = env_new(NULL);
     /* Register as a GC root immediately — everything defined below

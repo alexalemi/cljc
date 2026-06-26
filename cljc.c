@@ -5927,6 +5927,17 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_meta(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *v = argv[0];
+    /* a deftype instance implementing IMeta keeps its metadata in a :meta field
+     * (the convention SCI's Var/Namespace follow) — return that, deref'd if it
+     * is a mutable (atom) field. */
+    if (v != NIL && v->tag == CLJC_MAP) {
+        Cljc *ty, *mf;
+        if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty) &&
+            map_find(v, mk_kw(intern("meta", 4)), &mf)) {
+            if (mf != NIL && mf->tag == CLJC_ATOM) return mf->as.atom.value;
+            return mf;
+        }
+    }
     return (v != NIL && v->meta) ? v->meta : NIL;
 }
 

@@ -116,6 +116,9 @@ typedef enum {
     CLJC_EMPTY,     /* the empty list () — a distinct singleton: truthy, seq?/list?
                      * true, (= () nil) false, but seq/to_seq of it is NIL so the
                      * seq machinery and cons-traversal still terminate cleanly */
+    CLJC_BIGINT,    /* arbitrary-precision integer: sign + base-2^32 magnitude.
+                     * Only exists when a value exceeds int64 — results that fit
+                     * demote back to CLJC_INT, so the common case never allocates */
 } CljcTag;
 
 typedef struct Cljc Cljc;
@@ -162,6 +165,9 @@ struct Cljc {
                  bool fc_ready; uint8_t fc_n; Cljc *fc_arity; } fn;
         CljcNativeFn native;
         struct { Cljc *value; } atom;
+        /* CLJC_BIGINT: sign in {-1,+1}; mag is n little-endian base-2^32 limbs,
+         * mag[n-1] != 0 (never stored as zero — zero demotes to CLJC_INT). */
+        struct { int sign; uint32_t n; uint32_t *mag; } big;
         struct { Cljc *thunk; Cljc *cached; bool done; } lazy;
         /* recur sentinel: up to 3 values inline (covers real loops);
          * wider recurs spill to a heap array stored in iv[0]. */
@@ -204,6 +210,8 @@ static const char *intern(const char *s, size_t n);
 static bool cljc_eq(Cljc *a, Cljc *b);
 static bool map_find(Cljc *m, Cljc *key, Cljc **out);
 static double as_num(Cljc *v);
+static Cljc *big_from_decimal(const char *s);
+static char *big_to_decimal(Cljc *v);
 static Cljc *to_seq(Cljc *v);
 static Cljc *seq1(Cljc *v);
 static Cljc *seq1_slot(Cljc **slot);
@@ -954,6 +962,7 @@ static void gc_collect(void) {
             if (c->tag != CLJC_FREE) {
                 switch (c->tag) {
                     case CLJC_STRING: free(c->as.str); break;
+                    case CLJC_BIGINT: free(c->as.big.mag); break;
                     case CLJC_CHUNK:
                         free(c->as.chunk.code);
                         free(c->as.chunk.consts);
@@ -1069,6 +1078,9 @@ static uint32_t cljc_hash(Cljc *v) {
         case CLJC_NIL:  return 0x9e3779b9u;
         case CLJC_BOOL: return v->as.b ? 1231u : 1237u;
         case CLJC_INT:  return mix64((uint64_t)v->as.i);
+        case CLJC_BIGINT: { uint64_t h = v->as.big.sign < 0 ? 2166136261u : 0;
+            for (uint32_t i = 0; i < v->as.big.n; i++) h = h * 31 + v->as.big.mag[i];
+            return mix64(h); }
         case CLJC_DOUBLE: {
             double d = v->as.d;
             if (d == (double)(int64_t)d) return mix64((uint64_t)(int64_t)d);  /* = int cross-equality */
@@ -1866,6 +1878,23 @@ static Cljc *read_atom(const char **p) {
                    ((start[0] == '+' || start[0] == '-') && n > 1 &&
                     isdigit((unsigned char)start[1])));
     if (is_num) {
+        /* Plain decimal integer (optional sign, digits, optional trailing N):
+         * may exceed int64 -> bigint. Detected first, before the 64-char buf cap,
+         * so arbitrarily long literals parse. big_from_decimal demotes if it fits. */
+        {
+            const char *p = start; size_t m = n;
+            if (m && (*p == '+' || *p == '-')) { p++; m--; }
+            bool hasN = m > 0 && p[m - 1] == 'N';
+            size_t dn = hasN ? m - 1 : m;
+            bool alldig = dn > 0;
+            for (size_t i = 0; i < dn && alldig; i++) if (p[i] < '0' || p[i] > '9') alldig = false;
+            if (alldig && (hasN || dn >= 19)) {
+                char *tmp = xmalloc(n + 1); memcpy(tmp, start, n); tmp[n] = '\0';
+                Cljc *r = big_from_decimal(tmp);   /* stops at the trailing N */
+                free(tmp);
+                return r;
+            }
+        }
         char buf[64]; if (n >= sizeof buf) cljc_error("number too long");
         memcpy(buf, start, n); buf[n] = '\0';
         int64_t sign = 1;
@@ -2824,7 +2853,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             vmc_emit(c, form->as.b ? VOP_TRUE : VOP_FALSE, 0);
             return;
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_STRING: case CLJC_CHAR:
-        case CLJC_KEYWORD:
+        case CLJC_KEYWORD: case CLJC_BIGINT:
         case CLJC_FN: case CLJC_NATIVE: case CLJC_MAP: case CLJC_SET:
             /* map/set literals with computed elements are rare in hot
              * bodies; constant ones are common — non-constant fall back */
@@ -3666,6 +3695,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL: case CLJC_EMPTY:
+        case CLJC_BIGINT:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
@@ -4297,6 +4327,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_EMPTY: sb_puts(sb, "()"); break;
         case CLJC_BOOL: sb_puts(sb, v->as.b ? "true" : "false"); break;
         case CLJC_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
+        case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); if (readably) sb_putc(sb, 'N'); free(s); } break;
         case CLJC_DOUBLE: {
             char tmp[32];
             snprintf(tmp, sizeof tmp, "%g", v->as.d);
@@ -4560,14 +4591,186 @@ static void print_error(void) {
  *   - unary: (- x) negates, (/ x) reciprocates
  *   - integer / that doesn't divide evenly promotes to double
  *     (real Clojure makes a Ratio — a deliberate v0 divergence) */
+/* ───── Arbitrary-precision integers ─────────────────────────────────────
+ * Sign-magnitude, base-2^32 little-endian limbs. Only created when a value
+ * exceeds int64; big_norm demotes back to CLJC_INT whenever the result fits,
+ * so CLJC_INT vs CLJC_BIGINT is purely a function of magnitude. Local Cljc*
+ * are GC roots (conservative C-stack scan), so no manual rooting is needed;
+ * malloc'd limb arrays are owned by their cell and freed in the GC sweep. */
+static uint32_t *umalloc(uint32_t n) { return xmalloc(sizeof(uint32_t) * (n ? n : 1)); }
+
+typedef struct { int sign; uint32_t n; const uint32_t *mag; } BigView;
+
+/* View any integer (CLJC_INT or CLJC_BIGINT) as sign + magnitude limbs. For an
+ * int64 the up-to-2 limbs land in the caller's scratch. sign==0 means zero. */
+static void big_view(Cljc *v, BigView *bv, uint32_t scratch[2]) {
+    if (v->tag == CLJC_BIGINT) {
+        bv->sign = v->as.big.sign; bv->n = v->as.big.n; bv->mag = v->as.big.mag; return;
+    }
+    int64_t x = v->as.i;
+    uint64_t u = x < 0 ? (uint64_t)(-(x + 1)) + 1 : (uint64_t)x;   /* INT64_MIN-safe */
+    bv->sign = x < 0 ? -1 : (x ? 1 : 0);
+    scratch[0] = (uint32_t)u; scratch[1] = (uint32_t)(u >> 32);
+    bv->n = scratch[1] ? 2 : (scratch[0] ? 1 : 0);
+    bv->mag = scratch;
+}
+
+/* Wrap sign + freshly malloc'd magnitude (n limbs, ownership taken) as a value,
+ * trimming leading zero limbs and demoting to CLJC_INT when it fits. */
+static Cljc *big_norm(int sign, uint32_t *mag, uint32_t n) {
+    while (n > 0 && mag[n - 1] == 0) n--;
+    if (n == 0) { free(mag); return mk_int(0); }
+    if (n <= 2) {
+        uint64_t u = mag[0] | (n == 2 ? ((uint64_t)mag[1] << 32) : 0);
+        if (u <= (uint64_t)INT64_MAX) { free(mag); return mk_int(sign < 0 ? -(int64_t)u : (int64_t)u); }
+        if (sign < 0 && u == (uint64_t)INT64_MAX + 1) { free(mag); return mk_int(INT64_MIN); }
+    }
+    Cljc *v = alloc(CLJC_BIGINT);
+    v->as.big.sign = sign < 0 ? -1 : 1; v->as.big.n = n; v->as.big.mag = mag;
+    return v;
+}
+
+static int umag_cmp(const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb) {
+    if (na != nb) return na < nb ? -1 : 1;
+    for (uint32_t i = na; i-- > 0; ) if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    return 0;
+}
+static uint32_t umag_add(const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb, uint32_t *out) {
+    if (na < nb) { const uint32_t *t = a; a = b; b = t; uint32_t k = na; na = nb; nb = k; }
+    uint64_t carry = 0; uint32_t i;
+    for (i = 0; i < nb; i++) { uint64_t s = (uint64_t)a[i] + b[i] + carry; out[i] = (uint32_t)s; carry = s >> 32; }
+    for (; i < na; i++) { uint64_t s = (uint64_t)a[i] + carry; out[i] = (uint32_t)s; carry = s >> 32; }
+    if (carry) out[i++] = (uint32_t)carry;
+    return i;
+}
+static uint32_t umag_sub(const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb, uint32_t *out) {
+    int64_t borrow = 0; uint32_t i;            /* requires a >= b */
+    for (i = 0; i < nb; i++) { int64_t d = (int64_t)a[i] - b[i] - borrow; borrow = d < 0; if (d < 0) d += (int64_t)1 << 32; out[i] = (uint32_t)d; }
+    for (; i < na; i++) { int64_t d = (int64_t)a[i] - borrow; borrow = d < 0; if (d < 0) d += (int64_t)1 << 32; out[i] = (uint32_t)d; }
+    return na;
+}
+static uint32_t umag_mul(const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb, uint32_t *out) {
+    for (uint32_t i = 0; i < na + nb; i++) out[i] = 0;
+    for (uint32_t i = 0; i < na; i++) {
+        uint64_t carry = 0;
+        for (uint32_t j = 0; j < nb; j++) { uint64_t s = (uint64_t)a[i] * b[j] + out[i + j] + carry; out[i + j] = (uint32_t)s; carry = s >> 32; }
+        out[i + nb] += (uint32_t)carry;
+    }
+    return na + nb;
+}
+
+static Cljc *big_addsub(Cljc *A, Cljc *B, int sub) {
+    uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
+    int bsign = sub ? -b.sign : b.sign;
+    if (a.sign == 0) { if (bsign == 0) return mk_int(0); uint32_t *m = umalloc(b.n); memcpy(m, b.mag, b.n * 4); return big_norm(bsign, m, b.n); }
+    if (bsign == 0) { uint32_t *m = umalloc(a.n); memcpy(m, a.mag, a.n * 4); return big_norm(a.sign, m, a.n); }
+    if (a.sign == bsign) { uint32_t cap = (a.n > b.n ? a.n : b.n) + 1; uint32_t *out = umalloc(cap); uint32_t n = umag_add(a.mag, a.n, b.mag, b.n, out); return big_norm(a.sign, out, n); }
+    int c = umag_cmp(a.mag, a.n, b.mag, b.n);
+    if (c == 0) return mk_int(0);
+    uint32_t cap = a.n > b.n ? a.n : b.n; uint32_t *out = umalloc(cap);
+    if (c > 0) return big_norm(a.sign, out, umag_sub(a.mag, a.n, b.mag, b.n, out));
+    return big_norm(bsign, out, umag_sub(b.mag, b.n, a.mag, a.n, out));
+}
+static Cljc *big_mul(Cljc *A, Cljc *B) {
+    uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
+    if (a.sign == 0 || b.sign == 0) return mk_int(0);
+    uint32_t *out = umalloc(a.n + b.n); uint32_t n = umag_mul(a.mag, a.n, b.mag, b.n, out);
+    return big_norm(a.sign * b.sign, out, n);
+}
+static int big_cmp(Cljc *A, Cljc *B) {
+    uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
+    if (a.sign != b.sign) return a.sign < b.sign ? -1 : 1;
+    if (a.sign == 0) return 0;
+    int c = umag_cmp(a.mag, a.n, b.mag, b.n);
+    return a.sign < 0 ? -c : c;
+}
+
+/* Truncating divmod (quot toward zero, rem takes the dividend's sign). Bit-by-
+ * bit long division on magnitudes — simple and correct; fine at our scale. */
+static void big_divmod(Cljc *A, Cljc *B, Cljc **Q, Cljc **R) {
+    uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
+    if (b.sign == 0) cljc_error("Divide by zero");
+    if (a.sign == 0 || umag_cmp(a.mag, a.n, b.mag, b.n) < 0) {
+        if (Q) *Q = mk_int(0);
+        if (R) { uint32_t *m = umalloc(a.n ? a.n : 1); memcpy(m, a.mag, a.n * 4); *R = big_norm(a.sign, m, a.n); }
+        return;
+    }
+    uint32_t qn = a.n, rn = a.n + 1;
+    uint32_t *q = umalloc(qn); for (uint32_t i = 0; i < qn; i++) q[i] = 0;
+    uint32_t *r = umalloc(rn); for (uint32_t i = 0; i < rn; i++) r[i] = 0;
+    for (uint32_t bit = a.n * 32; bit-- > 0; ) {
+        uint32_t carry = 0;                                   /* r <<= 1 */
+        for (uint32_t i = 0; i < rn; i++) { uint32_t nx = r[i] >> 31; r[i] = (r[i] << 1) | carry; carry = nx; }
+        if ((a.mag[bit / 32] >> (bit % 32)) & 1) r[0] |= 1;   /* bring down next bit */
+        uint32_t rl = rn; while (rl > 0 && r[rl - 1] == 0) rl--;
+        if (umag_cmp(r, rl, b.mag, b.n) >= 0) { umag_sub(r, rl, b.mag, b.n, r); q[bit / 32] |= 1u << (bit % 32); }
+    }
+    if (Q) *Q = big_norm(a.sign * b.sign, q, qn); else free(q);
+    if (R) *R = big_norm(a.sign, r, rn); else free(r);
+}
+static Cljc *big_abs(Cljc *A) {
+    if (A->tag == CLJC_INT) return A->as.i < 0 ? big_addsub(mk_int(0), A, 1) : A;
+    uint32_t *m = umalloc(A->as.big.n); memcpy(m, A->as.big.mag, A->as.big.n * 4);
+    return big_norm(1, m, A->as.big.n);
+}
+static bool big_is_zero(Cljc *A) { return A->tag == CLJC_INT && A->as.i == 0; }
+static Cljc *big_gcd(Cljc *A, Cljc *B) {
+    Cljc *a = big_abs(A), *b = big_abs(B);
+    while (!big_is_zero(b)) { Cljc *r; big_divmod(a, b, NULL, &r); a = b; b = r; }
+    return a;
+}
+static double big_to_double(Cljc *v) {
+    if (v->tag == CLJC_INT) return (double)v->as.i;
+    double d = 0; for (uint32_t i = v->as.big.n; i-- > 0; ) d = d * 4294967296.0 + v->as.big.mag[i];
+    return v->as.big.sign < 0 ? -d : d;
+}
+static uint32_t udiv_small_inplace(uint32_t *d, uint32_t n, uint32_t div) {
+    uint64_t rem = 0;
+    for (uint32_t i = n; i-- > 0; ) { uint64_t cur = (rem << 32) | d[i]; d[i] = (uint32_t)(cur / div); rem = cur % div; }
+    return (uint32_t)rem;
+}
+/* Decimal text (with sign). Caller frees. */
+static char *big_to_decimal(Cljc *v) {
+    if (v->tag == CLJC_INT) { char *b = xmalloc(24); snprintf(b, 24, "%lld", (long long)v->as.i); return b; }
+    uint32_t n = v->as.big.n, tn = n; uint32_t *t = umalloc(n); memcpy(t, v->as.big.mag, n * 4);
+    uint32_t *chunks = xmalloc(sizeof(uint32_t) * ((size_t)n + 2)); size_t nc = 0;
+    while (tn > 0) { uint32_t r = udiv_small_inplace(t, tn, 1000000000u); while (tn > 0 && t[tn - 1] == 0) tn--; chunks[nc++] = r; }
+    free(t);
+    size_t cap = nc * 9 + 4; char *buf = xmalloc(cap); size_t p = 0;
+    if (v->as.big.sign < 0) buf[p++] = '-';
+    p += (size_t)snprintf(buf + p, cap - p, "%u", chunks[nc - 1]);
+    for (size_t i = nc - 1; i-- > 0; ) p += (size_t)snprintf(buf + p, cap - p, "%09u", chunks[i]);
+    buf[p] = 0; free(chunks); return buf;
+}
+/* Parse a decimal integer (optional sign, all digits) into INT or BIGINT. */
+static Cljc *big_from_decimal(const char *s) {
+    int sign = 1; if (*s == '+') s++; else if (*s == '-') { sign = -1; s++; }
+    Cljc *acc = mk_int(0), *ten = mk_int(10);
+    for (; *s; s++) { if (*s < '0' || *s > '9') break; acc = big_addsub(big_mul(acc, ten), mk_int(*s - '0'), 0); }
+    return sign < 0 ? big_addsub(mk_int(0), acc, 1) : acc;
+}
+
 typedef enum { OP_ADD, OP_SUB, OP_MUL, OP_DIV } ArithOp;
 
-static Cljc *arith(ArithOp op, Cljc **argv, int nargs) {
+static Cljc *big_binop(ArithOp op, Cljc *a, Cljc *b) {
+    switch (op) {
+        case OP_ADD: return big_addsub(a, b, 0);
+        case OP_SUB: return big_addsub(a, b, 1);
+        case OP_MUL: return big_mul(a, b);
+        default: return mk_int(0);  /* DIV handled separately */
+    }
+}
+
+/* promote=false: int64 ops wrap (the +,-,* used everywhere, incl. unchecked).
+ * promote=true: int64 overflow auto-promotes to bigint (the +',-',*' ops). A
+ * bigint operand always takes the exact path regardless of `promote`. */
+static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
     size_t n = (size_t)nargs;
-    bool is_float = false;
+    bool is_float = false, is_big = false;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Cljc *v = argv[ai_];
         if (v->tag == CLJC_DOUBLE) is_float = true;
+        else if (v->tag == CLJC_BIGINT) is_big = true;
         else if (v->tag != CLJC_INT) cljc_error("expected number");
     }
     if (n == 0) {
@@ -4575,12 +4778,17 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs) {
         if (op == OP_MUL) return mk_int(1);
         cljc_error("wrong number of args (0)");
     }
+    if (is_float) goto float_path;
+    if (is_big) goto big_path;
 
-    if (!is_float) {
+    {
         int64_t acc = argv[0]->as.i;
         int ai_;
         if (n == 1) {
-            if (op == OP_SUB) return mk_int(-acc);
+            if (op == OP_SUB) {  /* negate; INT64_MIN overflows -> promote */
+                if (promote && acc == INT64_MIN) return big_addsub(mk_int(0), argv[0], 1);
+                return mk_int(-acc);
+            }
             if (op == OP_DIV) {
                 if (acc == 0) cljc_error("division by zero");
                 return acc == 1 || acc == -1 ? mk_int(acc) : mk_double(1.0 / (double)acc);
@@ -4589,18 +4797,50 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs) {
         }
         for (ai_ = 1; ai_ < nargs; ai_++) {
             int64_t x = argv[ai_]->as.i;
-            switch (op) {
-                case OP_ADD: acc += x; break;
-                case OP_SUB: acc -= x; break;
-                case OP_MUL: acc *= x; break;
-                case OP_DIV:
-                    if (x == 0) cljc_error("division by zero");
-                    if (acc % x != 0) { is_float = true; goto float_path; }
-                    acc /= x;
-                    break;
+            if (op == OP_DIV) {
+                if (x == 0) cljc_error("division by zero");
+                if (acc % x != 0) { is_float = true; goto float_path; }
+                acc /= x;
+                continue;
+            }
+            if (promote) {            /* checked: spill into bigint on overflow */
+                int64_t r; bool ovf;
+                if (op == OP_ADD) ovf = __builtin_add_overflow(acc, x, &r);
+                else if (op == OP_SUB) ovf = __builtin_sub_overflow(acc, x, &r);
+                else ovf = __builtin_mul_overflow(acc, x, &r);
+                if (ovf) {
+                    Cljc *b = mk_int(acc);
+                    for (; ai_ < nargs; ai_++) b = big_binop(op, b, argv[ai_]);
+                    return b;
+                }
+                acc = r;
+            } else {
+                switch (op) {
+                    case OP_ADD: acc += x; break;
+                    case OP_SUB: acc -= x; break;
+                    case OP_MUL: acc *= x; break;
+                    default: break;
+                }
             }
         }
         return mk_int(acc);
+    }
+
+big_path: {
+        Cljc *acc = argv[0];
+        if (n == 1) {
+            if (op == OP_SUB) return big_addsub(mk_int(0), acc, 1);
+            if (op == OP_DIV) return mk_double(1.0 / big_to_double(acc));
+            return acc;
+        }
+        for (int ai_ = 1; ai_ < nargs; ai_++) {
+            if (op == OP_DIV) {       /* exact if it divides, else fall to double */
+                Cljc *q, *r; big_divmod(acc, argv[ai_], &q, &r);
+                if (!big_is_zero(r)) { is_float = true; goto float_path; }
+                acc = q;
+            } else acc = big_binop(op, acc, argv[ai_]);
+        }
+        return acc;
     }
 
 float_path:;
@@ -4623,10 +4863,14 @@ float_path:;
     return mk_double(facc);
 }
 
-static Cljc *prim_add(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs); }
-static Cljc *prim_sub(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs); }
-static Cljc *prim_mul(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs); }
-static Cljc *prim_div(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_DIV, argv, nargs); }
+static Cljc *prim_add(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, false); }
+static Cljc *prim_sub(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, false); }
+static Cljc *prim_mul(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, false); }
+static Cljc *prim_div(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_DIV, argv, nargs, false); }
+/* auto-promoting +' -' *' (Clojure): int64 overflow grows to bigint */
+static Cljc *prim_addq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, true); }
+static Cljc *prim_subq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, true); }
+static Cljc *prim_mulq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, true); }
 
 /* Sequential equality across lists and vectors, Clojure-style:
  * (= [1 2 3] '(1 2 3)) is true. */
@@ -4669,6 +4913,7 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         case CLJC_NIL: return true;
         case CLJC_BOOL: return a->as.b == b->as.b;
         case CLJC_INT: return a->as.i == b->as.i;
+        case CLJC_BIGINT: return big_cmp(a, b) == 0;
         case CLJC_DOUBLE: return a->as.d == b->as.d;
         case CLJC_SYMBOL: return a->as.sym == b->as.sym;
         case CLJC_KEYWORD: return a->as.kw == b->as.kw;
@@ -4705,18 +4950,32 @@ static Cljc *prim_eq(CljcEnv *env, Cljc **argv, int nargs) {
 static double as_num(Cljc *v) {
     if (v->tag == CLJC_INT) return (double)v->as.i;
     if (v->tag == CLJC_DOUBLE) return v->as.d;
+    if (v->tag == CLJC_BIGINT) return big_to_double(v);
     cljc_error("expected number");
     return 0;
 }
 
 /* Chained comparisons: (< 1 2 3) is true iff each adjacent pair satisfies OP. */
+/* Numeric ordering across int/bigint/double; exact for bigints (a double
+ * comparison would lose precision between adjacent large integers). */
+static int num_cmp(Cljc *a, Cljc *b) {
+    int ta = a->tag, tb = b->tag;
+    if ((ta != CLJC_INT && ta != CLJC_DOUBLE && ta != CLJC_BIGINT) ||
+        (tb != CLJC_INT && tb != CLJC_DOUBLE && tb != CLJC_BIGINT)) cljc_error("expected number");
+    if (ta == CLJC_DOUBLE || tb == CLJC_DOUBLE) {
+        double x = as_num(a), y = as_num(b); return x < y ? -1 : (x > y ? 1 : 0);
+    }
+    if (ta == CLJC_BIGINT || tb == CLJC_BIGINT) return big_cmp(a, b);
+    int64_t x = a->as.i, y = b->as.i; return x < y ? -1 : (x > y ? 1 : 0);
+}
+
 #define COMPARISON(NAME, OP) \
     static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
         (void)env; \
         Cljc *prev = NULL; \
         for (int ai_ = 0; ai_ < nargs; ai_++) { \
             Cljc *v = argv[ai_]; \
-            if (prev && !(as_num(prev) OP as_num(v))) return FALSE; \
+            if (prev && !(num_cmp(prev, v) OP 0)) return FALSE; \
             prev = v; \
         } \
         return TRUE; \
@@ -4921,7 +5180,7 @@ TYPE_PRED(map_p,     v != NIL && v->tag == CLJC_MAP)
 TYPE_PRED(set_p,     v != NIL && v->tag == CLJC_SET)
 TYPE_PRED(list_p,    v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_EMPTY))
 TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
-TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE))
+TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE || v->tag == CLJC_BIGINT))
 TYPE_PRED(int_p,     v != NIL && v->tag == CLJC_INT)
 TYPE_PRED(double_p,  v != NIL && v->tag == CLJC_DOUBLE)
 TYPE_PRED(string_p,  v != NIL && v->tag == CLJC_STRING)
@@ -4963,6 +5222,12 @@ static Cljc *prim_dec(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
+        Cljc *r; big_divmod(argv[0], argv[1], NULL, &r);   /* mod follows divisor sign */
+        if (!big_is_zero(r) && (num_cmp(r, mk_int(0)) < 0) != (num_cmp(argv[1], mk_int(0)) < 0))
+            r = big_addsub(r, argv[1], 0);
+        return r;
+    }
     int64_t a = as_int(argv[0], "mod");
     int64_t b = as_int(argv[1], "mod");
     if (b == 0) cljc_error("mod: division by zero");
@@ -5089,6 +5354,9 @@ static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_rem(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
+        Cljc *r; big_divmod(argv[0], argv[1], NULL, &r); return r;
+    }
     int64_t a = as_int(argv[0], "rem");
     int64_t b = as_int(argv[1], "rem");
     if (b == 0) cljc_error("rem: division by zero");
@@ -6148,6 +6416,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
     switch (v->tag) {
         case CLJC_BOOL: n = "boolean"; break;
         case CLJC_INT: n = "int"; break;
+        case CLJC_BIGINT: n = "bigint"; break;
         case CLJC_DOUBLE: n = "double"; break;
         case CLJC_STRING: n = "string"; break;
         case CLJC_CHAR: n = "char"; break;
@@ -6343,12 +6612,9 @@ static int cmp_values(Cljc *a, Cljc *b) {
     if (a == b) return 0;
     if (a == NIL) return -1;          /* nil sorts first */
     if (b == NIL) return 1;
-    bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE;
-    bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE;
-    if (a_num && b_num) {
-        double d = as_num(a) - as_num(b);
-        return d < 0 ? -1 : d > 0 ? 1 : 0;
-    }
+    bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE || a->tag == CLJC_BIGINT;
+    bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE || b->tag == CLJC_BIGINT;
+    if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints */
     if (a->tag != b->tag) cljc_error("compare: incomparable types");
     switch (a->tag) {
         case CLJC_STRING:  return strcmp(a->as.str, b->as.str);
@@ -6486,6 +6752,9 @@ static Cljc *prim_symbol(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_quot(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
+        Cljc *q; big_divmod(argv[0], argv[1], &q, NULL); return q;
+    }
     int64_t a = as_int(argv[0], "quot");
     int64_t b = as_int(argv[1], "quot");
     if (b == 0) cljc_error("quot: division by zero");
@@ -8015,8 +8284,8 @@ static const char *PRELUDE =
     "     v#))\n"
     "(def == =)\n"                       /* = already numeric cross-type */
     "(defn distinct? [& xs] (= (count xs) (count (set xs))))\n"
-    /* arbitrary-precision variants: int64 here (overflow wraps, v0) */
-    "(def *' *) (def +' +) (def -' -) (def inc' inc) (def dec' dec)\n"
+    /* +' -' *' are real auto-promoting natives now (see prim_*q); inc'/dec'
+     * are defined just below in terms of them */
     /* deftype, tolerated: defines a Name. constructor returning a plain map
      * of fields; interface method bodies are ignored. Enough for files that
      * define a type they rarely use to still load. */
@@ -8268,7 +8537,9 @@ static const char *PRELUDE =
     "(defn seqable? [x] (or (nil? x) (coll? x) (string? x) (seq? x)))\n"
     "(defn reversible? [x] (vector? x))\n"
     "(defn ratio? [_] false) (defn rational? [x] (number? x)) (defn decimal? [_] false)\n"
-    "(defn float? [x] (double? x)) (defn integer? [x] (int? x))\n"
+    "(defn float? [x] (double? x))\n"
+    "(defn bigint? [x] (= (type x) :bigint))\n"
+    "(defn integer? [x] (or (int? x) (bigint? x)))\n"
     "(defn volatile? [x] (= :atom (type x))) (defn realized? [_] true)\n"
     "(defn inst? [_] false) (defn uri? [_] false) (defn uuid? [_] false)\n"
     "(defn object? [x] (some? x)) (defn special-symbol? [_] false)\n"
@@ -8283,6 +8554,7 @@ static const char *PRELUDE =
     "(defn double [x] (* 1.0 x)) (defn float [x] (* 1.0 x))\n"
     /* unchecked math == checked in cljc */
     "(def unchecked-add +) (def unchecked-subtract -) (def unchecked-multiply *)\n"
+    "(defn inc' [x] (+' x 1)) (defn dec' [x] (-' x 1))\n"   /* auto-promoting inc/dec */
     "(def unchecked-dec dec) (def unchecked-inc inc) (def unchecked-negate -)\n"
     "(def unchecked-add-int +) (def unchecked-subtract-int -) (def unchecked-multiply-int *)\n"
     "(def unchecked-dec-int dec) (def unchecked-inc-int inc) (def unchecked-negate-int -)\n"
@@ -8782,6 +9054,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "+",       prim_add);
     cljc_define_native(e, "-",       prim_sub);
     cljc_define_native(e, "*",       prim_mul);
+    cljc_define_native(e, "+'",      prim_addq);
+    cljc_define_native(e, "-'",      prim_subq);
+    cljc_define_native(e, "*'",      prim_mulq);
     cljc_define_native(e, "/",       prim_div);
     cljc_define_native(e, "=",       prim_eq);
     cljc_define_native(e, "<",       prim_lt);

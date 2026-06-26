@@ -7631,6 +7631,7 @@ static const char *PRELUDE =
     "(defn split-at [n coll] [(take n coll) (drop n coll)])\n"
     "(defn str/split-lines [s] (re-split s \"\\r?\\n\"))\n"
     "(defmacro if-not [test then & else] `(if (not ~test) ~then ~@else))\n"
+    "(defmacro fn* [& body] (cons 'fn body))\n"   /* fn* === fn (cljc fn is the special form) */
     "(defmacro when-not [test & body] `(when (not ~test) ~@body))\n"
     "(defmacro -> [x & forms]\n"
     "  (loop [x x forms forms]\n"

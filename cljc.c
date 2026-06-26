@@ -1889,6 +1889,27 @@ static Cljc *read_atom(const char **p) {
     /* Keyword? */
     if (start[0] == ':') {
         if (n == 1) cljc_error("invalid token: :");
+        if (start[1] == ':') {
+            /* ::name -> :current-ns/name ; ::alias/name -> :full-ns/name */
+            if (n == 2) cljc_error("invalid token: ::");
+            const char *body = start + 2;
+            size_t blen = n - 2;
+            const char *slash = memchr(body, '/', blen);
+            char buf[256];
+            if (slash) {
+                size_t alen = (size_t)(slash - body);
+                const char *al = intern(body, alen);
+                const char *full = cur_reader_ns;
+                for (int i = 0; i < n_aliases; i++)
+                    if (alias_table[i] == al) { full = alias_ns[i]; break; }
+                snprintf(buf, sizeof buf, "%s/%.*s", full ? full : "",
+                         (int)(blen - alen - 1), slash + 1);
+            } else {
+                snprintf(buf, sizeof buf, "%s/%.*s",
+                         cur_reader_ns ? cur_reader_ns : "", (int)blen, body);
+            }
+            return mk_kw(intern(buf, strlen(buf)));
+        }
         return mk_kw(intern(start + 1, n - 1));
     }
 
@@ -2798,8 +2819,11 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
     Cljc *rest = form->as.cons.tail;
     if (head != NIL && head->tag == CLJC_SYMBOL) {
         const char *s = head->as.sym;
-        /* (.-field obj): deopt to the tree-walker, which does the field access */
-        if (s[0] == '.' && s[1] == '-' && s[2]) {
+        /* (.-field obj) / an undefined (.foo x) field access: deopt to the
+         * tree-walker, which resolves it as a deftype field read */
+        if ((s[0] == '.' && s[1] == '-' && s[2]) ||
+            (s[0] == '.' && s[1] && s[1] != '-' &&
+             !root_find(env_root(cenv), s, NULL))) {
             vmc_emit(c, VOP_EVAL, vmc_const(c, form));
             return;
         }
@@ -3652,6 +3676,20 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         map_find(obj, mk_kw(intern(s + 2, strlen(s + 2))), &out))
                         return out;
                     return NIL;
+                }
+                /* (.foo x): if .foo is not a defined method, treat as a deftype
+                 * field access (Java's field-access syntax === method syntax) */
+                if (s[0] == '.' && s[1] && s[1] != '-' &&
+                    rest != NIL && rest->tag == CLJC_LIST &&
+                    rest->as.cons.tail == NIL &&
+                    !root_find(env_root(env), s, NULL)) {
+                    Cljc *obj = eval(env, rest->as.cons.head);
+                    Cljc *out;
+                    if (obj != NIL && obj->tag == CLJC_MAP &&
+                        map_find(obj, mk_kw(intern(s + 1, strlen(s + 1))), &out))
+                        return out;
+                    err_token = s;
+                    cljc_error("I don't know what `%s` refers to.", s);
                 }
                 static const char *SYM_QUOTE, *SYM_IF, *SYM_DO, *SYM_DEF, *SYM_LET, *SYM_FN, *SYM_LOOP, *SYM_RECUR,
                                   *SYM_AND, *SYM_OR, *SYM_WHEN, *SYM_COND, *SYM_DEFN,
@@ -7854,7 +7892,9 @@ static const char *PRELUDE =
     "       ~@(map (fn [g]\n"
     "                (let [mname (first g)\n"
     "                      arities (map (fn [m]\n"
-    "                                     (let [params (vec (second m)) this (first (second m))\n"
+    "                                     (let [oparams (vec (second m)) othis (first oparams)\n"
+    "                                           this (if (= othis '_) (gensym \"this\") othis)\n"
+    "                                           params (assoc oparams 0 this)\n"
     "                                           body (map (fn [x] (cljc/deftype-walk x fset mset this)) (drop 2 m))]\n"
     "                                       `(~params ~@body)))\n"
     "                                   (second g))]\n"
@@ -8003,14 +8043,8 @@ static const char *PRELUDE =
     "(def unchecked-int int) (def unchecked-long int) (def unchecked-byte int)\n"
     "(def unchecked-short int) (def unchecked-char int)\n"
     "(def unchecked-float float) (def unchecked-double double)\n"
-    /* arrays modelled as vectors */
-    "(defn to-array [coll] (vec coll))\n"
-    "(defn into-array ([coll] (vec coll)) ([_t coll] (vec coll)))\n"
-    "(defn make-array [_ & dims] (vec (repeat (first dims) nil)))\n"
-    "(defn object-array [x] (if (number? x) (vec (repeat x nil)) (vec x)))\n"
-    "(defn aclone [a] (vec a))\n"
-    "(def boolean-array vec) (def char-array vec) (def double-array vec)\n"
-    "(def long-array vec) (def int-array vec) (def float-array vec) (def short-array vec) (def byte-array vec)\n"
+    /* array coercions are identity; the *-array CONSTRUCTORS are defined later,
+       after cljc's real (transient-backed, mutable) int-array exists */
     "(def booleans identity) (def chars identity) (def doubles identity) (def longs identity)\n"
     "(def ints identity) (def floats identity) (def shorts identity) (def bytes identity)\n"
     /* misc */
@@ -8038,10 +8072,6 @@ static const char *PRELUDE =
     "(defn hash-ordered-coll [c] (hash (vec c))) (defn hash-unordered-coll [c] (hash (set c)))\n"
     "(defn hash-combine [a b] (bit-xor (hash a) (hash b)))\n"
     "(defn pop! [coll] coll) (defn random-sample ([_ coll] coll) ([_ coll _] coll))\n"
-    /* array element setters: cljc arrays are immutable vectors — return the value */
-    "(defn aset [a i v] v) (defn aset-int [_ _ v] v) (defn aset-long [_ _ v] v)\n"
-    "(defn aset-double [_ _ v] v) (defn aset-float [_ _ v] v) (defn aset-boolean [_ _ v] v)\n"
-    "(defn aset-byte [_ _ v] v) (defn aset-char [_ _ v] v) (defn aset-short [_ _ v] v)\n"
     /* chunked-seq stubs (cljc seqs are unchunked) */
     "(defn chunk-buffer [_] (atom [])) (defn chunk-append [b x] (swap! b conj x) nil)\n"
     "(defn chunk [b] (deref b)) (defn chunk-cons [c s] (concat c s))\n"
@@ -8112,6 +8142,17 @@ static const char *PRELUDE =
     "(defn aget [a i] (a i))\n"
     "(defn aset [a i v] (assoc! a i v) v)\n"
     "(defn alength [a] (count a))\n"
+    /* remaining array constructors / ops as transient (mutable) arrays */
+    "(def double-array int-array) (def float-array int-array) (def short-array int-array)\n"
+    "(def char-array int-array) (def boolean-array int-array)\n"
+    "(defn make-array [_ & dims] (int-array (first dims)))\n"
+    "(defn to-array [coll] (int-array (vec coll)))\n"
+    "(defn into-array ([coll] (int-array (vec coll))) ([_t coll] (int-array (vec coll))))\n"
+    "(defn aclone [a] (int-array (vec a)))\n"
+    "(defn aset-int [a i v] (aset a i v)) (defn aset-long [a i v] (aset a i v))\n"
+    "(defn aset-double [a i v] (aset a i v)) (defn aset-float [a i v] (aset a i v))\n"
+    "(defn aset-boolean [a i v] (aset a i v)) (defn aset-byte [a i v] (aset a i v))\n"
+    "(defn aset-char [a i v] (aset a i v)) (defn aset-short [a i v] (aset a i v))\n"
     /* image-writing stubs: visualization code runs, no PNGs produced */
     "(def BufferedImage/TYPE_3BYTE_BGR 5)\n"
     "(def BufferedImage/TYPE_INT_RGB 1)\n"
@@ -8201,6 +8242,14 @@ static const char *PRELUDE =
     "(defn .get\n"
     "  ([x] (if (= :atom (type x)) (deref x) x))\n"
     "  ([m k] (get m k)) ([m k d] (get m k d)))\n"
+    /* clojure.lang.{Associative,Indexed,IDeref,Map} interop (sci.impl.faster) */
+    "(defn .assoc [m k v] (assoc m k v))\n"
+    "(defn .nth ([c i] (nth c i)) ([c i d] (nth c i d)))\n"
+    "(defn .valAt ([m k] (get m k)) ([m k d] (get m k d)))\n"
+    "(defn .deref [r] (deref r))\n"
+    "(defn .idx [x] (:idx x))\n"   /* BindingNode field via (.idx node) in :clj */
+    "(defn .containsKey [m k] (contains? m k))\n"
+    "(defn .entryAt [m k] (find m k))\n"
     "(defn .set [x v] (when (= :atom (type x)) (reset! x v)) nil)\n"
     "(defn .remove [& _] nil)\n"
     /* exception accessors (cljc errors carry :message/:data; ex-* read them) */
@@ -9102,7 +9151,9 @@ CljcEnv *cljc_new_env(void) {
         "       ~@(map (fn [g]\n"
         "                (let [mn (first g)\n"
         "                      arities (map (fn [m]\n"
-        "                                     (let [params (vec (second m)) this (first (second m))\n"
+        "                                     (let [oparams (vec (second m)) othis (first oparams)\n"
+        "                                           this (if (= othis '_) (gensym \"this\") othis)\n"
+        "                                           params (assoc oparams 0 this)\n"
         "                                           body (map (fn [x] (cljc/deftype-walk x fset #{} this)) (drop 2 m))]\n"
         "                                       `(~params ~@body)))\n"
         "                                   (second g))]\n"

@@ -8442,7 +8442,9 @@ static const char *PRELUDE =
     /* a protocol resolves to a vector of its method symbols (see defprotocol);
        instance? against one means "does x's type implement it" = satisfies?.
        A host/deftype class resolves to a type keyword: plain type equality. */
-    "(defn instance? [c x] (if (vector? c) (satisfies? c x) (= c (type x))))\n"
+    /* protocol (a vector of method syms) -> satisfies?; a class keyword -> the
+       type ISA the class, so a supertype like Number matches an int/double too. */
+    "(defn instance? [c x] (if (vector? c) (satisfies? c x) (isa? (type x) c)))\n"
     "(defn nnext [s] (next (next s)))\n"
     "(defn find [m k] (when (contains? m k) [k (get m k)]))\n"
     "(defn reduced [x] (cons '**reduced** (cons x nil)))\n"
@@ -8528,6 +8530,9 @@ static const char *PRELUDE =
     "           :clojure.lang.PersistentHashMap :clojure.lang.IPersistentCollection]] (derive :map c))\n"
     "(doseq [c [:clojure.lang.IPersistentSet :clojure.lang.PersistentHashSet\n"
     "           :clojure.lang.IPersistentCollection]] (derive :set c))\n"
+    /* cljc's numeric types are java.lang.Number subclasses, so (instance? Number n)
+       holds — Emmy's v/number? checks exactly this */
+    "(doseq [t [:int :double :bigint :ratio]] (derive t :number))\n"
     "(defn every-pred [& ps]\n"
     "  (fn [& args] (every? (fn [p] (every? p args)) ps)))\n"
     "(defn some-fn [& ps]\n"

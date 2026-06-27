@@ -4151,6 +4151,23 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         valf = valf->as.cons.tail;
                     Cljc *val = eval(env, valf->as.cons.head);
                     env_define_root(env_root(env), name, val);  /* def is always global */
+                    /* Attach :name metadata to a def'd function (fresh per defn, so
+                     * no shared-cell hazard) the first time it's named, so
+                     * (:name (meta (resolve sym))) works for potemkin-style
+                     * import-def without cljc having real vars. */
+                    if (val != NIL && val->tag == CLJC_FN) {
+                        bool has_name = false;
+                        if (val->meta && val->meta->tag == CLJC_MAP) {
+                            Cljc *tmp; has_name = map_find(val->meta, mk_kw(intern("name", 4)), &tmp);
+                        }
+                        if (!has_name) {
+                            const char *slash = strrchr(name, '/');
+                            const char *bare = slash ? slash + 1 : name;
+                            Cljc *m = (val->meta && val->meta->tag == CLJC_MAP) ? val->meta : mk_map();
+                            val->meta = map_assoc(m, mk_kw(intern("name", 4)),
+                                                  mk_sym(intern(bare, strlen(bare))));
+                        }
+                    }
                     return val;
                 }
                 if (s == SYM_LET) {
@@ -6430,7 +6447,10 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *v = argv[0];
     Cljc *m = argv[1];
     if (m != NIL && m->tag != CLJC_MAP) cljc_error("with-meta: meta must be a map");
-    if (v == NIL) cljc_error("with-meta: nil cannot carry metadata");
+    /* nil is lenient (Clojure throws): reader metadata is advisory and notebook
+     * annotations ^{:nextjournal.clerk/visibility ..} land on forms that are nil
+     * here (e.g. a stubbed ->clerk-only). Other non-IObj types still error. */
+    if (v == NIL) return NIL;
     switch (v->tag) {
         case CLJC_LIST: case CLJC_VECTOR: case CLJC_MAP: case CLJC_SET:
         case CLJC_FN: case CLJC_SYMBOL: case CLJC_STRING: break;

@@ -3468,12 +3468,14 @@ static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
 
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     cljc_check_stack();   /* raise a catchable error before the C stack overflows */
+    /* NATIVE/FN are the overwhelmingly common cases — check them before VAR so
+     * the hot path (every +, <, fn call) doesn't pay an extra branch. */
+    if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
     if (fn->tag == CLJC_VAR) {     /* a Var is IFn: call its current value */
         Binding *b = root_find(env_root(env), fn->as.var.name, NULL);
         if (b && b->value != fn) return apply(env, b->value, argv, nargs);
         cljc_error("var is unbound or not callable");
     }
-    if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
     if (fn->tag == CLJC_FN) {
         /* volatile: when recur swaps argv to the sentinel's (possibly heap-
          * spilled) value array, this slot is the cell's only GC root — the

@@ -121,6 +121,9 @@ typedef enum {
                      * demote back to CLJC_INT, so the common case never allocates */
     CLJC_RATIO,     /* exact rational num/den (each INT or BIGINT), den>0, gcd-
                      * reduced, den!=1 (den==1 demotes to the integer) */
+    CLJC_VAR,       /* a Var: a named reference to a global binding. Derefs to the
+                     * binding's current value, is IFn (calls the value), and
+                     * carries {:name :ns} metadata — what (resolve sym) returns */
 } CljcTag;
 
 typedef struct Cljc Cljc;
@@ -171,6 +174,7 @@ struct Cljc {
          * mag[n-1] != 0 (never stored as zero — zero demotes to CLJC_INT). */
         struct { int sign; uint32_t n; uint32_t *mag; } big;
         struct { Cljc *num; Cljc *den; } ratio;   /* CLJC_RATIO */
+        struct { const char *name; } var;          /* CLJC_VAR: canonical binding name */
         struct { Cljc *thunk; Cljc *cached; bool done; } lazy;
         /* recur sentinel: up to 3 values inline (covers real loops);
          * wider recurs spill to a heap array stored in iv[0]. */
@@ -3438,6 +3442,11 @@ static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
 
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     cljc_check_stack();   /* raise a catchable error before the C stack overflows */
+    if (fn->tag == CLJC_VAR) {     /* a Var is IFn: call its current value */
+        Binding *b = root_find(env_root(env), fn->as.var.name, NULL);
+        if (b && b->value != fn) return apply(env, b->value, argv, nargs);
+        cljc_error("var is unbound or not callable");
+    }
     if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
     if (fn->tag == CLJC_FN) {
         /* volatile: when recur swaps argv to the sentinel's (possibly heap-
@@ -3727,7 +3736,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL: case CLJC_EMPTY:
-        case CLJC_BIGINT: case CLJC_RATIO:
+        case CLJC_BIGINT: case CLJC_RATIO: case CLJC_VAR:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
@@ -4379,6 +4388,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); if (readably) sb_putc(sb, 'N'); free(s); } break;
         case CLJC_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
             sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
+        case CLJC_VAR: sb_puts(sb, "#'"); sb_puts(sb, v->as.var.name); break;
         case CLJC_DOUBLE: {
             char tmp[32];
             snprintf(tmp, sizeof tmp, "%g", v->as.d);
@@ -6393,6 +6403,27 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
     return b ? b->value : NIL;
 }
 
+/* (cljc/resolve-var name) -> a Var (named reference to the binding) or nil. The
+ * Var derefs to the binding's CURRENT value (so it tracks redefs) and carries
+ * {:name :ns} metadata — this is what the public resolve / (var x) / #'x give,
+ * so reflective code like potemkin's import-def can read a def's name. */
+static Cljc *prim_resolve_var(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    const char *raw = as_str(argv[0], "resolve");
+    const char *name = intern(raw, strlen(raw));
+    Binding *b = root_find(env_root(env), name, NULL);
+    if (!b) return NIL;
+    Cljc *v = alloc(CLJC_VAR);
+    v->as.var.name = b->name;
+    const char *slash = strrchr(b->name, '/');
+    const char *bare = slash ? slash + 1 : b->name;
+    Cljc *m = map_assoc(mk_map(), mk_kw(intern("name", 4)), mk_sym(intern(bare, strlen(bare))));
+    if (slash)
+        m = map_assoc(m, mk_kw(intern("ns", 2)), mk_sym(intern(b->name, (size_t)(slash - b->name))));
+    v->meta = m;
+    return v;
+}
+
 /* (cljc/eval-forms* src) — read and eval each top-level form in turn (NOT
  * read-all-then-eval), so a leading (ns ..) is active when later forms are
  * READ — their bare refs to ns-local defs then resolve. cur_reader_ns is
@@ -6538,6 +6569,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_INT: n = "int"; break;
         case CLJC_BIGINT: n = "bigint"; break;
         case CLJC_RATIO: n = "ratio"; break;
+        case CLJC_VAR: n = "var"; break;
         case CLJC_DOUBLE: n = "double"; break;
         case CLJC_STRING: n = "string"; break;
         case CLJC_CHAR: n = "char"; break;
@@ -6681,6 +6713,10 @@ static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
     (void)nargs;
     Cljc *v = argv[0];
     if (v != NIL && v->tag == CLJC_ATOM) return v->as.atom.value;
+    if (v != NIL && v->tag == CLJC_VAR) {     /* deref a Var -> its current value */
+        Binding *b = root_find(env_root(env), v->as.var.name, NULL);
+        return b ? b->value : NIL;
+    }
     if (v != NIL && v->tag == CLJC_MAP) {
         /* CljcDelay: force in C, independent of the multimethod table — a
          * library that redefines `deref` as a defmulti resets that table, so
@@ -8956,14 +8992,17 @@ static const char *PRELUDE =
     /* (Object.) is used as a unique sentinel; a fresh atom is a clean identity
        object that never equals read data. */
     "(defn Object. [] (atom nil))\n"
-    /* cljc has no var objects: #'x => (var x) resolves to x's value (or nil if
-       unbound) — enough for #'fn references in data-reader tables etc. */
-    "(defmacro var [s] `(cljc/resolve-maybe ~(str s)))\n"
-    /* resolve/ns-resolve: cljc has no var objects, so these return the bound
-       VALUE (or nil) rather than a var. */
-    "(defn resolve ([sym] (cljc/resolve-maybe (str sym))) ([_ns sym] (cljc/resolve-maybe (str sym))))\n"
+    /* #'x => (var x) => a Var (IFn + IDeref, carries {:name :ns} metadata).
+       resolve/ns-resolve/requiring-resolve return a Var too (Clojure semantics);
+       a Var calls its value in call position and @-derefs to it, so most uses
+       work unchanged while reflective code (import-def) can read :name. */
+    "(defmacro var [s] `(cljc/resolve-var ~(str s)))\n"
+    "(defn resolve ([sym] (cljc/resolve-var (str sym))) ([_ns sym] (cljc/resolve-var (str sym))))\n"
     "(def ns-resolve resolve)\n"
-    "(defn requiring-resolve [sym] (cljc/resolve-maybe (str sym)))\n"
+    "(defn requiring-resolve [sym] (cljc/resolve-var (str sym)))\n"
+    "(defn var? [x] (= (type x) :var))\n"
+    "(defn var-get [v] (deref v))\n"
+    "(defn find-var [sym] (cljc/resolve-var (str sym)))\n"
     /* alter-meta!/reset-meta!: a deftype with a mutable :meta field (e.g. SCI's
        Var/Namespace) keeps its metadata in a :meta atom — mutate that. */
     "(defn alter-meta! [r f & args]\n"
@@ -9155,7 +9194,7 @@ static const char *PRELUDE =
     "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
     "(defn ifn? [x] (or (fn? x) (keyword? x) (symbol? x) (map? x) (set? x) (vector? x)))\n"
-    "(defn var? [_] false)\n"   /* cljc has no first-class var objects */
+    /* var? is a real predicate now (see CLJC_VAR / resolve-var above) */
     /* java.util.Iterator over any seqable, as a seq cursor in an atom */
     "(defn .iterator [coll] (atom (seq coll)))\n"
     "(defn .hasNext [it] (boolean (seq (deref it))))\n"
@@ -9268,6 +9307,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/in-ns*", prim_in_ns);
     cljc_define_native(e, "cljc/ns-publics*", prim_ns_publics);
     cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
+    cljc_define_native(e, "cljc/resolve-var", prim_resolve_var);
     cljc_define_native(e, "macroexpand-1", prim_macroexpand_1);
     cljc_define_native(e, "cljc/eval-forms*", prim_eval_forms);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);

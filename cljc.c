@@ -8926,6 +8926,7 @@ static const char *PRELUDE =
     "(def Character :char) (def Boolean :bool) (def Number :int)\n"
     "(def Long :int) (def Integer :int) (def Double :double)\n"
     "(def Float :double) (def Byte :int) (def Short :int) (def Number :number)\n"
+    "(def Keyword :keyword) (def Symbol :symbol) (def String :string) (def Boolean :bool) (def Character :char)\n"
     "(def BigInt :bigint) (def BigInteger :bigint) (def BigDecimal :double) (def Ratio :ratio)\n"
     /* host exception/error classes (catch dispatch values, sci class tables) */
     "(def Exception :Exception) (def Throwable :Throwable) (def Error :Error)\n"
@@ -9075,14 +9076,24 @@ static const char *PRELUDE =
     /* (:import clojure.lang.Foo (java.io Bar Baz)) — bind each short class name
        to a keyword token so code that names the class loads. cljc has no real
        classes; the value just needs to be a stable, distinct placeholder. */
+    /* well-known host scalar classes map to cljc's OWN type keywords, so a
+       (defmethod f [Keyword] ..) dispatches on the same value (type x) yields —
+       this is what makes Emmy's generic-op derivative dispatch (g/add :dfdx) hit. */
+    "(def cljc/class->kind {\"Keyword\" :keyword \"Symbol\" :symbol \"String\" :string\n"
+    "  \"Long\" :int \"Integer\" :int \"BigInt\" :bigint \"BigInteger\" :bigint \"Ratio\" :ratio\n"
+    "  \"Double\" :double \"Float\" :double \"Number\" :number \"Boolean\" :bool \"Character\" :char\n"
+    /* all the host fn classes collapse to cljc's single :fn type, so an
+       (extend-type MultiFn ..) etc. applies to every cljc function */
+    "  \"AFunction\" :fn \"Fn\" :fn \"RestFn\" :fn \"MultiFn\" :fn \"IFn\" :fn \"AFn\" :fn\n"
+    "  \"Var\" :var})\n"
     "(defn cljc/import-one [spec]\n"
     "  (when spec\n"
     "  (if (or (list? spec) (vector? spec) (seq? spec))\n"
     "    (let [pkg (str (first spec))]\n"
     "      (doseq [c (rest spec)]\n"
-    "        (eval (list 'def (symbol (str c)) (keyword (str pkg \".\" c))))))\n"
-    "    (let [s (str spec)]\n"
-    "      (eval (list 'def (symbol (last (str/split s #\"\\.\"))) (keyword s)))))))\n"
+    "        (eval (list 'def (symbol (str c)) (or (cljc/class->kind (str c)) (keyword (str pkg \".\" c)))))))\n"
+    "    (let [s (str spec) short (last (str/split s #\"\\.\"))]\n"
+    "      (eval (list 'def (symbol short) (or (cljc/class->kind short) (keyword s))))))))\n"
     "(defn cljc/require-one [spec]\n"
     "  (when spec\n"   /* a #?(:cljs ..)-only spec reads as nil under cljc */
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
@@ -9844,6 +9855,10 @@ CljcEnv *cljc_new_env(void) {
         "                                      \" for \" (pr-str dv#)) {}))))))\n"
         "         {:cljc/mm-key '~key})))))\n"
         "(defmacro defmethod [name dval params & body]\n"
+        /* peel reader metadata off the multimethod name (e.g. defgeneric passes
+           ^:no-doc add): otherwise ~name evaluates to (with-meta add ..), losing
+           the :cljc/mm-key and keying the method under the wrong table entry */
+        "  (let [name (loop [n name] (if (and (seq? n) (= 'with-meta (first n))) (recur (second n)) n))]\n"
         /* skip a host-class dispatch value (dotted / $-inner-class) that cljc
            can't resolve — it would never match anyway; bare typos still error */
         "  (if (and (symbol? dval)\n"
@@ -9856,7 +9871,7 @@ CljcEnv *cljc_new_env(void) {
     "    `(let [mm# ~name\n"
         "           key# (or (:cljc/mm-key (meta mm#)) (cljc/mmk '~name))]\n"
         "       (swap! cljc/multi-tables update key# assoc ~dval (fn ~params ~@body))\n"
-        "       mm#)))\n"
+        "       mm#))))\n"
         /* multimethod API: cljc has no dispatch hierarchy, so preferences are
            moot; the rest operate on the flat method table. */
         "(defn prefer-method [& _] nil)\n"

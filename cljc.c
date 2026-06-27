@@ -4509,7 +4509,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_MAP: {
             /* a StringBuilder ({:cljc/type :StringBuilder :v <atom-of-string>})
              * renders as its accumulated content — so (str sb) gives the token */
-            Cljc *ty;
+            Cljc *ty = NULL;
             if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty) &&
                 ty == mk_kw(intern("StringBuilder", 13))) {
                 Cljc *vv;
@@ -4519,6 +4519,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                     sb_puts(sb, vv->as.atom.value->as.str);
                 break;
             }
+            (void)ty;
             sb_putc(sb, '{');
             bool first = true;
             for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
@@ -8351,6 +8352,10 @@ static const char *PRELUDE =
     "    (if static?\n"
     "      (cons (symbol (str s \"/\" (first m))) (rest m))\n"
     "      (cons (symbol (str \".\" (first m))) (cons target (rest m))))))\n"
+    /* (.. x a (b c) ..) threads interop: (.. x a b) => (. (. x a) b) */
+    "(defmacro .. [x & forms] (reduce (fn [acc f] (list '. acc f)) x forms))\n"
+    "(defn .getClass [x] (type x))\n"
+    "(defn .isInstance [k o] (isa? (type o) k))\n"
     "(defmacro let* [& body] (cons 'let body))\n"
     "(defmacro loop* [& body] (cons 'loop body))\n"
     "(defmacro when-not [test & body] `(when (not ~test) ~@body))\n"

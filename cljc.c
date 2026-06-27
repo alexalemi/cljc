@@ -5130,6 +5130,19 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         case CLJC_STRING: return strcmp(a->as.str, b->as.str) == 0;
         case CLJC_CHAR: return a->as.chr == b->as.chr;
         case CLJC_MAP: {
+            /* a deftype with a custom equiv/equals (e.g. DataScript's Datom
+             * compares only e/a/v/tx, ignoring its mutable hash/idx cache fields)
+             * defines its own equality — Clojure's = dispatches to equiv, so
+             * field-by-field map comparison is wrong for it. */
+            { Cljc *ty;
+              static const char *KW_CT; if (!KW_CT) KW_CT = intern("cljc/type", 9);
+              if (map_find(a, mk_kw(KW_CT), &ty)) {
+                  Cljc *barg[1] = { b }, *out;
+                  if (dispatch_deftype_method(gc_root_envs[0], a, "equiv", barg, 1, &out) ||
+                      dispatch_deftype_method(gc_root_envs[0], a, "equals", barg, 1, &out))
+                      return is_truthy(out);
+              }
+            }
             if (a->as.map.count != b->as.map.count) return false;
             for (Cljc *e = map_entry_list(a); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
                 Cljc *bv;
@@ -6909,6 +6922,16 @@ static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_reset(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    /* a deftype with its own atom semantics (a `deref` + `cljc/cas` method, e.g.
+     * DataScript's Conn via extend-clj/deftype-atom): reset! = cas(@x, v). */
+    if (argv[0] != NIL && argv[0]->tag == CLJC_MAP) {
+        Cljc *old, *casout;
+        if (dispatch_deftype_method(env, argv[0], "deref", NULL, 0, &old)) {
+            Cljc *cargs[2] = { old, argv[1] };
+            if (dispatch_deftype_method(env, argv[0], "cljc/cas", cargs, 2, &casout))
+                return argv[1];
+        }
+    }
     Cljc *a = as_atom(argv[0], "reset!");
     Cljc *v = argv[1];
     a->as.atom.value = v;
@@ -6917,6 +6940,20 @@ static Cljc *prim_reset(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_swap(CljcEnv *env, Cljc **argv, int nargs) {
     /* (swap! a f x y) => sets a to (f @a x y), returns the new value. */
+    /* deftype atom (Conn): new = (apply f @x args); cas(@x, new). */
+    if (argv[0] != NIL && argv[0]->tag == CLJC_MAP) {
+        Cljc *old;
+        if (dispatch_deftype_method(env, argv[0], "deref", NULL, 0, &old)) {
+            size_t b = vsp;
+            vpush(old);
+            for (int i = 2; i < nargs; i++) vpush(argv[i]);
+            Cljc *nv = apply(env, argv[1], &vstack[b], (int)(vsp - b));
+            vsp = b;
+            Cljc *cargs[2] = { old, nv }, *casout;
+            if (dispatch_deftype_method(env, argv[0], "cljc/cas", cargs, 2, &casout))
+                return nv;
+        }
+    }
     Cljc *a = as_atom(argv[0], "swap!");
     Cljc *f = argv[1];
     size_t base = vsp;
@@ -8406,6 +8443,8 @@ static const char *PRELUDE =
     "(defmacro let* [& body] (cons 'let body))\n"
     "(defmacro loop* [& body] (cons 'loop body))\n"
     "(defmacro when-not [test & body] `(when (not ~test) ~@body))\n"
+    /* locking: cljc is single-threaded, so it just runs the body */
+    "(defmacro locking [_ & body] `(do ~@body))\n"
     "(defmacro -> [x & forms]\n"
     "  (loop [x x forms forms]\n"
     "    (if (empty? forms)\n"
@@ -9541,7 +9580,13 @@ static const char *PRELUDE =
     /* java.util.Iterator over any seqable, as a seq cursor in an atom */
     "(defn .iterator [coll] (atom (seq coll)))\n"
     "(defn .hasNext [it] (boolean (seq (deref it))))\n"
-    "(defn .next [it] (let [s (seq (deref it))] (reset! it (rest s)) (first s)))\n"
+    /* .next is overloaded: a mutable iterator (an atom cursor) advances and
+       returns its head; on a seq/list it's clojure.lang.ISeq.next (DataScript's
+       (.next xs)). Dispatch on whether the arg is the atom cursor. */
+    "(defn .next [it] (if (identical? (type it) :atom)\n"
+    "                   (let [s (seq (deref it))] (reset! it (rest s)) (first s))\n"
+    "                   (next it)))\n"
+    "(defn .cons [xs x] (cons x xs))\n"   /* clojure.lang.ISeq.cons */
     /* trampoline: call f; while it returns a fn, keep calling it (stack-safe
      * via recur). Clojure's idiom for mutual recursion without proper TCO. */
     "(defn trampoline\n"

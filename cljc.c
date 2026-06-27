@@ -6531,14 +6531,13 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *v = argv[0];
     Cljc *m = argv[1];
     if (m != NIL && m->tag != CLJC_MAP) cljc_error("with-meta: meta must be a map");
-    /* nil is lenient (Clojure throws): reader metadata is advisory and notebook
-     * annotations ^{:nextjournal.clerk/visibility ..} land on forms that are nil
-     * here (e.g. a stubbed ->clerk-only). Other non-IObj types still error. */
-    if (v == NIL) return NIL;
-    switch (v->tag) {
+    /* Lenient (Clojure throws on a non-IObj): metadata is advisory, and libraries
+     * attach it to immutable scalars they treat as values (Emmy on a ratio
+     * coefficient, notebook annotations on nil). Pass the value through. */
+    switch (v == NIL ? CLJC_NIL : v->tag) {
         case CLJC_LIST: case CLJC_VECTOR: case CLJC_MAP: case CLJC_SET:
         case CLJC_FN: case CLJC_SYMBOL: case CLJC_STRING: break;
-        default: cljc_error("with-meta: this type cannot carry metadata");
+        default: return v;
     }
     Cljc *c = alloc(v->tag);
     c->as = v->as;

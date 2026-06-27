@@ -952,7 +952,7 @@
 (assert= nil (meta [1]))
 (assert= [1] (with-meta [1] {:k :v}))                ; meta invisible to =
 (assert= {:a 1 :b 2} (meta (vary-meta (with-meta [] {:a 1}) assoc :b 2)))
-(assert= :no (try (with-meta 42 {}) (catch Exception e :no)))
+(assert= 42 (with-meta 42 {}))   ; lenient: metadata on an immutable scalar is ignored, not an error
 (require '[clojure.zip :as z])
 (def zt (z/vector-zip [1 [2 3] 4]))
 (assert= 3 (-> zt z/down z/right z/down z/right z/node))

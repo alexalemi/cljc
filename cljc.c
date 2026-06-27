@@ -2345,9 +2345,11 @@ static Cljc *read_form(const char **p) {
     }
     if (c == '~') {
         (*p)++;
-        const char *tag = "unquote";
-        size_t taglen = 7;
-        if (**p == '@') { (*p)++; tag = "unquote-splicing"; taglen = 16; }
+        /* qualified like Clojure (and like @ -> clojure.core/deref above), so
+         * code that inspects the form (e.g. Emmy's unquote?) sees the same head */
+        const char *tag = "clojure.core/unquote";
+        size_t taglen = 20;
+        if (**p == '@') { (*p)++; tag = "clojure.core/unquote-splicing"; taglen = 29; }
         Cljc *form = read_form(p);
         return mk_cons(mk_sym(intern(tag, taglen)), mk_cons(form, NIL));
     }
@@ -3655,7 +3657,7 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
  * (no level counting, no auto-gensym #-suffixes, no namespace resolution). */
 static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
     static const char *SYM_UQ, *SYM_UQS;
-    if (!SYM_UQ) { SYM_UQ = intern("unquote", 7); SYM_UQS = intern("unquote-splicing", 16); }
+    if (!SYM_UQ) { SYM_UQ = intern("clojure.core/unquote", 20); SYM_UQS = intern("clojure.core/unquote-splicing", 29); }
 
     if (form == NULL || form == NIL) return NIL;
 
@@ -8724,6 +8726,15 @@ static const char *PRELUDE =
     "(defn System/getProperty ([k] nil) ([k d] d))\n"
     "(defn System/exit [n] nil)\n"
     "(defn System/currentTimeMillis [] 0)\n"
+    /* Apache Commons Math integer gcd, used by Emmy's rational-function simplifier */
+    "(defn ArithmeticUtils/gcd [a b]\n"
+    "  (let [a (if (neg? a) (- a) a) b (if (neg? b) (- b) b)]\n"
+    "    (loop [a a b b] (if (zero? b) a (recur b (rem a b))))))\n"
+    "(defn biginteger [x] x)\n"
+    "(defn .gcd [a b] (ArithmeticUtils/gcd a b))\n"
+    /* stopwatch.core/start returns an elapsed-nanos fn; cljc has no real clock,
+       so report 0 (Emmy's simplifier stopwatch then never times out) */
+    "(defn stopwatch.core/start [] (constantly 0))\n"
     "(def cljc/uuid-counter (atom 0))\n"
     "(defn UUID/randomUUID [] (symbol (str \"uuid-\" (swap! cljc/uuid-counter inc))))\n"
     "(defn random-uuid [] (UUID/randomUUID))\n"

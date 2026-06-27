@@ -124,6 +124,11 @@ typedef enum {
     CLJC_VAR,       /* a Var: a named reference to a global binding. Derefs to the
                      * binding's current value, is IFn (calls the value), and
                      * carries {:name :ns} metadata — what (resolve sym) returns */
+    CLJC_SORTED,    /* sorted set/map: comparator-ordered. A persistent vector of
+                     * entries kept in comparator order (set: the element; map: a
+                     * [k v] MapEntry vector) + the comparator (NIL = default).
+                     * Key identity is "cmp == 0", not =, so custom comparators
+                     * collapse cmp-equal keys. O(log n) reads, O(n) writes. */
 } CljcTag;
 
 typedef struct Cljc Cljc;
@@ -157,6 +162,9 @@ struct Cljc {
                  uint8_t shift; uint8_t taillen; bool alive; } vec;
         /* HAMT persistent map: root tree node (NULL when empty) + entry count */
         struct { Cljc *root; size_t count; } map;
+        /* sorted set/map: items is a persistent vector of entries in comparator
+         * order; cmp is the comparator fn (NIL = default cmp_values). */
+        struct { Cljc *items; Cljc *cmp; bool is_map; } sorted;
         /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
          * subnode. Collision nodes hold same-hash entries linearly. */
         struct { Cljc **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
@@ -224,6 +232,12 @@ static Cljc *to_seq(Cljc *v);
 static Cljc *seq1(Cljc *v);
 static Cljc *seq1_slot(Cljc **slot);
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs);
+static Cljc *sorted_entry_list(Cljc *coll);
+static bool sorted_get(CljcEnv *env, Cljc *coll, Cljc *key, Cljc **out);
+static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *entry);
+static Cljc *sorted_remove(CljcEnv *env, Cljc *coll, Cljc *key);
+static size_t sorted_bsearch(CljcEnv *env, Cljc *coll, Cljc *key, bool *found);
+static Cljc *mk_map_entry(Cljc *k, Cljc *v);
 static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs);
 static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs);
 static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs);
@@ -800,6 +814,10 @@ static void gc_drain(void) {
             case CLJC_SET:
                 mark_push(v->as.map.root);          /* NULL-safe */
                 break;
+            case CLJC_SORTED:
+                mark_push(v->as.sorted.items);
+                mark_push(v->as.sorted.cmp);
+                break;
             case CLJC_HNODE:
                 for (size_t i = 0; i < v->as.hnode.nkids; i++)
                     mark_push(v->as.hnode.kids[i]); /* NULL slots skip */
@@ -1143,6 +1161,17 @@ static uint32_t cljc_hash(Cljc *v) {
             for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
                 h += cljc_hash(e->as.cons.head->as.cons.head) * 31
                    + cljc_hash(e->as.cons.head->as.cons.tail);
+            return h;
+        }
+        case CLJC_SORTED: {  /* must match the hash of an equal hash set/map */
+            bool is_map = v->as.sorted.is_map;
+            uint32_t h = is_map ? 0 : 0xa5e3u;
+            Cljc *items = v->as.sorted.items;
+            for (size_t i = 0, n = vec_len(items); i < n; i++) {
+                Cljc *e = vec_nth(items, i);
+                Cljc *k = is_map ? vec_nth(e, 0) : e;
+                h += cljc_hash(k) * 31 + cljc_hash(is_map ? vec_nth(e, 1) : e);
+            }
             return h;
         }
         default:  /* fns, natives, atoms: identity hash (cells never move) */
@@ -3591,6 +3620,11 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
         if (set_contains(fn, a0, &out)) return out;
         return a1;
     }
+    if (fn->tag == CLJC_SORTED) {
+        Cljc *out;
+        if (sorted_get(env, fn, a0, &out)) return out;
+        return a1;
+    }
     if (fn->tag == CLJC_VECTOR || fn->tag == CLJC_TVEC) {  /* transients too */
         if (a0->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
         if (a0->as.i < 0 || (size_t)a0->as.i >= vec_len(fn))
@@ -3805,6 +3839,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
         case CLJC_BIGINT: case CLJC_RATIO: case CLJC_VAR:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
+        case CLJC_SORTED:  /* a constructed sorted coll has no reader literal */
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
         case CLJC_CHUNK:   /* internal; self-evaluates if it ever leaks */
             return form;
@@ -4590,6 +4625,25 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '}');
             break;
         }
+        case CLJC_SORTED: {
+            /* a sorted map's entries are [k v] vectors; a sorted set's are bare */
+            bool is_map = v->as.sorted.is_map;
+            sb_puts(sb, is_map ? "{" : "#{");
+            Cljc *items = v->as.sorted.items;
+            for (size_t i = 0, n = vec_len(items); i < n; i++) {
+                if (i) sb_puts(sb, is_map ? ", " : " ");
+                Cljc *e = vec_nth(items, i);
+                if (is_map) {
+                    print_to(sb, vec_nth(e, 0), readably);
+                    sb_putc(sb, ' ');
+                    print_to(sb, vec_nth(e, 1), readably);
+                } else {
+                    print_to(sb, e, readably);
+                }
+            }
+            sb_putc(sb, '}');
+            break;
+        }
         case CLJC_TVEC:  sb_puts(sb, "#<transient-vector>"); break;
         case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
         case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
@@ -5101,6 +5155,36 @@ static bool seq_eq(Cljc *a, Cljc *b) {
     }
 }
 
+/* A sorted set/map is = to a hash set/map (or another sorted coll) with the same
+ * contents — Clojure's = compares collections by category, not representation. */
+static size_t collcount_(Cljc *c) {
+    return c->tag == CLJC_SORTED ? vec_len(c->as.sorted.items) : c->as.map.count;
+}
+static bool setlike_member_(Cljc *s, Cljc *x) {
+    if (s->tag == CLJC_SET) return set_contains(s, x, NULL);
+    bool f; sorted_bsearch(gc_root_envs[0], s, x, &f); return f;
+}
+static bool setlike_eq_(Cljc *a, Cljc *b) {
+    if (collcount_(a) != collcount_(b)) return false;
+    Cljc *es = a->tag == CLJC_SORTED ? sorted_entry_list(a) : set_element_list(a);
+    for (Cljc *e = es; e != NIL; e = e->as.cons.tail)
+        if (!setlike_member_(b, e->as.cons.head)) return false;
+    return true;
+}
+static bool maplike_eq_(Cljc *a, Cljc *b) {
+    if (collcount_(a) != collcount_(b)) return false;
+    Cljc *es = a->tag == CLJC_SORTED ? sorted_entry_list(a) : map_entry_list(a);
+    for (Cljc *e = es; e != NIL; e = e->as.cons.tail) {
+        Cljc *entry = e->as.cons.head, *k, *v, *bv;
+        if (a->tag == CLJC_SORTED) { k = vec_nth(entry, 0); v = vec_nth(entry, 1); }
+        else { k = entry->as.cons.head; v = entry->as.cons.tail; }
+        if (b->tag == CLJC_MAP ? !map_find(b, k, &bv)
+                               : !sorted_get(gc_root_envs[0], b, k, &bv)) return false;
+        if (!cljc_eq(v, bv)) return false;
+    }
+    return true;
+}
+
 static bool cljc_eq(Cljc *a, Cljc *b) {
     if (a == b) return true;
     if (a == NULL || b == NULL) return false;
@@ -5109,6 +5193,16 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
     if (a_seq && b_seq)  /* to_seq also surfaces lazy tails hidden in lists */
         return seq_eq(a->tag == CLJC_VECTOR ? a : to_seq(a),
                       b->tag == CLJC_VECTOR ? b : to_seq(b));
+    /* sorted collections compare as their set/map category, across tags */
+    if (a->tag == CLJC_SORTED || b->tag == CLJC_SORTED) {
+        bool a_set = a->tag == CLJC_SET || (a->tag == CLJC_SORTED && !a->as.sorted.is_map);
+        bool b_set = b->tag == CLJC_SET || (b->tag == CLJC_SORTED && !b->as.sorted.is_map);
+        if (a_set && b_set) return setlike_eq_(a, b);
+        bool a_map = a->tag == CLJC_MAP || (a->tag == CLJC_SORTED && a->as.sorted.is_map);
+        bool b_map = b->tag == CLJC_MAP || (b->tag == CLJC_SORTED && b->as.sorted.is_map);
+        if (a_map && b_map) return maplike_eq_(a, b);
+        return false;
+    }
     if (a->tag != b->tag) {
         /* Clojure's = is category-sensitive across the numeric tower: an exact
          * integer never equals a floating-point value (only == crosses that),
@@ -5284,6 +5378,8 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
         return mk_int((int64_t)vec_len(argv[0]));
     if (tag == CLJC_MAP || tag == CLJC_SET)
         return mk_int((int64_t)argv[0]->as.map.count);
+    if (tag == CLJC_SORTED)
+        return mk_int((int64_t)vec_len(argv[0]->as.sorted.items));
     if (tag == CLJC_STRING) return mk_int((int64_t)strlen(argv[0]->as.str));
     cljc_error("count: not countable");
     return NIL;
@@ -5323,7 +5419,6 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     if (nargs == 0) return mk_empty_vec();   /* (conj) => [] */
     Cljc *r = argv[0];  /* nil works: conj onto nil yields a list */
     for (int i = 1; i < nargs; i++) {
@@ -5341,6 +5436,19 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
             if (prev->meta) r->meta = prev->meta;   /* queue tag etc. survive */
         } else if (r->tag == CLJC_SET) {
             r = set_conj(r, x);
+        } else if (r->tag == CLJC_SORTED) {
+            if (!r->as.sorted.is_map) r = sorted_put(env, r, x, x);
+            else if (x == NIL) { /* no-op */ }
+            else if (x->tag == CLJC_VECTOR && vec_len(x) == 2)
+                r = sorted_put(env, r, vec_nth(x, 0), mk_map_entry(vec_nth(x, 0), vec_nth(x, 1)));
+            else if (x->tag == CLJC_SORTED || x->tag == CLJC_MAP) {
+                for (Cljc *e = to_seq(x); e != NIL; e = e->as.cons.tail) {
+                    Cljc *kv = e->as.cons.head;   /* [k v] (sorted) or (k . v) (map) */
+                    Cljc *k2 = kv->tag == CLJC_VECTOR ? vec_nth(kv, 0) : kv->as.cons.head;
+                    Cljc *v2 = kv->tag == CLJC_VECTOR ? vec_nth(kv, 1) : kv->as.cons.tail;
+                    r = sorted_put(env, r, k2, mk_map_entry(k2, v2));
+                }
+            } else cljc_error("conj on sorted map: expected a [k v] entry or a map");
         } else if (r->tag == CLJC_MAP) {
             /* (conj m [k v]) and (conj m {k v ...}) — Clojure semantics; nil is
              * a no-op, and a 2-element seq is accepted like a vector entry. */
@@ -5423,8 +5531,9 @@ static Cljc *prim_apply(CljcEnv *env, Cljc **argv, int nargs) {
     }
 
 TYPE_PRED(nil_p,     v == NIL)
-TYPE_PRED(map_p,     v != NIL && v->tag == CLJC_MAP)
-TYPE_PRED(set_p,     v != NIL && v->tag == CLJC_SET)
+TYPE_PRED(map_p,     v != NIL && (v->tag == CLJC_MAP || (v->tag == CLJC_SORTED && v->as.sorted.is_map)))
+TYPE_PRED(set_p,     v != NIL && (v->tag == CLJC_SET || (v->tag == CLJC_SORTED && !v->as.sorted.is_map)))
+TYPE_PRED(sorted_p,  v != NIL && v->tag == CLJC_SORTED)
 TYPE_PRED(list_p,    v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_EMPTY))
 TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
 TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE || v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO))
@@ -5508,6 +5617,9 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
     } else if (coll != NIL && coll->tag == CLJC_SET) {
         Cljc *out;
         if (set_contains(coll, k, &out)) return out;
+    } else if (coll != NIL && coll->tag == CLJC_SORTED) {
+        Cljc *out;
+        if (sorted_get(env, coll, k, &out)) return out;
     } else if (coll != NIL && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)
                && k->tag == CLJC_INT) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
@@ -5535,6 +5647,9 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
             if (dispatch_deftype_method(env, r, "assoc", kv, 2, &out)) { r = out; continue; }
             r = map_assoc(r, k, v);
         }
+        else if (r->tag == CLJC_SORTED && r->as.sorted.is_map) {
+            r = sorted_put(env, r, k, mk_map_entry(k, v));
+        }
         else if (r->tag == CLJC_VECTOR) {
             if (k->tag != CLJC_INT || k->as.i < 0)
                 cljc_error("assoc on vector: index out of bounds");
@@ -5545,48 +5660,61 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
+    if (m->tag == CLJC_SORTED && m->as.sorted.is_map) {
+        for (int i = 1; i < nargs; i++) m = sorted_remove(env, m, argv[i]);
+        return m;
+    }
     if (m->tag != CLJC_MAP) cljc_error("dissoc: not a map");
     for (int i = 1; i < nargs; i++)
         m = map_dissoc_one(m, argv[i]);
     return m;
 }
 
-static Cljc *prim_keys(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
-    Cljc *m = argv[0];
-    if (m == NIL) return NIL;
-    if (m->tag != CLJC_MAP) cljc_error("keys: not a map");
+/* keys (kv=0) / vals (kv=1) for a hash or sorted map. */
+static Cljc *map_kv_list(Cljc *m, int kv) {
     Cljc *out = NIL, **t = &out;
-    for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-        *t = mk_cons(e->as.cons.head->as.cons.head, NIL);
-        t = &(*t)->as.cons.tail;
+    if (m->tag == CLJC_SORTED) {
+        Cljc *items = m->as.sorted.items;
+        for (size_t i = 0, n = vec_len(items); i < n; i++) {
+            *t = mk_cons(vec_nth(vec_nth(items, i), kv), NIL);
+            t = &(*t)->as.cons.tail;
+        }
+    } else {
+        for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            *t = mk_cons(kv ? e->as.cons.head->as.cons.tail : e->as.cons.head->as.cons.head, NIL);
+            t = &(*t)->as.cons.tail;
+        }
     }
     return out;
+}
+
+static Cljc *prim_keys(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *m = argv[0];
+    if (m == NIL) return NIL;
+    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("keys: not a map");
+    return map_kv_list(m, 0);
 }
 
 static Cljc *prim_vals(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
+    (void)env; (void)nargs;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag != CLJC_MAP) cljc_error("vals: not a map");
-    Cljc *out = NIL, **t = &out;
-    for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-        *t = mk_cons(e->as.cons.head->as.cons.tail, NIL);
-        t = &(*t)->as.cons.tail;
-    }
-    return out;
+    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("vals: not a map");
+    return map_kv_list(m, 1);
 }
 
 static Cljc *prim_contains_p(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     Cljc *coll = argv[0];
     Cljc *k = argv[1];
     if (coll == NIL) return FALSE;
     if (coll->tag == CLJC_MAP) return mk_bool(map_find(coll, k, NULL));
     if (coll->tag == CLJC_SET) return mk_bool(set_contains(coll, k, NULL));
+    if (coll->tag == CLJC_SORTED) {
+        bool found; sorted_bsearch(env, coll, k, &found); return mk_bool(found);
+    }
     if (coll->tag == CLJC_VECTOR)  /* contains? checks INDEX presence on vectors */
         return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
     cljc_error("contains?: not associative");
@@ -5594,15 +5722,28 @@ static Cljc *prim_contains_p(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     Cljc *r = NIL;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Cljc *m = argv[ai_];
         if (m == NIL) continue;
-        if (m->tag != CLJC_MAP) cljc_error("merge: not a map");
+        if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("merge: not a map");
         if (r == NIL) { r = m; continue; }
-        for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
-            r = map_assoc(r, e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail);
+        /* preserve the first map's type (a sorted map merges into a sorted map) */
+        if (m->tag == CLJC_SORTED) {
+            Cljc *items = m->as.sorted.items;
+            for (size_t i = 0, n = vec_len(items); i < n; i++) {
+                Cljc *e = vec_nth(items, i);
+                Cljc *pair[2] = { vec_nth(e, 0), vec_nth(e, 1) };
+                Cljc *ca[2] = { r, mk_vector(pair, 2) };
+                r = prim_conj(env, ca, 2);
+            }
+        } else {
+            for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+                Cljc *pair[2] = { e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail };
+                Cljc *ca[2] = { r, mk_vector(pair, 2) };
+                r = prim_conj(env, ca, 2);
+            }
+        }
     }
     return r;
 }
@@ -5743,6 +5884,7 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
+    if (v->tag == CLJC_SORTED) return sorted_entry_list(v);
     if (v->tag == CLJC_SET) return set_element_list(v);
     if (v->tag == CLJC_MAP) {
         /* A deftype implementing Seqable (its own `seq` method, e.g. instaparse's
@@ -6455,9 +6597,12 @@ static Cljc *prim_hash_set(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     Cljc *s = argv[0];
     if (s == NIL) return NIL;
+    if (s->tag == CLJC_SORTED && !s->as.sorted.is_map) {
+        for (int i = 1; i < nargs; i++) s = sorted_remove(env, s, argv[i]);
+        return s;
+    }
     if (s->tag != CLJC_SET) cljc_error("disj: not a set");
     for (int i = 1; i < nargs; i++)
         s = set_disj(s, argv[i]);
@@ -6998,6 +7143,172 @@ static int cmp_values(Cljc *a, Cljc *b) {
 static Cljc *prim_compare(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     return mk_int(cmp_values(argv[0], argv[1]));
+}
+
+/* ───── Sorted set/map (CLJC_SORTED) ───────────────────────────────────── */
+
+static Cljc *mk_sorted(Cljc *cmp, bool is_map) {
+    Cljc *s = alloc(CLJC_SORTED);
+    s->as.sorted.items = mk_empty_vec();
+    s->as.sorted.cmp = cmp;          /* NIL => default cmp_values */
+    s->as.sorted.is_map = is_map;
+    return s;
+}
+
+/* the comparison key of an entry: a set's element is its own key; a map entry
+ * is a [k v] vector keyed by element 0. */
+static Cljc *sorted_entry_key(Cljc *coll, Cljc *entry) {
+    return coll->as.sorted.is_map ? vec_nth(entry, 0) : entry;
+}
+
+static int sorted_cmp_call(CljcEnv *env, Cljc *coll, Cljc *a, Cljc *b) {
+    Cljc *cmp = coll->as.sorted.cmp;
+    if (cmp == NIL) return cmp_values(a, b);
+    Cljc *args[2] = { a, b };
+    Cljc *r = apply(env, cmp, args, 2);
+    if (r == NIL) return 0;
+    if (r->tag == CLJC_INT)    return r->as.i < 0 ? -1 : r->as.i > 0 ? 1 : 0;
+    if (r->tag == CLJC_DOUBLE) return r->as.d < 0 ? -1 : r->as.d > 0 ? 1 : 0;
+    if (is_truthy(r)) return -1;     /* boolean comparator: true => a before b */
+    Cljc *args2[2] = { b, a };
+    return is_truthy(apply(env, cmp, args2, 2)) ? 1 : 0;
+}
+
+/* first index whose key compares >= `key`; *found set when that key cmp==0. */
+static size_t sorted_bsearch(CljcEnv *env, Cljc *coll, Cljc *key, bool *found) {
+    Cljc *items = coll->as.sorted.items;
+    size_t lo = 0, hi = vec_len(items);
+    *found = false;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = sorted_cmp_call(env, coll, sorted_entry_key(coll, vec_nth(items, mid)), key);
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    if (lo < vec_len(items) &&
+        sorted_cmp_call(env, coll, sorted_entry_key(coll, vec_nth(items, lo)), key) == 0)
+        *found = true;
+    return lo;
+}
+
+static Cljc *sorted_clone(Cljc *coll, Cljc *items) {
+    Cljc *s = alloc(CLJC_SORTED);
+    s->as.sorted.items = items;
+    s->as.sorted.cmp = coll->as.sorted.cmp;
+    s->as.sorted.is_map = coll->as.sorted.is_map;
+    s->meta = coll->meta;
+    return s;
+}
+
+/* items with `entry` inserted at `at`, or (insert=false) the entry at `at` dropped. */
+static Cljc *sorted_splice(Cljc *items, size_t at, Cljc *entry, bool insert) {
+    size_t n = vec_len(items);
+    Cljc *out = mk_empty_vec();
+    for (size_t j = 0; j < at; j++) out = vec_conj1(out, vec_nth(items, j));
+    if (insert) out = vec_conj1(out, entry);
+    for (size_t j = at + (insert ? 0 : 1); j < n; j++) out = vec_conj1(out, vec_nth(items, j));
+    return out;
+}
+
+/* set conj / map assoc: insert `entry` for `key`, replacing any cmp-equal entry
+ * (map replaces the value; set keeps the existing element on a cmp-tie). */
+static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *entry) {
+    bool found;
+    size_t i = sorted_bsearch(env, coll, key, &found);
+    Cljc *items = coll->as.sorted.items;
+    if (found) {
+        if (!coll->as.sorted.is_map) return coll;     /* element already present */
+        Cljc *out = mk_empty_vec();
+        size_t n = vec_len(items);
+        for (size_t j = 0; j < n; j++)
+            out = vec_conj1(out, j == i ? entry : vec_nth(items, j));
+        return sorted_clone(coll, out);
+    }
+    return sorted_clone(coll, sorted_splice(items, i, entry, true));
+}
+
+static Cljc *sorted_remove(CljcEnv *env, Cljc *coll, Cljc *key) {
+    bool found;
+    size_t i = sorted_bsearch(env, coll, key, &found);
+    if (!found) return coll;
+    return sorted_clone(coll, sorted_splice(coll->as.sorted.items, i, NULL, false));
+}
+
+static bool sorted_get(CljcEnv *env, Cljc *coll, Cljc *key, Cljc **out) {
+    bool found;
+    size_t i = sorted_bsearch(env, coll, key, &found);
+    if (!found) return false;
+    Cljc *entry = vec_nth(coll->as.sorted.items, i);
+    *out = coll->as.sorted.is_map ? vec_nth(entry, 1) : entry;
+    return true;
+}
+
+/* entries (set: elements; map: [k v] vectors) as a cons list, in order. */
+static Cljc *sorted_entry_list(Cljc *coll) {
+    Cljc *items = coll->as.sorted.items, *out = NIL, **t = &out;
+    for (size_t i = 0, n = vec_len(items); i < n; i++) {
+        *t = mk_cons(vec_nth(items, i), NIL);
+        t = &(*t)->as.cons.tail;
+    }
+    return out;
+}
+
+static Cljc *mk_map_entry(Cljc *k, Cljc *v) {
+    Cljc *kv[2] = { k, v };
+    return mk_vector(kv, 2);
+}
+
+static Cljc *prim_sorted_set(CljcEnv *env, Cljc **argv, int nargs) {
+    Cljc *s = mk_sorted(NIL, false);
+    for (int i = 0; i < nargs; i++) s = sorted_put(env, s, argv[i], argv[i]);
+    return s;
+}
+static Cljc *prim_sorted_set_by(CljcEnv *env, Cljc **argv, int nargs) {
+    Cljc *s = mk_sorted(argv[0], false);
+    for (int i = 1; i < nargs; i++) s = sorted_put(env, s, argv[i], argv[i]);
+    return s;
+}
+static Cljc *prim_sorted_map(CljcEnv *env, Cljc **argv, int nargs) {
+    Cljc *m = mk_sorted(NIL, true);
+    for (int i = 0; i + 1 < nargs; i += 2)
+        m = sorted_put(env, m, argv[i], mk_map_entry(argv[i], argv[i + 1]));
+    return m;
+}
+static Cljc *prim_sorted_map_by(CljcEnv *env, Cljc **argv, int nargs) {
+    Cljc *m = mk_sorted(argv[0], true);
+    for (int i = 1; i + 1 < nargs; i += 2)
+        m = sorted_put(env, m, argv[i], mk_map_entry(argv[i], argv[i + 1]));
+    return m;
+}
+
+/* (subseq sc test key) / (subseq sc t1 k1 t2 k2): entries whose key satisfies
+ * (test (compare entry-key key) 0). The satisfying set is contiguous (the data
+ * is ordered). rev => descending order (rsubseq). */
+static Cljc *sorted_subseq(CljcEnv *env, Cljc **argv, int nargs, bool rev) {
+    Cljc *coll = argv[0];
+    if (coll == NIL) return NIL;
+    if (coll->tag != CLJC_SORTED) cljc_error("subseq: not a sorted collection");
+    bool two = nargs >= 5;
+    Cljc *t1 = argv[1], *k1 = argv[2];
+    Cljc *t2 = two ? argv[3] : NIL, *k2 = two ? argv[4] : NIL;
+    Cljc *items = coll->as.sorted.items, *out = NIL, **t = &out;
+    for (size_t i = 0, n = vec_len(items); i < n; i++) {
+        Cljc *entry = vec_nth(items, i), *ek = sorted_entry_key(coll, entry);
+        Cljc *a1[2] = { mk_int(sorted_cmp_call(env, coll, ek, k1)), mk_int(0) };
+        if (!is_truthy(apply(env, t1, a1, 2))) continue;
+        if (two) {
+            Cljc *a2[2] = { mk_int(sorted_cmp_call(env, coll, ek, k2)), mk_int(0) };
+            if (!is_truthy(apply(env, t2, a2, 2))) continue;
+        }
+        if (rev) { out = mk_cons(entry, out); }          /* prepend => descending */
+        else { *t = mk_cons(entry, NIL); t = &(*t)->as.cons.tail; }
+    }
+    return out;
+}
+static Cljc *prim_subseq(CljcEnv *env, Cljc **argv, int nargs) {
+    return sorted_subseq(env, argv, nargs, false);
+}
+static Cljc *prim_rsubseq(CljcEnv *env, Cljc **argv, int nargs) {
+    return sorted_subseq(env, argv, nargs, true);
 }
 
 /* qsort has no context parameter; the interpreter is single-threaded. */
@@ -8121,6 +8432,7 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_VECTOR: return mk_empty_vec();
         case CLJC_MAP:    return mk_map();
         case CLJC_SET:    return mk_set();
+        case CLJC_SORTED: return mk_sorted(v->as.sorted.cmp, v->as.sorted.is_map);
         default:          return NIL;
     }
 }
@@ -8631,7 +8943,7 @@ static const char *PRELUDE =
        tagged map counts as a coll only when it's a record or derives a collection
        interface (Sequential / IPersistentCollection). Plain maps stay colls. */
     "(defn coll? [x]\n"
-    "  (or (list? x) (vector? x) (set? x) (seq? x) (sequential? x)\n"
+    "  (or (list? x) (vector? x) (set? x) (sorted? x) (seq? x) (sequential? x)\n"
     "      (and (cljc/map-raw? x)\n"
     "           (let [t (get x :cljc/type)]\n"
     "             (or (nil? t) (contains? (deref cljc/record-types) t)\n"
@@ -9033,12 +9345,7 @@ static const char *PRELUDE =
     "(defn commute [r f & args] (apply swap! r f args))\n"
     "(defn ensure [r] (deref r))\n"
     /* sorted colls: approximated as unsorted (cljc has no ordered colls) */
-    "(defn sorted-set [& xs] (set xs))\n"
-    "(defn sorted-set-by [_cmp & xs] (set xs))\n"
-    "(defn sorted-map [& kvs] (apply hash-map kvs))\n"
-    "(defn sorted-map-by [_cmp & kvs] (apply hash-map kvs))\n"
-    "(defn sorted? [_] false)\n"
-    "(defn subseq [sc & _] (seq sc)) (defn rsubseq [sc & _] (seq (reverse sc)))\n"
+    /* sorted-set/-by, sorted-map/-by, sorted?, subseq, rsubseq are native */
     "(def clojure.edn/read-string read-string)\n"
     "(def clojure.edn/read read-string)\n"
     /* ── clojure.core completeness (fns SCI and other libs enumerate) ── */
@@ -9718,6 +10025,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "hash-set",  prim_hash_set);
     cljc_define_native(e, "disj",      prim_disj);
     cljc_define_native(e, "set?",      prim_set_p);
+    cljc_define_native(e, "sorted?",   prim_sorted_p);
     cljc_define_native(e, "re-find",    prim_re_find);
     cljc_define_native(e, "cljc/re-match-front", prim_re_match_front);
     cljc_define_native(e, "re-matches", prim_re_matches);
@@ -9798,6 +10106,12 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "swap!",   prim_swap);
     cljc_define_native(e, "compare", prim_compare);
     cljc_define_native(e, "sort",    prim_sort);
+    cljc_define_native(e, "sorted-set",    prim_sorted_set);
+    cljc_define_native(e, "sorted-set-by", prim_sorted_set_by);
+    cljc_define_native(e, "sorted-map",    prim_sorted_map);
+    cljc_define_native(e, "sorted-map-by", prim_sorted_map_by);
+    cljc_define_native(e, "subseq",        prim_subseq);
+    cljc_define_native(e, "rsubseq",       prim_rsubseq);
     cljc_define_native(e, "vec",     prim_vec);
     cljc_define_native(e, "transient",   prim_transient);
     cljc_define_native(e, "persistent!", prim_persistent_bang);

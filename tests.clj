@@ -1680,4 +1680,43 @@
   (assert= 1100000 (count (apply concat (repeat 1100000 [1]))))     ; lazy concat fn
   (assert= 1100000 (apply (fn [& xs] (count xs)) (repeat 1100000 1)))) ; user variadic fn
 
+; ── sorted collections (comparator-ordered set/map: CLJC_SORTED) ──
+(assert= [1 2 3] (vec (sorted-set 3 1 2 1)))            ; ordered + deduped
+(assert= [3 2 1] (vec (sorted-set-by > 1 2 3)))         ; custom comparator
+(assert= [[:a 1] [:b 2] [:c 3]] (vec (sorted-map :c 3 :a 1 :b 2)))
+(assert= true  (sorted? (sorted-set 1)))
+(assert= true  (set? (sorted-set 1)))
+(assert= true  (map? (sorted-map :a 1)))
+(assert= false (sorted? #{1 2}))
+; key identity is the comparator: cmp-equal keys collapse
+(assert= 1 (count (sorted-set-by (fn [a b] (compare (count a) (count b))) "aa" "bb")))
+; conj / disj / assoc / dissoc / get / contains?
+(assert= [0 1 2 3 5] (vec (conj (sorted-set 1 2 3) 5 0)))
+(assert= [1 3] (vec (disj (sorted-set 1 2 3) 2)))
+(assert= 2 (get (sorted-map :a 1 :b 2) :b))
+(assert= 99 (get (sorted-map :a 1) :z 99))
+(assert= 2 ((sorted-map :a 1 :b 2) :b))                 ; callable as a fn
+(assert= [[:a 1] [:c 3]] (vec (dissoc (sorted-map :a 1 :b 2 :c 3) :b)))
+(assert= true (contains? (sorted-set 1 2) 2))
+(assert= false (contains? (sorted-set 1 2) 9))
+; = and hash agree with the hash-set/map category (so usable as map keys)
+(assert= true (= (sorted-set 1 2 3) #{3 2 1}))
+(assert= true (= (sorted-map :a 1 :b 2) {:b 2 :a 1}))
+(assert= false (= (sorted-set 1 2) #{1 2 3}))
+(assert= true (= (hash (sorted-set 1 2)) (hash #{1 2})))
+(assert= :x (get {(sorted-set 1 2) :x} (sorted-set 2 1)))
+; range queries
+(assert= [5 6 7 8 9] (vec (subseq (apply sorted-set (range 10)) >= 5)))
+(assert= [3 4 5 6] (vec (subseq (apply sorted-set (range 10)) > 2 < 7)))
+(assert= [9 8 7 6 5] (vec (rsubseq (apply sorted-set (range 10)) >= 5)))
+(assert= [9 8 7 6 5 4 3 2 1 0] (vec (rseq (apply sorted-set (range 10)))))
+; seq-derived ops, empty preserves type, into/merge
+(assert= [:a :b :c] (keys (sorted-map :c 3 :a 1 :b 2)))
+(assert= [1 2 3] (vals (sorted-map :c 3 :a 1 :b 2)))
+(assert= 15 (reduce + 0 (sorted-set 1 2 3 4 5)))
+(assert= [1 2 3] (vec (into (sorted-set) [3 1 2 3])))
+(assert= true (sorted? (empty (sorted-set 1))))
+(assert= {:a 1 :b 2} (merge (sorted-map :a 1) {:b 2}))
+(assert= true (sorted? (merge (sorted-map :a 1) {:b 2})))
+
 (println "tests complete")

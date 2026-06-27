@@ -407,7 +407,7 @@
 ; mixed key types, hash/equality coherence
 (def mixed {1 :int "1" :string :one :kw [1 2] :vec})
 (assert= :int (get mixed 1))
-(assert= :int (get mixed 1.0))                      ; (= 1 1.0) → same bucket
+(assert= nil (get mixed 1.0))                       ; (= 1 1.0) is false in Clojure: distinct keys
 (assert= :string (get mixed "1"))
 (assert= :vec (get mixed [1 2]))
 (assert= :vec (get mixed (list 1 2)))               ; seq equality crosses types

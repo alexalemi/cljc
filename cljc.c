@@ -2155,6 +2155,17 @@ static Cljc *read_form(const char **p) {
             for (size_t i = 1; i < n; i++) cp = cp * 8 + (start[i] - '0');
             return mk_char(cp);
         }
+        if ((unsigned char)start[0] >= 0x80) {   /* a literal multi-byte UTF-8 char, e.g. \⁹ */
+            const unsigned char *s = (const unsigned char *)start;
+            int32_t cp = 0; size_t len = 0;
+            if ((s[0] & 0xE0) == 0xC0) { cp = s[0] & 0x1F; len = 2; }
+            else if ((s[0] & 0xF0) == 0xE0) { cp = s[0] & 0x0F; len = 3; }
+            else if ((s[0] & 0xF8) == 0xF0) { cp = s[0] & 0x07; len = 4; }
+            if (len && len == n) {
+                for (size_t i = 1; i < len; i++) cp = (cp << 6) | (s[i] & 0x3F);
+                return mk_char(cp);
+            }
+        }
         cljc_error("unsupported char literal");
     }
     if (c == '#' && (*p)[1] == '_') {
@@ -5028,13 +5039,11 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         return seq_eq(a->tag == CLJC_VECTOR ? a : to_seq(a),
                       b->tag == CLJC_VECTOR ? b : to_seq(b));
     if (a->tag != b->tag) {
-        /* Numeric cross-equality: int vs double. */
-        if ((a->tag == CLJC_INT && b->tag == CLJC_DOUBLE) ||
-            (a->tag == CLJC_DOUBLE && b->tag == CLJC_INT)) {
-            double da = a->tag == CLJC_INT ? (double)a->as.i : a->as.d;
-            double db = b->tag == CLJC_INT ? (double)b->as.i : b->as.d;
-            return da == db;
-        }
+        /* Clojure's = is category-sensitive across the numeric tower: an exact
+         * integer never equals a floating-point value (only == crosses that),
+         * so (= -1 -1.0) is false. This matters for set/map literals like
+         * #{-1 -1.0}, which are two distinct elements. Integer<->bigint DO
+         * compare (bignums demote to int when they fit, so same tag here). */
         return false;
     }
     switch (a->tag) {
@@ -5427,14 +5436,20 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     Cljc *coll = argv[0];
     if (coll == NIL) coll = mk_map();
     Cljc *r = coll;
     if ((nargs - 1) % 2 != 0) cljc_error("assoc needs key-value pairs");
     for (int i = 1; i < nargs; i += 2) {
         Cljc *k = argv[i], *v = argv[i + 1];
-        if (r->tag == CLJC_MAP) r = map_assoc(r, k, v);
+        if (r->tag == CLJC_MAP) {
+            /* a deftype implementing Associative/assoc (a structure/matrix indexed
+             * by position) updates through its own assoc, not the field map. This
+             * is what lets reverse-mode AD's (assoc-in x [i] perturbation) work. */
+            Cljc *out, *kv[2] = { k, v };
+            if (dispatch_deftype_method(env, r, "assoc", kv, 2, &out)) { r = out; continue; }
+            r = map_assoc(r, k, v);
+        }
         else if (r->tag == CLJC_VECTOR) {
             if (k->tag != CLJC_INT || k->as.i < 0)
                 cljc_error("assoc on vector: index out of bounds");
@@ -8484,7 +8499,8 @@ static const char *PRELUDE =
     "(def vreset! reset!)\n"
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
     "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
-    "(defn sequential? [x] (or (list? x) (vector? x) (seq? x)))\n"
+    "(defn sequential? [x] (boolean (or (list? x) (vector? x) (seq? x)\n"
+    "                          (and (map? x) (:cljc/type x) (isa? (:cljc/type x) :clojure.lang.Sequential)))))\n"
     "(defn class [x] (if (fn? x) x (type x)))\n"   /* fn reflects on itself (below) */
     /* synthesize java.lang.reflect.Method info from cljc fn arities so libraries
        that compute arity by reflection (emmy.function) work without the JVM */
@@ -8573,7 +8589,12 @@ static const char *PRELUDE =
     "  `(let [t0# (cljc/now-ms*) v# ~expr]\n"
     "     (println (str \"Elapsed time: \" (- (cljc/now-ms*) t0#) \" msecs\"))\n"
     "     v#))\n"
-    "(def == =)\n"                       /* = already numeric cross-type */
+    /* == is numeric value-equality across the tower (1 == 1.0), unlike = which is
+       category-sensitive. Neither-less-nor-greater via the numeric comparators. */
+    "(defn ==\n"
+    "  ([_] true)\n"
+    "  ([a b] (not (or (< a b) (> a b))))\n"
+    "  ([a b & more] (if (not (or (< a b) (> a b))) (apply == b more) false)))\n"
     "(defn distinct? [& xs] (= (count xs) (count (set xs))))\n"
     /* +' -' *' are real auto-promoting natives now (see prim_*q); inc'/dec'
      * are defined just below in terms of them */
@@ -8640,12 +8661,16 @@ static const char *PRELUDE =
     "        fset  (set fsyms)\n"
     "        mset  (set (filter some? (map (fn [f] (when (cljc/field-mut? f) (cljc/field-sym f))) fields)))\n"
     "        ms    (filter list? specs)\n"
+    /* a declared Sequential marker interface makes the type sequential? (Emmy's
+       structures/matrices rely on this for their own s:nth) */
+    "        seqmark (some (fn [s] (str/ends-with? (str s) \"Sequential\")) (filter symbol? specs))\n"
     "        kvs   (mapcat (fn [s] [(keyword (str s)) (if (contains? mset s) (list 'atom s) s)]) fsyms)]\n"
     "    `(do\n"
     "       (def ~tname ~tkw)\n"
     "       (defn ~(symbol (str tname \".\")) ~fsyms\n"
     "         (hash-map :cljc/type ~tkw ~@kvs))\n"
     "       (def ~(symbol (str \"->\" tname)) ~(symbol (str tname \".\")))\n"
+    "       ~@(when seqmark [`(derive ~tkw :clojure.lang.Sequential)])\n"
     /* group method forms by name -> one multi-arity fn per (type,name), so a
        protocol method with several arities (e.g. IFn invoke) doesn't collide */
     "       ~@(map (fn [g]\n"
@@ -9274,6 +9299,29 @@ static const char *PRELUDE =
     "              (reverse (cons (first cs) (cons :else acc)))\n"
     "              (recur (rest (rest cs))\n"
     "                     (cons (first (rest cs)) (cons (list p (first cs) e) acc))))))))))\n"
+    /* clojure.core.match subset: match a value against vector patterns. A symbol
+       binds (a bare _ is a wildcard), a keyword/number/etc. compares by =, and a
+       vector pattern recurses element-wise. Enough for Emmy's arity combination. */
+    "(defn cljc/match-compile [v pat]\n"
+    "  (cond\n"
+    "    (= pat '_) {:test true :binds []}\n"
+    "    (symbol? pat) {:test true :binds [pat v]}\n"
+    "    (vector? pat)\n"
+    "      (let [subs (map-indexed (fn [i p] (cljc/match-compile (list 'nth v i) p)) pat)]\n"
+    "        {:test (apply list 'and (list 'sequential? v) (list '= (list 'count v) (count pat))\n"
+    "                      (map :test subs))\n"
+    "         :binds (vec (mapcat :binds subs))})\n"
+    "    :else {:test (list '= v pat) :binds []}))\n"
+    "(defmacro match [value & clauses]\n"
+    "  (let [v (gensym \"mv\")]\n"
+    "    (list 'let [v value]\n"
+    "      (cons 'cond\n"
+    "        (concat\n"
+    "          (mapcat (fn [[pat res]]\n"
+    "                    (let [c (cljc/match-compile v pat)]\n"
+    "                      [(:test c) (list 'let (:binds c) res)]))\n"
+    "                  (partition 2 clauses))\n"
+    "          (list :else (list 'throw (list 'ex-info \"no matching clause\" {}))))))))\n"
     "(defn rand-nth [coll] (nth (vec coll) (rand-int (count coll))))\n"
     "(defn max-key [f x & xs] (reduce (fn [a b] (if (> (f a) (f b)) a b)) x xs))\n"
     "(defn min-key [f x & xs] (reduce (fn [a b] (if (< (f a) (f b)) a b)) x xs))\n"

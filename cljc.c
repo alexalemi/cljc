@@ -617,7 +617,11 @@ static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
      * bar/cljc/foo. This is what lets a battery carry an (ns ...) header (for
      * babashka/clj compatibility) yet still define its cljc-prefixed helpers
      * in place. */
-    if (cur_reader_ns && !strchr(name, '/')) {
+    /* `/` (the division symbol) is itself a slash but is NOT namespace-qualified
+     * — without this a library that redefines / (e.g. a generic-arithmetic ns
+     * with :refer-clojure :exclude [/]) would clobber the global core / for
+     * everyone instead of isolating it under its own ns. */
+    if (cur_reader_ns && (!strchr(name, '/') || !strcmp(name, "/"))) {
         char buf[256];
         snprintf(buf, sizeof buf, "%s/%s", cur_reader_ns, name);
         name = intern(buf, strlen(buf));
@@ -8215,6 +8219,8 @@ static const char *PRELUDE =
     "        :else       `(mapcat (fn [~k] (for ~more ~body)) ~v)))))\n"
     /* batch 5-lite */
     "(defmacro comment [& _] nil)\n"
+    "(defmacro ->clerk-only [& _] nil)\n"   /* notebook-only code (mentat.clerk-utils): dropped */
+    "(defmacro ->clerk [& _] nil)\n"
     "(defmacro defn- [name & body] `(defn ~name ~@body))\n"
     "(defn vary-meta [x f & args] (with-meta x (apply f (meta x) args)))\n"
     /* c resolves to a type keyword (deftype name, or a host-class stub/keyword);
@@ -8255,7 +8261,36 @@ static const char *PRELUDE =
     "(defn re-pattern [s] (with-meta s {:regex true}))\n"
     "(defn boolean? [x] (or (true? x) (false? x)))\n"
     "(defn nat-int? [x] (and (int? x) (>= x 0)))\n"
-    "(defn isa? [c p] (= c p))\n"          /* no hierarchies (v0) */
+    /* Global ad-hoc hierarchy for derive/isa?/defmulti, like clojure.core's
+     * *global-hierarchy*: {child #{direct-parents}}. isa? closes it transitively
+     * and is vector-aware ([::a ::b] isa [::c ::d] elementwise), which is what
+     * multimethod dispatch on multiple args needs. */
+    "(def cljc/global-hierarchy (atom {}))\n"
+    "(defn cljc/tag-isa? [c p]\n"
+    "  (or (= c p) (boolean (some (fn [x] (cljc/tag-isa? x p)) (get (deref cljc/global-hierarchy) c)))))\n"
+    "(defn isa? [c p]\n"
+    "  (or (= c p) (cljc/tag-isa? c p)\n"
+    "      (and (vector? c) (vector? p) (= (count c) (count p))\n"
+    "           (every? identity (map isa? c p)))))\n"
+    "(defn parents [t] (get (deref cljc/global-hierarchy) t))\n"
+    "(defn ancestors [t]\n"
+    "  (let [ps (get (deref cljc/global-hierarchy) t)]\n"
+    "    (reduce (fn [acc p] (into (conj acc p) (ancestors p))) #{} ps)))\n"
+    "(defn descendants [t]\n"
+    "  (set (filter (fn [k] (and (not= k t) (cljc/tag-isa? k t))) (keys (deref cljc/global-hierarchy)))))\n"
+    "(defn derive\n"
+    "  ([t parent] (swap! cljc/global-hierarchy update t (fn [s] (conj (or s #{}) parent))) nil)\n"
+    "  ([h t parent] (derive t parent)))\n"
+    "(defn underive\n"
+    "  ([t parent] (swap! cljc/global-hierarchy update t disj parent) nil)\n"
+    "  ([h t parent] (underive t parent)))\n"
+    /* resolve a method by walking the hierarchy: among method keys that dv isa?,
+     * pick the most specific (the one that isa? all the other matches). */
+    "(defn cljc/multi-find [t dv]\n"
+    "  (let [ms (filter (fn [e] (isa? dv (key e))) t)]\n"
+    "    (when (seq ms)\n"
+    "      (val (or (some (fn [e] (when (every? (fn [e2] (isa? (key e) (key e2))) ms) e)) ms)\n"
+    "               (first ms))))))\n"
     "(defn every-pred [& ps]\n"
     "  (fn [& args] (every? (fn [p] (every? p args)) ps)))\n"
     "(defn some-fn [& ps]\n"
@@ -8712,6 +8747,8 @@ static const char *PRELUDE =
     "(def Object :default) (def String :string) (def CharSequence :string)\n"
     "(def Character :char) (def Boolean :bool) (def Number :int)\n"
     "(def Long :int) (def Integer :int) (def Double :double)\n"
+    "(def Float :double) (def Byte :int) (def Short :int) (def Number :number)\n"
+    "(def BigInt :bigint) (def BigInteger :bigint) (def BigDecimal :double) (def Ratio :ratio)\n"
     /* host exception/error classes (catch dispatch values, sci class tables) */
     "(def Exception :Exception) (def Throwable :Throwable) (def Error :Error)\n"
     "(def RuntimeException :RuntimeException) (def AssertionError :AssertionError)\n"
@@ -8815,8 +8852,7 @@ static const char *PRELUDE =
     "  (when (= :atom (type (:meta r))) (deref (:meta r))))\n"
     "(defn reset-meta! [r m] (when (= :atom (type (:meta r))) (reset! (:meta r) m)) m)\n"
     /* ad-hoc hierarchies: cljc multimethods don't use them, so these are inert */
-    "(defn derive [& _] nil)\n"
-    "(defn underive [& _] nil)\n"
+    /* derive/underive/isa?/parents/ancestors are real now — see above */
     "(defn make-hierarchy [] {})\n"
     "(defn ident? [x] (or (symbol? x) (keyword? x)))\n"
     "(defn namespace [x]\n"
@@ -9601,7 +9637,7 @@ CljcEnv *cljc_new_env(void) {
         "           (fn [& args#]\n"
         "             (let [t# (get @cljc/multi-tables '~name)\n"
         "                   dv# (apply d# args#)\n"
-        "                   m# (get t# dv# (get t# ~default))]\n"
+        "                   m# (or (get t# dv#) (cljc/multi-find t# dv#) (get t# ~default))]\n"
         "               (if m#\n"
         "                 (apply m# args#)\n"
         "                 (throw (ex-info (str \"No method in \" '~name\n"

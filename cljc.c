@@ -3598,6 +3598,14 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
 
 /* One arity: validate a [params] vector and pair it with its body. */
 static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
+    /* a return-type hint reads as (with-meta [params] {..}) (reader turns ^{..}
+     * into a with-meta call) — unwrap to the param vector. ^Symbol hints are
+     * dropped by the reader already, so only the map-meta form reaches here. */
+    if (params_vec != NIL && params_vec->tag == CLJC_LIST &&
+        params_vec->as.cons.head->tag == CLJC_SYMBOL &&
+        params_vec->as.cons.head->as.sym == intern("with-meta", 9) &&
+        params_vec->as.cons.tail != NIL)
+        params_vec = params_vec->as.cons.tail->as.cons.head;
     if (params_vec == NIL || params_vec->tag != CLJC_VECTOR)
         cljc_error("fn params must be a vector");
     Cljc *params = NIL, **t = &params;
@@ -3638,6 +3646,15 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
         f->as.fn.env = env;
         f->as.fn.is_macro = is_macro;
         return f;
+    }
+    /* single arity with a return-type hint: (fn ^{:tag T} [x] ..) reads its
+     * params as (with-meta [x] {..}); unwrap so it's seen as a [params] head. */
+    if (forms != NIL && forms->as.cons.head->tag == CLJC_LIST) {
+        Cljc *h = forms->as.cons.head;
+        if (h->as.cons.head->tag == CLJC_SYMBOL &&
+            h->as.cons.head->as.sym == intern("with-meta", 9) &&
+            h->as.cons.tail != NIL && h->as.cons.tail->as.cons.head->tag == CLJC_VECTOR)
+            forms = mk_cons(h->as.cons.tail->as.cons.head, forms->as.cons.tail);
     }
     Cljc *arities = NIL, **t = &arities;
     if (forms != NIL && forms->as.cons.head->tag == CLJC_VECTOR) {
@@ -8798,6 +8815,10 @@ static const char *PRELUDE =
     "(defn UUID/randomUUID [] (symbol (str \"uuid-\" (swap! cljc/uuid-counter inc))))\n"
     "(def cljc/rt-id (atom 0))\n"   /* clojure.lang.RT/nextID: monotonic unique ids (core.logic lvars) */
     "(defn clojure.lang.RT/nextID [] (swap! cljc/rt-id inc))\n"
+    /* RT array ops (persistent-sorted-set's arrays.cljc expands aget/aset to these) */
+    "(defn clojure.lang.RT/aget [a i] (aget a i))\n"
+    "(defn clojure.lang.RT/aset [a i v] (aset a i v))\n"
+    "(defn clojure.lang.RT/alength [a] (alength a))\n"
     "(defn random-uuid [] (UUID/randomUUID))\n"
     "(defn System/nanoTime [] 0)\n"
     "(defn System/lineSeparator [] \"\\n\")\n"

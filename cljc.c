@@ -119,6 +119,8 @@ typedef enum {
     CLJC_BIGINT,    /* arbitrary-precision integer: sign + base-2^32 magnitude.
                      * Only exists when a value exceeds int64 — results that fit
                      * demote back to CLJC_INT, so the common case never allocates */
+    CLJC_RATIO,     /* exact rational num/den (each INT or BIGINT), den>0, gcd-
+                     * reduced, den!=1 (den==1 demotes to the integer) */
 } CljcTag;
 
 typedef struct Cljc Cljc;
@@ -168,6 +170,7 @@ struct Cljc {
         /* CLJC_BIGINT: sign in {-1,+1}; mag is n little-endian base-2^32 limbs,
          * mag[n-1] != 0 (never stored as zero — zero demotes to CLJC_INT). */
         struct { int sign; uint32_t n; uint32_t *mag; } big;
+        struct { Cljc *num; Cljc *den; } ratio;   /* CLJC_RATIO */
         struct { Cljc *thunk; Cljc *cached; bool done; } lazy;
         /* recur sentinel: up to 3 values inline (covers real loops);
          * wider recurs spill to a heap array stored in iv[0]. */
@@ -212,6 +215,7 @@ static bool map_find(Cljc *m, Cljc *key, Cljc **out);
 static double as_num(Cljc *v);
 static Cljc *big_from_decimal(const char *s);
 static char *big_to_decimal(Cljc *v);
+static Cljc *make_ratio(Cljc *num, Cljc *den);
 static Cljc *to_seq(Cljc *v);
 static Cljc *seq1(Cljc *v);
 static Cljc *seq1_slot(Cljc **slot);
@@ -765,6 +769,10 @@ static void gc_drain(void) {
                 mark_push(v->as.cons.head);
                 mark_push(v->as.cons.tail);
                 break;
+            case CLJC_RATIO:
+                mark_push(v->as.ratio.num);
+                mark_push(v->as.ratio.den);
+                break;
             case CLJC_VECTOR:
             case CLJC_TVEC:
                 for (size_t i = 0; i < v->as.vec.taillen; i++) mark_push(v->as.vec.tail[i]);
@@ -1085,6 +1093,7 @@ static uint32_t cljc_hash(Cljc *v) {
         case CLJC_BIGINT: { uint64_t h = v->as.big.sign < 0 ? 2166136261u : 0;
             for (uint32_t i = 0; i < v->as.big.n; i++) h = h * 31 + v->as.big.mag[i];
             return mix64(h); }
+        case CLJC_RATIO: return mix64(cljc_hash(v->as.ratio.num) * 31 + cljc_hash(v->as.ratio.den));
         case CLJC_DOUBLE: {
             double d = v->as.d;
             if (d == (double)(int64_t)d) return mix64((uint64_t)(int64_t)d);  /* = int cross-equality */
@@ -1897,6 +1906,25 @@ static Cljc *read_atom(const char **p) {
                 Cljc *r = big_from_decimal(tmp);   /* stops at the trailing N */
                 free(tmp);
                 return r;
+            }
+        }
+        /* ratio literal: [+-]?digits/digits -> exact rational */
+        {
+            const char *slash = memchr(start, '/', n);
+            const char *ns = start; if (*ns == '+' || *ns == '-') ns++;
+            if (slash && slash > ns && slash + 1 < start + n) {
+                bool ok = true;
+                for (const char *q = ns; q < slash && ok; q++) if (*q < '0' || *q > '9') ok = false;
+                for (const char *q = slash + 1; q < start + n && ok; q++) if (*q < '0' || *q > '9') ok = false;
+                if (ok) {
+                    char *nb = xmalloc(n + 1), *db = xmalloc(n + 1);
+                    size_t nl = (size_t)(slash - start), dl = (size_t)(start + n - slash - 1);
+                    memcpy(nb, start, nl); nb[nl] = '\0';
+                    memcpy(db, slash + 1, dl); db[dl] = '\0';
+                    Cljc *num = big_from_decimal(nb), *den = big_from_decimal(db);
+                    free(nb); free(db);
+                    return make_ratio(num, den);
+                }
             }
         }
         char buf[64]; if (n >= sizeof buf) cljc_error("number too long");
@@ -2857,7 +2885,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             vmc_emit(c, form->as.b ? VOP_TRUE : VOP_FALSE, 0);
             return;
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_STRING: case CLJC_CHAR:
-        case CLJC_KEYWORD: case CLJC_BIGINT:
+        case CLJC_KEYWORD: case CLJC_BIGINT: case CLJC_RATIO:
         case CLJC_FN: case CLJC_NATIVE: case CLJC_MAP: case CLJC_SET:
             /* map/set literals with computed elements are rare in hot
              * bodies; constant ones are common — non-constant fall back */
@@ -3699,7 +3727,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL: case CLJC_EMPTY:
-        case CLJC_BIGINT:
+        case CLJC_BIGINT: case CLJC_RATIO:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
@@ -4332,6 +4360,8 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_BOOL: sb_puts(sb, v->as.b ? "true" : "false"); break;
         case CLJC_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
         case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); if (readably) sb_putc(sb, 'N'); free(s); } break;
+        case CLJC_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
+            sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
         case CLJC_DOUBLE: {
             char tmp[32];
             snprintf(tmp, sizeof tmp, "%g", v->as.d);
@@ -4754,6 +4784,30 @@ static Cljc *big_from_decimal(const char *s) {
     return sign < 0 ? big_addsub(mk_int(0), acc, 1) : acc;
 }
 
+/* ───── Exact rationals ──────────────────────────────────────────────── */
+static Cljc *rat_num(Cljc *v) { return v->tag == CLJC_RATIO ? v->as.ratio.num : v; }
+static Cljc *rat_den(Cljc *v) { return v->tag == CLJC_RATIO ? v->as.ratio.den : mk_int(1); }
+
+/* Build a reduced rational from num/den (each INT or BIGINT): force den>0,
+ * divide out the gcd, and demote to an integer when den becomes 1. */
+static Cljc *make_ratio(Cljc *num, Cljc *den) {
+    if (big_is_zero(den)) cljc_error("Divide by zero");
+    if (big_cmp(den, mk_int(0)) < 0) { num = big_addsub(mk_int(0), num, 1); den = big_addsub(mk_int(0), den, 1); }
+    if (big_is_zero(num)) return mk_int(0);
+    Cljc *g = big_gcd(num, den);
+    if (!(g->tag == CLJC_INT && g->as.i == 1)) {
+        Cljc *qn, *qd; big_divmod(num, g, &qn, NULL); big_divmod(den, g, &qd, NULL);
+        num = qn; den = qd;
+    }
+    if (den->tag == CLJC_INT && den->as.i == 1) return num;
+    Cljc *r = alloc(CLJC_RATIO);
+    r->as.ratio.num = num; r->as.ratio.den = den;
+    return r;
+}
+static double ratio_to_double(Cljc *v) {
+    return big_to_double(v->as.ratio.num) / big_to_double(v->as.ratio.den);
+}
+
 typedef enum { OP_ADD, OP_SUB, OP_MUL, OP_DIV } ArithOp;
 
 static Cljc *big_binop(ArithOp op, Cljc *a, Cljc *b) {
@@ -4770,11 +4824,12 @@ static Cljc *big_binop(ArithOp op, Cljc *a, Cljc *b) {
  * bigint operand always takes the exact path regardless of `promote`. */
 static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
     size_t n = (size_t)nargs;
-    bool is_float = false, is_big = false;
+    bool is_float = false, is_big = false, is_ratio = false;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Cljc *v = argv[ai_];
         if (v->tag == CLJC_DOUBLE) is_float = true;
         else if (v->tag == CLJC_BIGINT) is_big = true;
+        else if (v->tag == CLJC_RATIO) is_ratio = true;
         else if (v->tag != CLJC_INT) cljc_error("expected number");
     }
     if (n == 0) {
@@ -4783,6 +4838,9 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         cljc_error("wrong number of args (0)");
     }
     if (is_float) goto float_path;
+    /* division of exact integers yields an exact ratio (Clojure), so all
+     * non-float division and anything touching a ratio takes the ratio path */
+    if (op == OP_DIV || is_ratio) goto ratio_path;
     if (is_big) goto big_path;
 
     {
@@ -4847,6 +4905,27 @@ big_path: {
         return acc;
     }
 
+ratio_path: {
+        Cljc *rn = rat_num(argv[0]), *rd = rat_den(argv[0]);
+        if (n == 1) {
+            if (op == OP_DIV) return make_ratio(rd, rn);                 /* reciprocal */
+            if (op == OP_SUB) return make_ratio(big_addsub(mk_int(0), rn, 1), rd);
+            return argv[0];
+        }
+        for (int ai_ = 1; ai_ < nargs; ai_++) {
+            Cljc *n2 = rat_num(argv[ai_]), *d2 = rat_den(argv[ai_]);
+            switch (op) {                                               /* a/b OP c/d */
+                case OP_ADD: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 0); rd = big_mul(rd, d2); break;
+                case OP_SUB: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 1); rd = big_mul(rd, d2); break;
+                case OP_MUL: rn = big_mul(rn, n2); rd = big_mul(rd, d2); break;
+                case OP_DIV: rn = big_mul(rn, d2); rd = big_mul(rd, n2); break;
+            }
+            Cljc *g = big_gcd(rn, rd);    /* reduce each step to bound intermediates */
+            if (!(g->tag == CLJC_INT && g->as.i == 1)) { Cljc *a, *b; big_divmod(rn, g, &a, NULL); big_divmod(rd, g, &b, NULL); rn = a; rd = b; }
+        }
+        return make_ratio(rn, rd);
+    }
+
 float_path:;
     double facc = as_num(argv[0]);
     int aj_;
@@ -4875,6 +4954,18 @@ static Cljc *prim_div(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return 
 static Cljc *prim_addq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, true); }
 static Cljc *prim_subq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, true); }
 static Cljc *prim_mulq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, true); }
+static Cljc *prim_numerator(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs; Cljc *v = argv[0];
+    if (v->tag == CLJC_RATIO) return v->as.ratio.num;
+    if (v->tag == CLJC_INT || v->tag == CLJC_BIGINT) return v;
+    cljc_error("numerator: not a rational");  return NIL;
+}
+static Cljc *prim_denominator(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs; Cljc *v = argv[0];
+    if (v->tag == CLJC_RATIO) return v->as.ratio.den;
+    if (v->tag == CLJC_INT || v->tag == CLJC_BIGINT) return mk_int(1);
+    cljc_error("denominator: not a rational");  return NIL;
+}
 
 /* Sequential equality across lists and vectors, Clojure-style:
  * (= [1 2 3] '(1 2 3)) is true. */
@@ -4918,6 +5009,8 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         case CLJC_BOOL: return a->as.b == b->as.b;
         case CLJC_INT: return a->as.i == b->as.i;
         case CLJC_BIGINT: return big_cmp(a, b) == 0;
+        case CLJC_RATIO: return big_cmp(a->as.ratio.num, b->as.ratio.num) == 0 &&
+                                big_cmp(a->as.ratio.den, b->as.ratio.den) == 0;
         case CLJC_DOUBLE: return a->as.d == b->as.d;
         case CLJC_SYMBOL: return a->as.sym == b->as.sym;
         case CLJC_KEYWORD: return a->as.kw == b->as.kw;
@@ -4955,6 +5048,7 @@ static double as_num(Cljc *v) {
     if (v->tag == CLJC_INT) return (double)v->as.i;
     if (v->tag == CLJC_DOUBLE) return v->as.d;
     if (v->tag == CLJC_BIGINT) return big_to_double(v);
+    if (v->tag == CLJC_RATIO) return ratio_to_double(v);
     cljc_error("expected number");
     return 0;
 }
@@ -4964,11 +5058,13 @@ static double as_num(Cljc *v) {
  * comparison would lose precision between adjacent large integers). */
 static int num_cmp(Cljc *a, Cljc *b) {
     int ta = a->tag, tb = b->tag;
-    if ((ta != CLJC_INT && ta != CLJC_DOUBLE && ta != CLJC_BIGINT) ||
-        (tb != CLJC_INT && tb != CLJC_DOUBLE && tb != CLJC_BIGINT)) cljc_error("expected number");
+#define CLJC_ISNUM(t) ((t) == CLJC_INT || (t) == CLJC_DOUBLE || (t) == CLJC_BIGINT || (t) == CLJC_RATIO)
+    if (!CLJC_ISNUM(ta) || !CLJC_ISNUM(tb)) cljc_error("expected number");
     if (ta == CLJC_DOUBLE || tb == CLJC_DOUBLE) {
         double x = as_num(a), y = as_num(b); return x < y ? -1 : (x > y ? 1 : 0);
     }
+    if (ta == CLJC_RATIO || tb == CLJC_RATIO)   /* a/b ? c/d  <=>  a*d ? c*b (dens > 0) */
+        return big_cmp(big_mul(rat_num(a), rat_den(b)), big_mul(rat_num(b), rat_den(a)));
     if (ta == CLJC_BIGINT || tb == CLJC_BIGINT) return big_cmp(a, b);
     int64_t x = a->as.i, y = b->as.i; return x < y ? -1 : (x > y ? 1 : 0);
 }
@@ -5184,7 +5280,7 @@ TYPE_PRED(map_p,     v != NIL && v->tag == CLJC_MAP)
 TYPE_PRED(set_p,     v != NIL && v->tag == CLJC_SET)
 TYPE_PRED(list_p,    v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_EMPTY))
 TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
-TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE || v->tag == CLJC_BIGINT))
+TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE || v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO))
 TYPE_PRED(int_p,     v != NIL && v->tag == CLJC_INT)
 TYPE_PRED(double_p,  v != NIL && v->tag == CLJC_DOUBLE)
 TYPE_PRED(string_p,  v != NIL && v->tag == CLJC_STRING)
@@ -6421,6 +6517,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_BOOL: n = "boolean"; break;
         case CLJC_INT: n = "int"; break;
         case CLJC_BIGINT: n = "bigint"; break;
+        case CLJC_RATIO: n = "ratio"; break;
         case CLJC_DOUBLE: n = "double"; break;
         case CLJC_STRING: n = "string"; break;
         case CLJC_CHAR: n = "char"; break;
@@ -6616,9 +6713,9 @@ static int cmp_values(Cljc *a, Cljc *b) {
     if (a == b) return 0;
     if (a == NIL) return -1;          /* nil sorts first */
     if (b == NIL) return 1;
-    bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE || a->tag == CLJC_BIGINT;
-    bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE || b->tag == CLJC_BIGINT;
-    if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints */
+    bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE || a->tag == CLJC_BIGINT || a->tag == CLJC_RATIO;
+    bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE || b->tag == CLJC_BIGINT || b->tag == CLJC_RATIO;
+    if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
     if (a->tag != b->tag) cljc_error("compare: incomparable types");
     switch (a->tag) {
         case CLJC_STRING:  return strcmp(a->as.str, b->as.str);
@@ -8575,6 +8672,8 @@ static const char *PRELUDE =
     "(defn float? [x] (double? x))\n"
     "(defn bigint? [x] (= (type x) :bigint))\n"
     "(defn integer? [x] (or (int? x) (bigint? x)))\n"
+    "(defn ratio? [x] (= (type x) :ratio))\n"
+    "(defn rational? [x] (or (integer? x) (ratio? x)))\n"
     "(defn volatile? [x] (= :atom (type x))) (defn realized? [_] true)\n"
     "(defn inst? [_] false) (defn uri? [_] false) (defn uuid? [_] false)\n"
     "(defn object? [x] (some? x)) (defn special-symbol? [_] false)\n"
@@ -8585,7 +8684,7 @@ static const char *PRELUDE =
     /* numeric coercions (cljc ints are int64, no bignum/ratio) */
     "(defn byte [x] (int x)) (defn short [x] (int x)) (defn long [x] (int x))\n"
     "(defn num [x] x) (defn bigdec [x] x) (defn bigint [x] (int x)) (defn biginteger [x] (int x))\n"
-    "(defn rationalize [x] x) (defn numerator [x] x) (defn denominator [_] 1)\n"
+    "(defn rationalize [x] x)\n"   /* numerator/denominator are real natives now */
     "(defn double [x] (* 1.0 x)) (defn float [x] (* 1.0 x))\n"
     /* unchecked math == checked in cljc */
     "(def unchecked-add +) (def unchecked-subtract -) (def unchecked-multiply *)\n"
@@ -9093,6 +9192,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "+'",      prim_addq);
     cljc_define_native(e, "-'",      prim_subq);
     cljc_define_native(e, "*'",      prim_mulq);
+    cljc_define_native(e, "numerator",   prim_numerator);
+    cljc_define_native(e, "denominator", prim_denominator);
     cljc_define_native(e, "/",       prim_div);
     cljc_define_native(e, "=",       prim_eq);
     cljc_define_native(e, "<",       prim_lt);
@@ -9622,7 +9723,12 @@ CljcEnv *cljc_new_env(void) {
            & options). Skip a leading docstring/attr-map; the next form is the
            dispatch fn; remaining key-vals are options (we honour :default). */
         "(defmacro defmulti [name & args]\n"
-        "  (let [args (if (string? (first args)) (rest args) args)\n"
+        /* peel reader metadata off the name (e.g. (defmulti ^:no-doc add ..) —
+         * Emmy's defgeneric does this) so the table key matches defmethod's bare
+         * name; otherwise methods register under `add` but dispatch reads the
+         * (with-meta add ..) form's empty table. */
+        "  (let [name (loop [n name] (if (and (seq? n) (= 'with-meta (first n))) (recur (second n)) n))\n"
+        "        args (if (string? (first args)) (rest args) args)\n"
         "        args (if (map? (first args)) (rest args) args)\n"
         "        dispatch (first args)\n"
         "        opts (apply hash-map (rest args))\n"

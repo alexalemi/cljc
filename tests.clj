@@ -84,8 +84,10 @@
 
 ; unary arithmetic
 (assert= -5 (- 5))
-(assert= 0.5 (/ 2))
-(assert= 3.5 (/ 7 2))
+(assert= 1/2 (/ 2))       ; exact rationals now, like Clojure
+(assert= 7/2 (/ 7 2))
+(assert= 0.5 (/ 2.0))     ; float division stays float
+(assert= 3.5 (/ 7.0 2))
 (assert= 3 (/ 6 2))
 
 ; macros: quasiquote
@@ -144,7 +146,8 @@
 ; doubles print distinctly from ints
 (assert= "1.0" (str 1.0))
 (assert= "1" (str 1))
-(assert= "0.5" (str (/ 2)))
+(assert= "1/2" (str (/ 2)))
+(assert= "0.5" (str (/ 2.0)))
 
 ; conj onto nil
 (assert= (list 2 1) (conj nil 1 2))

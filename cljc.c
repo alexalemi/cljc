@@ -124,11 +124,14 @@ typedef enum {
     CLJC_VAR,       /* a Var: a named reference to a global binding. Derefs to the
                      * binding's current value, is IFn (calls the value), and
                      * carries {:name :ns} metadata — what (resolve sym) returns */
-    CLJC_SORTED,    /* sorted set/map: comparator-ordered. A persistent vector of
-                     * entries kept in comparator order (set: the element; map: a
-                     * [k v] MapEntry vector) + the comparator (NIL = default).
-                     * Key identity is "cmp == 0", not =, so custom comparators
-                     * collapse cmp-equal keys. O(log n) reads, O(n) writes. */
+    CLJC_SORTED,    /* sorted set/map: comparator-ordered. A persistent weight-
+                     * balanced tree (CLJC_TNODE root) + the comparator (NIL =
+                     * default). Key identity is "cmp == 0", not =, so custom
+                     * comparators collapse cmp-equal keys. O(log n) everything. */
+    CLJC_TNODE,     /* internal: a node of a sorted collection's weight-balanced
+                     * tree (Adams' tree). Holds key, val (set: val==key; map: the
+                     * value), left/right subtrees, and subtree size. Not user-
+                     * visible. */
 } CljcTag;
 
 typedef struct Cljc Cljc;
@@ -162,9 +165,12 @@ struct Cljc {
                  uint8_t shift; uint8_t taillen; bool alive; } vec;
         /* HAMT persistent map: root tree node (NULL when empty) + entry count */
         struct { Cljc *root; size_t count; } map;
-        /* sorted set/map: items is a persistent vector of entries in comparator
-         * order; cmp is the comparator fn (NIL = default cmp_values). */
-        struct { Cljc *items; Cljc *cmp; bool is_map; } sorted;
+        /* sorted set/map: root of a weight-balanced tree (NIL when empty); cmp is
+         * the comparator fn (NIL = default cmp_values). */
+        struct { Cljc *root; Cljc *cmp; bool is_map; } sorted;
+        /* a weight-balanced tree node: left/right subtrees, the comparison key,
+         * its value (set: == key; map: the value), and subtree node count. */
+        struct { Cljc *left; Cljc *right; Cljc *key; Cljc *val; uint32_t size; } tnode;
         /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
          * subnode. Collision nodes hold same-hash entries linearly. */
         struct { Cljc **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
@@ -234,9 +240,10 @@ static Cljc *seq1_slot(Cljc **slot);
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs);
 static Cljc *sorted_entry_list(Cljc *coll);
 static bool sorted_get(CljcEnv *env, Cljc *coll, Cljc *key, Cljc **out);
-static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *entry);
+static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *val);
 static Cljc *sorted_remove(CljcEnv *env, Cljc *coll, Cljc *key);
-static size_t sorted_bsearch(CljcEnv *env, Cljc *coll, Cljc *key, bool *found);
+static bool sorted_contains(CljcEnv *env, Cljc *coll, Cljc *key);
+static uint32_t sorted_count(Cljc *coll);
 static Cljc *mk_map_entry(Cljc *k, Cljc *v);
 static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs);
 static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs);
@@ -815,8 +822,14 @@ static void gc_drain(void) {
                 mark_push(v->as.map.root);          /* NULL-safe */
                 break;
             case CLJC_SORTED:
-                mark_push(v->as.sorted.items);
+                mark_push(v->as.sorted.root);
                 mark_push(v->as.sorted.cmp);
+                break;
+            case CLJC_TNODE:
+                mark_push(v->as.tnode.left);
+                mark_push(v->as.tnode.right);
+                mark_push(v->as.tnode.key);
+                mark_push(v->as.tnode.val);
                 break;
             case CLJC_HNODE:
                 for (size_t i = 0; i < v->as.hnode.nkids; i++)
@@ -1166,11 +1179,10 @@ static uint32_t cljc_hash(Cljc *v) {
         case CLJC_SORTED: {  /* must match the hash of an equal hash set/map */
             bool is_map = v->as.sorted.is_map;
             uint32_t h = is_map ? 0 : 0xa5e3u;
-            Cljc *items = v->as.sorted.items;
-            for (size_t i = 0, n = vec_len(items); i < n; i++) {
-                Cljc *e = vec_nth(items, i);
-                Cljc *k = is_map ? vec_nth(e, 0) : e;
-                h += cljc_hash(k) * 31 + cljc_hash(is_map ? vec_nth(e, 1) : e);
+            for (Cljc *e = sorted_entry_list(v); e != NIL; e = e->as.cons.tail) {
+                Cljc *ent = e->as.cons.head;
+                Cljc *k = is_map ? vec_nth(ent, 0) : ent;
+                h += cljc_hash(k) * 31 + cljc_hash(is_map ? vec_nth(ent, 1) : ent);
             }
             return h;
         }
@@ -3840,6 +3852,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
         case CLJC_SORTED:  /* a constructed sorted coll has no reader literal */
+        case CLJC_TNODE:   /* internal sorted-tree node; self-evaluates if it leaks */
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
         case CLJC_CHUNK:   /* internal; self-evaluates if it ever leaks */
             return form;
@@ -4629,16 +4642,17 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             /* a sorted map's entries are [k v] vectors; a sorted set's are bare */
             bool is_map = v->as.sorted.is_map;
             sb_puts(sb, is_map ? "{" : "#{");
-            Cljc *items = v->as.sorted.items;
-            for (size_t i = 0, n = vec_len(items); i < n; i++) {
-                if (i) sb_puts(sb, is_map ? ", " : " ");
-                Cljc *e = vec_nth(items, i);
+            bool first = true;
+            for (Cljc *e = sorted_entry_list(v); e != NIL; e = e->as.cons.tail) {
+                if (!first) sb_puts(sb, is_map ? ", " : " ");
+                first = false;
+                Cljc *ent = e->as.cons.head;
                 if (is_map) {
-                    print_to(sb, vec_nth(e, 0), readably);
+                    print_to(sb, vec_nth(ent, 0), readably);
                     sb_putc(sb, ' ');
-                    print_to(sb, vec_nth(e, 1), readably);
+                    print_to(sb, vec_nth(ent, 1), readably);
                 } else {
-                    print_to(sb, e, readably);
+                    print_to(sb, ent, readably);
                 }
             }
             sb_putc(sb, '}');
@@ -4646,6 +4660,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         }
         case CLJC_TVEC:  sb_puts(sb, "#<transient-vector>"); break;
         case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
+        case CLJC_TNODE: sb_puts(sb, "#<tree-node>"); break;  /* never user-visible */
         case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
         case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
         case CLJC_CORO:   sb_puts(sb, "#<coroutine>"); break;
@@ -5158,11 +5173,11 @@ static bool seq_eq(Cljc *a, Cljc *b) {
 /* A sorted set/map is = to a hash set/map (or another sorted coll) with the same
  * contents — Clojure's = compares collections by category, not representation. */
 static size_t collcount_(Cljc *c) {
-    return c->tag == CLJC_SORTED ? vec_len(c->as.sorted.items) : c->as.map.count;
+    return c->tag == CLJC_SORTED ? sorted_count(c) : c->as.map.count;
 }
 static bool setlike_member_(Cljc *s, Cljc *x) {
     if (s->tag == CLJC_SET) return set_contains(s, x, NULL);
-    bool f; sorted_bsearch(gc_root_envs[0], s, x, &f); return f;
+    return sorted_contains(gc_root_envs[0], s, x);
 }
 static bool setlike_eq_(Cljc *a, Cljc *b) {
     if (collcount_(a) != collcount_(b)) return false;
@@ -5379,7 +5394,7 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
     if (tag == CLJC_MAP || tag == CLJC_SET)
         return mk_int((int64_t)argv[0]->as.map.count);
     if (tag == CLJC_SORTED)
-        return mk_int((int64_t)vec_len(argv[0]->as.sorted.items));
+        return mk_int((int64_t)sorted_count(argv[0]));
     if (tag == CLJC_STRING) return mk_int((int64_t)strlen(argv[0]->as.str));
     cljc_error("count: not countable");
     return NIL;
@@ -5440,13 +5455,13 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
             if (!r->as.sorted.is_map) r = sorted_put(env, r, x, x);
             else if (x == NIL) { /* no-op */ }
             else if (x->tag == CLJC_VECTOR && vec_len(x) == 2)
-                r = sorted_put(env, r, vec_nth(x, 0), mk_map_entry(vec_nth(x, 0), vec_nth(x, 1)));
+                r = sorted_put(env, r, vec_nth(x, 0), vec_nth(x, 1));
             else if (x->tag == CLJC_SORTED || x->tag == CLJC_MAP) {
                 for (Cljc *e = to_seq(x); e != NIL; e = e->as.cons.tail) {
                     Cljc *kv = e->as.cons.head;   /* [k v] (sorted) or (k . v) (map) */
                     Cljc *k2 = kv->tag == CLJC_VECTOR ? vec_nth(kv, 0) : kv->as.cons.head;
                     Cljc *v2 = kv->tag == CLJC_VECTOR ? vec_nth(kv, 1) : kv->as.cons.tail;
-                    r = sorted_put(env, r, k2, mk_map_entry(k2, v2));
+                    r = sorted_put(env, r, k2, v2);
                 }
             } else cljc_error("conj on sorted map: expected a [k v] entry or a map");
         } else if (r->tag == CLJC_MAP) {
@@ -5648,7 +5663,7 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
             r = map_assoc(r, k, v);
         }
         else if (r->tag == CLJC_SORTED && r->as.sorted.is_map) {
-            r = sorted_put(env, r, k, mk_map_entry(k, v));
+            r = sorted_put(env, r, k, v);
         }
         else if (r->tag == CLJC_VECTOR) {
             if (k->tag != CLJC_INT || k->as.i < 0)
@@ -5676,9 +5691,8 @@ static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *map_kv_list(Cljc *m, int kv) {
     Cljc *out = NIL, **t = &out;
     if (m->tag == CLJC_SORTED) {
-        Cljc *items = m->as.sorted.items;
-        for (size_t i = 0, n = vec_len(items); i < n; i++) {
-            *t = mk_cons(vec_nth(vec_nth(items, i), kv), NIL);
+        for (Cljc *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
+            *t = mk_cons(vec_nth(e->as.cons.head, kv), NIL);
             t = &(*t)->as.cons.tail;
         }
     } else {
@@ -5712,9 +5726,7 @@ static Cljc *prim_contains_p(CljcEnv *env, Cljc **argv, int nargs) {
     if (coll == NIL) return FALSE;
     if (coll->tag == CLJC_MAP) return mk_bool(map_find(coll, k, NULL));
     if (coll->tag == CLJC_SET) return mk_bool(set_contains(coll, k, NULL));
-    if (coll->tag == CLJC_SORTED) {
-        bool found; sorted_bsearch(env, coll, k, &found); return mk_bool(found);
-    }
+    if (coll->tag == CLJC_SORTED) return mk_bool(sorted_contains(env, coll, k));
     if (coll->tag == CLJC_VECTOR)  /* contains? checks INDEX presence on vectors */
         return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
     cljc_error("contains?: not associative");
@@ -5730,11 +5742,8 @@ static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
         if (r == NIL) { r = m; continue; }
         /* preserve the first map's type (a sorted map merges into a sorted map) */
         if (m->tag == CLJC_SORTED) {
-            Cljc *items = m->as.sorted.items;
-            for (size_t i = 0, n = vec_len(items); i < n; i++) {
-                Cljc *e = vec_nth(items, i);
-                Cljc *pair[2] = { vec_nth(e, 0), vec_nth(e, 1) };
-                Cljc *ca[2] = { r, mk_vector(pair, 2) };
+            for (Cljc *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
+                Cljc *ca[2] = { r, e->as.cons.head };   /* head is a [k v] entry */
                 r = prim_conj(env, ca, 2);
             }
         } else {
@@ -7149,14 +7158,14 @@ static Cljc *prim_compare(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *mk_sorted(Cljc *cmp, bool is_map) {
     Cljc *s = alloc(CLJC_SORTED);
-    s->as.sorted.items = mk_empty_vec();
+    s->as.sorted.root = NIL;
     s->as.sorted.cmp = cmp;          /* NIL => default cmp_values */
     s->as.sorted.is_map = is_map;
     return s;
 }
 
-/* the comparison key of an entry: a set's element is its own key; a map entry
- * is a [k v] vector keyed by element 0. */
+/* the comparison key of an iteration entry: a set's element is its own key; a
+ * map entry is a [k v] vector keyed by element 0. */
 static Cljc *sorted_entry_key(Cljc *coll, Cljc *entry) {
     return coll->as.sorted.is_map ? vec_nth(entry, 0) : entry;
 }
@@ -7174,87 +7183,137 @@ static int sorted_cmp_call(CljcEnv *env, Cljc *coll, Cljc *a, Cljc *b) {
     return is_truthy(apply(env, cmp, args2, 2)) ? 1 : 0;
 }
 
-/* first index whose key compares >= `key`; *found set when that key cmp==0. */
-static size_t sorted_bsearch(CljcEnv *env, Cljc *coll, Cljc *key, bool *found) {
-    Cljc *items = coll->as.sorted.items;
-    size_t lo = 0, hi = vec_len(items);
-    *found = false;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        int c = sorted_cmp_call(env, coll, sorted_entry_key(coll, vec_nth(items, mid)), key);
-        if (c < 0) lo = mid + 1; else hi = mid;
-    }
-    if (lo < vec_len(items) &&
-        sorted_cmp_call(env, coll, sorted_entry_key(coll, vec_nth(items, lo)), key) == 0)
-        *found = true;
-    return lo;
+static Cljc *mk_map_entry(Cljc *k, Cljc *v) {
+    Cljc *kv[2] = { k, v };
+    return mk_vector(kv, 2);
 }
 
-static Cljc *sorted_clone(Cljc *coll, Cljc *items) {
+/* ── weight-balanced (Adams') tree backing a sorted collection ──
+ * Persistent: every insert/delete copies only the path it touches. DELTA bounds
+ * the size ratio between siblings; GAMMA picks single vs double rotation. */
+#define WBT_DELTA 3u
+#define WBT_GAMMA 2u
+
+static uint32_t tree_size(Cljc *n) { return n == NIL ? 0 : n->as.tnode.size; }
+
+static Cljc *mk_tnode(Cljc *l, Cljc *key, Cljc *val, Cljc *r) {
+    Cljc *n = alloc(CLJC_TNODE);
+    n->as.tnode.left = l; n->as.tnode.right = r;
+    n->as.tnode.key = key; n->as.tnode.val = val;
+    n->as.tnode.size = tree_size(l) + tree_size(r) + 1;
+    return n;
+}
+
+static Cljc *tnode_balance(Cljc *l, Cljc *key, Cljc *val, Cljc *r) {
+    uint32_t ln = tree_size(l), rn = tree_size(r);
+    if (ln + rn <= 1) return mk_tnode(l, key, val, r);
+    if (rn > WBT_DELTA * ln) {                  /* right heavy: rotate left */
+        Cljc *rl = r->as.tnode.left, *rr = r->as.tnode.right;
+        if (tree_size(rl) < WBT_GAMMA * tree_size(rr))            /* single */
+            return mk_tnode(mk_tnode(l, key, val, rl),
+                            r->as.tnode.key, r->as.tnode.val, rr);
+        return mk_tnode(mk_tnode(l, key, val, rl->as.tnode.left), /* double */
+                        rl->as.tnode.key, rl->as.tnode.val,
+                        mk_tnode(rl->as.tnode.right, r->as.tnode.key, r->as.tnode.val, rr));
+    }
+    if (ln > WBT_DELTA * rn) {                   /* left heavy: rotate right */
+        Cljc *ll = l->as.tnode.left, *lr = l->as.tnode.right;
+        if (tree_size(lr) < WBT_GAMMA * tree_size(ll))            /* single */
+            return mk_tnode(ll, l->as.tnode.key, l->as.tnode.val,
+                            mk_tnode(lr, key, val, r));
+        return mk_tnode(mk_tnode(ll, l->as.tnode.key, l->as.tnode.val, lr->as.tnode.left),
+                        lr->as.tnode.key, lr->as.tnode.val,       /* double */
+                        mk_tnode(lr->as.tnode.right, key, val, r));
+    }
+    return mk_tnode(l, key, val, r);
+}
+
+static Cljc *tnode_insert(CljcEnv *env, Cljc *coll, Cljc *n, Cljc *key, Cljc *val) {
+    if (n == NIL) return mk_tnode(NIL, key, val, NIL);
+    int c = sorted_cmp_call(env, coll, key, n->as.tnode.key);
+    if (c < 0) return tnode_balance(tnode_insert(env, coll, n->as.tnode.left, key, val),
+                                    n->as.tnode.key, n->as.tnode.val, n->as.tnode.right);
+    if (c > 0) return tnode_balance(n->as.tnode.left, n->as.tnode.key, n->as.tnode.val,
+                                    tnode_insert(env, coll, n->as.tnode.right, key, val));
+    if (!coll->as.sorted.is_map) return n;       /* set: keep existing element */
+    return mk_tnode(n->as.tnode.left, key, val, n->as.tnode.right);  /* map: update */
+}
+
+static Cljc *tnode_delete_min(Cljc *n, Cljc **ok, Cljc **ov) {
+    if (n->as.tnode.left == NIL) { *ok = n->as.tnode.key; *ov = n->as.tnode.val; return n->as.tnode.right; }
+    return tnode_balance(tnode_delete_min(n->as.tnode.left, ok, ov),
+                         n->as.tnode.key, n->as.tnode.val, n->as.tnode.right);
+}
+static Cljc *tnode_delete_max(Cljc *n, Cljc **ok, Cljc **ov) {
+    if (n->as.tnode.right == NIL) { *ok = n->as.tnode.key; *ov = n->as.tnode.val; return n->as.tnode.left; }
+    return tnode_balance(n->as.tnode.left, n->as.tnode.key, n->as.tnode.val,
+                         tnode_delete_max(n->as.tnode.right, ok, ov));
+}
+/* join two subtrees of a removed node (the larger donates its extreme element). */
+static Cljc *tnode_glue(Cljc *l, Cljc *r) {
+    if (l == NIL) return r;
+    if (r == NIL) return l;
+    Cljc *k, *v;
+    if (tree_size(l) > tree_size(r)) { Cljc *nl = tnode_delete_max(l, &k, &v); return tnode_balance(nl, k, v, r); }
+    Cljc *nr = tnode_delete_min(r, &k, &v); return tnode_balance(l, k, v, nr);
+}
+static Cljc *tnode_delete(CljcEnv *env, Cljc *coll, Cljc *n, Cljc *key, bool *removed) {
+    if (n == NIL) { *removed = false; return NIL; }
+    int c = sorted_cmp_call(env, coll, key, n->as.tnode.key);
+    if (c < 0) return tnode_balance(tnode_delete(env, coll, n->as.tnode.left, key, removed),
+                                    n->as.tnode.key, n->as.tnode.val, n->as.tnode.right);
+    if (c > 0) return tnode_balance(n->as.tnode.left, n->as.tnode.key, n->as.tnode.val,
+                                    tnode_delete(env, coll, n->as.tnode.right, key, removed));
+    *removed = true;
+    return tnode_glue(n->as.tnode.left, n->as.tnode.right);
+}
+
+static Cljc *sorted_clone(Cljc *coll, Cljc *root) {
     Cljc *s = alloc(CLJC_SORTED);
-    s->as.sorted.items = items;
+    s->as.sorted.root = root;
     s->as.sorted.cmp = coll->as.sorted.cmp;
     s->as.sorted.is_map = coll->as.sorted.is_map;
     s->meta = coll->meta;
     return s;
 }
 
-/* items with `entry` inserted at `at`, or (insert=false) the entry at `at` dropped. */
-static Cljc *sorted_splice(Cljc *items, size_t at, Cljc *entry, bool insert) {
-    size_t n = vec_len(items);
-    Cljc *out = mk_empty_vec();
-    for (size_t j = 0; j < at; j++) out = vec_conj1(out, vec_nth(items, j));
-    if (insert) out = vec_conj1(out, entry);
-    for (size_t j = at + (insert ? 0 : 1); j < n; j++) out = vec_conj1(out, vec_nth(items, j));
-    return out;
-}
+static uint32_t sorted_count(Cljc *coll) { return tree_size(coll->as.sorted.root); }
 
-/* set conj / map assoc: insert `entry` for `key`, replacing any cmp-equal entry
- * (map replaces the value; set keeps the existing element on a cmp-tie). */
-static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *entry) {
-    bool found;
-    size_t i = sorted_bsearch(env, coll, key, &found);
-    Cljc *items = coll->as.sorted.items;
-    if (found) {
-        if (!coll->as.sorted.is_map) return coll;     /* element already present */
-        Cljc *out = mk_empty_vec();
-        size_t n = vec_len(items);
-        for (size_t j = 0; j < n; j++)
-            out = vec_conj1(out, j == i ? entry : vec_nth(items, j));
-        return sorted_clone(coll, out);
-    }
-    return sorted_clone(coll, sorted_splice(items, i, entry, true));
+/* set conj / map assoc: `val` is the element (set) or the raw value (map). */
+static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *val) {
+    return sorted_clone(coll, tnode_insert(env, coll, coll->as.sorted.root, key, val));
 }
-
 static Cljc *sorted_remove(CljcEnv *env, Cljc *coll, Cljc *key) {
-    bool found;
-    size_t i = sorted_bsearch(env, coll, key, &found);
-    if (!found) return coll;
-    return sorted_clone(coll, sorted_splice(coll->as.sorted.items, i, NULL, false));
+    bool removed = false;
+    Cljc *root = tnode_delete(env, coll, coll->as.sorted.root, key, &removed);
+    return removed ? sorted_clone(coll, root) : coll;
 }
-
 static bool sorted_get(CljcEnv *env, Cljc *coll, Cljc *key, Cljc **out) {
-    bool found;
-    size_t i = sorted_bsearch(env, coll, key, &found);
-    if (!found) return false;
-    Cljc *entry = vec_nth(coll->as.sorted.items, i);
-    *out = coll->as.sorted.is_map ? vec_nth(entry, 1) : entry;
-    return true;
-}
-
-/* entries (set: elements; map: [k v] vectors) as a cons list, in order. */
-static Cljc *sorted_entry_list(Cljc *coll) {
-    Cljc *items = coll->as.sorted.items, *out = NIL, **t = &out;
-    for (size_t i = 0, n = vec_len(items); i < n; i++) {
-        *t = mk_cons(vec_nth(items, i), NIL);
-        t = &(*t)->as.cons.tail;
+    for (Cljc *n = coll->as.sorted.root; n != NIL; ) {
+        int c = sorted_cmp_call(env, coll, key, n->as.tnode.key);
+        if (c < 0) n = n->as.tnode.left;
+        else if (c > 0) n = n->as.tnode.right;
+        else { *out = n->as.tnode.val; return true; }
     }
-    return out;
+    return false;
+}
+static bool sorted_contains(CljcEnv *env, Cljc *coll, Cljc *key) {
+    Cljc *out; return sorted_get(env, coll, key, &out);
 }
 
-static Cljc *mk_map_entry(Cljc *k, Cljc *v) {
-    Cljc *kv[2] = { k, v };
-    return mk_vector(kv, 2);
+/* in-order entries (set: elements; map: [k v] vectors) as a cons list. */
+static void tnode_collect(Cljc *coll, Cljc *n, Cljc ***t) {
+    if (n == NIL) return;
+    tnode_collect(coll, n->as.tnode.left, t);
+    Cljc *e = coll->as.sorted.is_map ? mk_map_entry(n->as.tnode.key, n->as.tnode.val) : n->as.tnode.key;
+    **t = mk_cons(e, NIL);
+    *t = &(**t)->as.cons.tail;
+    tnode_collect(coll, n->as.tnode.right, t);
+}
+static Cljc *sorted_entry_list(Cljc *coll) {
+    Cljc *out = NIL, **t = &out;
+    tnode_collect(coll, coll->as.sorted.root, &t);
+    return out;
 }
 
 static Cljc *prim_sorted_set(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7270,13 +7329,13 @@ static Cljc *prim_sorted_set_by(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_sorted_map(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *m = mk_sorted(NIL, true);
     for (int i = 0; i + 1 < nargs; i += 2)
-        m = sorted_put(env, m, argv[i], mk_map_entry(argv[i], argv[i + 1]));
+        m = sorted_put(env, m, argv[i], argv[i + 1]);
     return m;
 }
 static Cljc *prim_sorted_map_by(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *m = mk_sorted(argv[0], true);
     for (int i = 1; i + 1 < nargs; i += 2)
-        m = sorted_put(env, m, argv[i], mk_map_entry(argv[i], argv[i + 1]));
+        m = sorted_put(env, m, argv[i], argv[i + 1]);
     return m;
 }
 
@@ -7290,9 +7349,9 @@ static Cljc *sorted_subseq(CljcEnv *env, Cljc **argv, int nargs, bool rev) {
     bool two = nargs >= 5;
     Cljc *t1 = argv[1], *k1 = argv[2];
     Cljc *t2 = two ? argv[3] : NIL, *k2 = two ? argv[4] : NIL;
-    Cljc *items = coll->as.sorted.items, *out = NIL, **t = &out;
-    for (size_t i = 0, n = vec_len(items); i < n; i++) {
-        Cljc *entry = vec_nth(items, i), *ek = sorted_entry_key(coll, entry);
+    Cljc *out = NIL, **t = &out;
+    for (Cljc *e = sorted_entry_list(coll); e != NIL; e = e->as.cons.tail) {
+        Cljc *entry = e->as.cons.head, *ek = sorted_entry_key(coll, entry);
         Cljc *a1[2] = { mk_int(sorted_cmp_call(env, coll, ek, k1)), mk_int(0) };
         if (!is_truthy(apply(env, t1, a1, 2))) continue;
         if (two) {

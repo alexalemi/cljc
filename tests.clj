@@ -1718,5 +1718,15 @@
 (assert= true (sorted? (empty (sorted-set 1))))
 (assert= {:a 1 :b 2} (merge (sorted-map :a 1) {:b 2}))
 (assert= true (sorted? (merge (sorted-map :a 1) {:b 2})))
+; weight-balanced tree stays balanced: 50k ASCENDING inserts (worst case for a
+; naive BST) + deletes must be O(n log n), not O(n^2). Skip under GC stress.
+(when-not (cljc/env* "CLJC_GC_STRESS")
+  (let [n 50000
+        s (reduce conj (sorted-set) (range n))]
+    (assert= n (count s))
+    (assert= true (= (seq s) (range n)))                  ; ordered
+    (assert= true (contains? s 25000))
+    (assert= 5 (count (subseq s >= (- n 5))))
+    (assert= (range 1 n 2) (seq (reduce disj s (range 0 n 2))))))
 
 (println "tests complete")

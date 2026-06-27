@@ -2476,9 +2476,12 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
                 }
                 cljc_error("destructure: unsupported map directive :%s", k->as.kw);
             }
-            /* {binding-form lookup-key} */
+            /* {binding-form lookup-key} — the key is evaluated (a keyword self-
+             * evaluates, but a symbol key is written quoted: {n '?n} looks up the
+             * symbol ?n, not the literal form (quote ?n)). */
+            Cljc *key = eval(scope, spec);
             Cljc *v = NIL;
-            bool found = value != NIL && value->tag == CLJC_MAP && map_find(value, spec, &v);
+            bool found = value != NIL && value->tag == CLJC_MAP && map_find(value, key, &v);
             if (!found && defaults && defaults->tag == CLJC_MAP && k->tag == CLJC_SYMBOL) {
                 Cljc *d;
                 if (map_find(defaults, k, &d)) v = eval(scope, d);

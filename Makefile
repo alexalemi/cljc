@@ -30,6 +30,8 @@ install: cljc
 	install -m 644 cljc.c $(DESTDIR)$(SHAREDIR)/   # `cljc bundle` needs the source
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure
 	install -m 644 vendor/clojure/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/core
+	install -m 644 vendor/clojure/core/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/core/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/data
 	install -m 644 vendor/clojure/data/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/data/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/math

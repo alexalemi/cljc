@@ -1729,4 +1729,30 @@
     (assert= 5 (count (subseq s >= (- n 5))))
     (assert= (range 1 n 2) (seq (reduce disj s (range 0 n 2))))))
 
+; ── clojure.core.async (vendored, coroutine-backed) ──
+(require '[clojure.core.async :as async])
+(assert= 3 (async/<!! (async/go (+ 1 2))))                  ; go + blocking take
+(let [c (async/chan)]                                       ; unbuffered rendezvous
+  (async/go (async/>! c :hi))
+  (assert= :hi (async/<!! (async/go (async/<! c)))))
+(let [bc (async/chan 4)]                                    ; buffered producer/consumer
+  (async/go (doseq [i (range 5)] (async/>! bc i)) (async/close! bc))
+  (assert= [0 1 2 3 4]
+           (async/<!! (async/go (loop [acc []]
+                                  (let [v (async/<! bc)]
+                                    (if (nil? v) acc (recur (conj acc v)))))))))
+(let [jobs (async/chan 10) out (async/chan 10)]             ; 3-worker pool
+  (dotimes [_ 3]
+    (async/go (loop [] (when-let [j (async/<! jobs)] (async/>! out (* j j)) (recur)))))
+  (async/go (doseq [j (range 1 6)] (async/>! jobs j)) (async/close! jobs))
+  (assert= [1 4 9 16 25]
+           (sort (async/<!! (async/go (loop [acc [] n 0]
+                                        (if (< n 5) (recur (conj acc (async/<! out)) (inc n)) acc)))))))
+(assert= [:nothing :default]                                ; alts! :default
+         (async/<!! (async/go (async/alts! [(async/chan)] :default :nothing))))
+(assert= (range 5) (async/<!! (async/into [] (async/to-chan! (range 5)))))  ; combinators
+(let [t0 (cljc/now-ms*)]                                    ; timeout actually waits
+  (async/<!! (async/timeout 30))
+  (assert= true (>= (- (cljc/now-ms*) t0) 25)))
+
 (println "tests complete")

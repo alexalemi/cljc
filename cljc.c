@@ -9247,7 +9247,7 @@ static const char *PRELUDE =
     "(defn System/getenv ([] {}) ([k] (cljc/env* k)))\n"
     "(defn System/getProperty ([k] nil) ([k d] d))\n"
     "(defn System/exit [n] nil)\n"
-    "(defn System/currentTimeMillis [] 0)\n"
+    "(defn System/currentTimeMillis [] (long (cljc/now-ms*)))\n"
     /* Apache Commons Math integer gcd, used by Emmy's rational-function simplifier */
     "(defn ArithmeticUtils/gcd [a b]\n"
     "  (let [a (if (neg? a) (- a) a) b (if (neg? b) (- b) b)]\n"
@@ -9289,7 +9289,7 @@ static const char *PRELUDE =
     "(defn .isArray [_] false)\n"   /* cljc arrays are vectors, not host array classes */
     "(defn .first [c] (first c))\n"
     "(defn random-uuid [] (UUID/randomUUID))\n"
-    "(defn System/nanoTime [] 0)\n"
+    "(defn System/nanoTime [] (long (* (cljc/now-ms*) 1000000.0)))\n"
     "(defn System/lineSeparator [] \"\\n\")\n"
     /* *in* / with-in-str + a LispReader$StringReader shim: instaparse unescapes
      * grammar strings by reading them through the JVM reader. cljc has no such
@@ -9307,7 +9307,7 @@ static const char *PRELUDE =
     /* threads: cljc is single-threaded, so one stable identity/id */
     "(defn Thread/currentThread [] :main-thread)\n"
     "(defn .getId [_] 0)\n"
-    "(defn Thread/sleep [& _] nil)\n"
+    "(defn Thread/sleep [ms & _] (cljc/sleep-ms* ms))\n"
     /* primitive TYPE fields (reflection tables) -> cljc type keywords */
     "(def Character/TYPE :char) (def Integer/TYPE :int) (def Long/TYPE :int)\n"
     "(def Double/TYPE :double) (def Float/TYPE :double) (def Boolean/TYPE :bool)\n"

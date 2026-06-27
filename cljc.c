@@ -2643,6 +2643,16 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
     return NULL;
 }
 
+/* True if `name` is a LOCAL binding in env — a let/loop/fn/letfn local shadowing
+ * a special form (Clojure lets (letfn [(loop [..] ..)] (loop ..)) call the local).
+ * Only consulted for the function-like special forms loop/let/fn, never the hot
+ * syntactic ones (if/when/cond/..), so ordinary code pays nothing. */
+static bool head_shadowed(CljcEnv *env, const char *name) {
+    for (CljcEnv *e = env; e->parent; e = e->parent)
+        if (env_local_find(e, name)) return true;
+    return false;
+}
+
 static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
     const char *name = form->as.symc.name;
     CljcEnv *e = env;
@@ -3979,9 +3989,10 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     if (s == SYM_NS) {
                         /* (ns name (:require [a.b :as x] ...)) — load the
                          * :require clauses; everything else is tolerated. */
-                        static const char *KW_REQ, *KW_IMPORT;
+                        static const char *KW_REQ, *KW_IMPORT, *KW_USE;
                         if (!KW_REQ) { KW_REQ = intern("require", 7);
-                                       KW_IMPORT = intern("import", 6); }
+                                       KW_IMPORT = intern("import", 6);
+                                       KW_USE = intern("use", 3); }
                         for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
                             Cljc *cl = c->as.cons.head;
                             /* clause head keyword -> which per-spec handler */
@@ -3994,6 +4005,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                 kw = vec_nth(cl, 0)->as.kw;
                             const char *callee_name =
                                 kw == KW_REQ    ? "cljc/require-one" :
+                                kw == KW_USE    ? "cljc/use-one"     :
                                 kw == KW_IMPORT ? "cljc/import-one"  : NULL;
                             if (!callee_name) continue;
                             Cljc *callee = env_lookup_maybe(env, callee_name);
@@ -4207,7 +4219,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     }
                     return val;
                 }
-                if (s == SYM_LET) {
+                if (s == SYM_LET && !head_shadowed(env, head->as.sym)) {
                     /* (let [a 1 b 2] body...) — bindings live in a vector. */
                     Cljc *binds_vec = rest->as.cons.head;
                     if (binds_vec == NIL || binds_vec->tag != CLJC_VECTOR ||
@@ -4277,7 +4289,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     }
                     return r;
                 }
-                if (s == SYM_LOOP) {
+                if (s == SYM_LOOP && !head_shadowed(env, head->as.sym)) {
                     /* (loop [name1 init1 name2 init2 ...] body...) — like let,
                      * but body re-runs whenever it produces a (recur ...) value. */
                     Cljc *binds_vec = rest->as.cons.head;
@@ -4351,7 +4363,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         return l;
                     }
                 }
-                if (s == SYM_FN) {
+                if (s == SYM_FN && !head_shadowed(env, head->as.sym)) {
                     /* (fn [x] ...) | (fn ([x] ...) ...) | (fn name [x] ...)
                      * Named fns see themselves via late binding: the name is
                      * defined into the closure env after construction. */
@@ -8329,6 +8341,16 @@ static const char *PRELUDE =
     "(defn str/split-lines [s] (re-split s \"\\r?\\n\"))\n"
     "(defmacro if-not [test then & else] `(if (not ~test) ~then ~@else))\n"
     "(defmacro fn* [& body] (cons 'fn body))\n"   /* fn* === fn (cljc fn is the special form) */
+    /* (. target member ..) interop: (. Class (m a)) -> (Class/m a) when target is
+       a class (dotted or Capitalized), else instance (.m target a). */
+    "(defmacro . [target member & args]\n"
+    "  (let [m (if (seq? member) member (cons member args))\n"
+    "        s (str target)\n"
+    "        c (when (pos? (count s)) (int (first s)))\n"
+    "        static? (and (symbol? target) (or (str/includes? s \".\") (and c (>= c 65) (<= c 90))))]\n"
+    "    (if static?\n"
+    "      (cons (symbol (str s \"/\" (first m))) (rest m))\n"
+    "      (cons (symbol (str \".\" (first m))) (cons target (rest m))))))\n"
     "(defmacro let* [& body] (cons 'let body))\n"
     "(defmacro loop* [& body] (cons 'loop body))\n"
     "(defmacro when-not [test & body] `(when (not ~test) ~@body))\n"
@@ -8508,7 +8530,21 @@ static const char *PRELUDE =
     "(defn subvec\n"
     "  ([v s] (subvec v s (count v)))\n"
     "  ([v s e] (vec (take (- e s) (drop s v)))))\n"
-    "(defn coll? [x] (or (list? x) (vector? x) (map? x) (set? x) (seq? x)))\n"
+    /* defrecord registers its type here so a deftype can be told apart from a
+       record (both are tagged maps in cljc). map? stays native (records, plain
+       maps, AND deftypes all read as maps — instaparse relies on this). */
+    "(def cljc/record-types (atom #{}))\n"
+    "(def cljc/map-raw? map?)\n"
+    /* coll?, though, must be FALSE for a deftype that isn't a collection (Emmy's
+       structures and core.logic's LVar are tagged maps but not collections): a
+       tagged map counts as a coll only when it's a record or derives a collection
+       interface (Sequential / IPersistentCollection). Plain maps stay colls. */
+    "(defn coll? [x]\n"
+    "  (or (list? x) (vector? x) (set? x) (seq? x) (sequential? x)\n"
+    "      (and (cljc/map-raw? x)\n"
+    "           (let [t (get x :cljc/type)]\n"
+    "             (or (nil? t) (contains? (deref cljc/record-types) t)\n"
+    "                 (isa? t :clojure.lang.IPersistentCollection))))))\n"
     "(defn map-entry? [x] (and (vector? x) (= 2 (count x))))\n"
     "(defn list* [& args]\n"
     "  (let [r (reverse args)]\n"
@@ -8522,8 +8558,10 @@ static const char *PRELUDE =
     "(def vreset! reset!)\n"
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
     "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
+    /* a deftype (no longer map?) is sequential? when it derives Sequential —
+       check the type tag directly, not map?. */
     "(defn sequential? [x] (boolean (or (list? x) (vector? x) (seq? x)\n"
-    "                          (and (map? x) (:cljc/type x) (isa? (:cljc/type x) :clojure.lang.Sequential)))))\n"
+    "                          (let [t (get x :cljc/type)] (and t (isa? t :clojure.lang.Sequential))))))\n"
     "(defn class [x] (if (fn? x) x (type x)))\n"   /* fn reflects on itself (below) */
     /* synthesize java.lang.reflect.Method info from cljc fn arities so libraries
        that compute arity by reflection (emmy.function) work without the JVM */
@@ -8679,16 +8717,19 @@ static const char *PRELUDE =
     "        fset  (set fsyms)\n"
     "        mset  (set (filter some? (map (fn [f] (when (cljc/field-mut? f) (cljc/field-sym f))) fields)))\n"
     "        ms    (filter list? specs)\n"
-    /* a declared Sequential marker interface makes the type sequential? (Emmy's
-       structures/matrices rely on this for their own s:nth) */
-    "        seqmark (some (fn [s] (str/ends-with? (str s) \"Sequential\")) (filter symbol? specs))\n"
+    /* every declared marker interface / protocol (definterface -> a keyword,
+       imported class -> a keyword) becomes a parent of this type, so
+       (instance? IBindable x) / (sequential? x) work via the hierarchy. */
+    "        ifaces (filter symbol? specs)\n"
     "        kvs   (mapcat (fn [s] [(keyword (str s)) (if (contains? mset s) (list 'atom s) s)]) fsyms)]\n"
     "    `(do\n"
     "       (def ~tname ~tkw)\n"
     "       (defn ~(symbol (str tname \".\")) ~fsyms\n"
     "         (hash-map :cljc/type ~tkw ~@kvs))\n"
     "       (def ~(symbol (str \"->\" tname)) ~(symbol (str tname \".\")))\n"
-    "       ~@(when seqmark [`(derive ~tkw :clojure.lang.Sequential)])\n"
+    "       ~@(map (fn [i] `(let [k# (cljc/resolve-maybe '~i)]\n"
+    "                         (when (and (keyword? k#) (not (contains? cljc/no-derive-kinds k#)))\n"
+    "                           (derive ~tkw k#)))) ifaces)\n"
     /* group method forms by name -> one multi-arity fn per (type,name), so a
        protocol method with several arities (e.g. IFn invoke) doesn't collide */
     "       ~@(map (fn [g]\n"
@@ -8750,6 +8791,8 @@ static const char *PRELUDE =
     "(defn stopwatch.core/start [] (constantly 0))\n"
     "(def cljc/uuid-counter (atom 0))\n"
     "(defn UUID/randomUUID [] (symbol (str \"uuid-\" (swap! cljc/uuid-counter inc))))\n"
+    "(def cljc/rt-id (atom 0))\n"   /* clojure.lang.RT/nextID: monotonic unique ids (core.logic lvars) */
+    "(defn clojure.lang.RT/nextID [] (swap! cljc/rt-id inc))\n"
     "(defn random-uuid [] (UUID/randomUUID))\n"
     "(defn System/nanoTime [] 0)\n"
     "(defn System/lineSeparator [] \"\\n\")\n"
@@ -9001,8 +9044,8 @@ static const char *PRELUDE =
     "(def Long/toString Integer/toString)\n"
     "(defn Integer/toBinaryString [n] (Integer/toString n 2))\n"
     "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
-    "(defn RuntimeException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
-    "(defn Exception. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
+    "(defn RuntimeException. ([] (ex-info \"\" {})) ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
+    "(defn Exception. ([] (ex-info \"\" {})) ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
     "(defn IllegalArgumentException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
     "(defn IllegalStateException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
     "(defn UnsupportedOperationException. [msg] (ex-info (str msg) {}))\n"
@@ -9132,6 +9175,8 @@ static const char *PRELUDE =
     "(defn .nth ([c i] (nth c i)) ([c i d] (nth c i d)))\n"
     "(defn .count [c] (count c))\n"
     "(defn .seq [c] (seq c))\n"
+    "(defn .hashCode [x] (hash x))\n"
+    "(defn .equals [a b] (= a b))\n"
     "(defn .valAt ([m k] (get m k)) ([m k d] (get m k d)))\n"
     "(defn .deref [r] (deref r))\n"
     "(defn .idx [x] (:idx x))\n"   /* BindingNode field via (.idx node) in :clj */
@@ -9222,6 +9267,16 @@ static const char *PRELUDE =
        (extend-type MultiFn ..) etc. applies to every cljc function */
     "  \"AFunction\" :fn \"Fn\" :fn \"RestFn\" :fn \"MultiFn\" :fn \"IFn\" :fn \"AFn\" :fn\n"
     "  \"Var\" :var})\n"
+    /* a deftype must NOT derive from these — they're cljc's own native-value
+       kinds (and the multimethod :default / nil). Object resolves to :default,
+       so without this every deftype would become isa? :default. */
+    "(def cljc/no-derive-kinds (conj (set (vals cljc/class->kind)) :default :nil))\n"
+    /* bind the FULLY-QUALIFIED host class names too, so (extend-type
+       clojure.lang.Fn ..) — written without an import — resolves like the short
+       name does (core.logic extends clojure.lang.Fn for its delayed streams). */
+    "(doseq [[c k] cljc/class->kind]\n"
+    "  (eval (list 'def (symbol (str \"clojure.lang.\" c)) k))\n"
+    "  (eval (list 'def (symbol (str \"java.lang.\" c)) k)))\n"
     "(defn cljc/import-one [spec]\n"
     "  (when spec\n"
     "  (if (or (list? spec) (vector? spec) (seq? spec))\n"
@@ -10073,7 +10128,9 @@ CljcEnv *cljc_new_env(void) {
            (e.g. IFn invoke) becomes one multi-arity fn, not colliding entries */
         "  (let [ms (filter list? impls)\n"
         "        groups (vals (group-by first ms))]\n"
-        "    (if (keyword? t)\n"
+        /* nil is a real dispatch value ((type nil) => nil), so (extend-type nil ..)
+           — core.logic extends nil for IBind/IMPlus/ITake — registers under it. */
+        "    (if (or (keyword? t) (nil? t))\n"
         "      `(do ~@(map (fn [g]\n"
         "                    (let [m (first (first g))\n"
         "                          arities (map (fn [form] `(~(vec (second form)) ~@(drop 2 form))) g)]\n"
@@ -10124,6 +10181,7 @@ CljcEnv *cljc_new_env(void) {
         "        kvs   (mapcat (fn [s] [(keyword (str s)) s]) fsyms)]\n"
         "    `(do\n"
         "       (def ~rname ~kw)\n"
+        "       (swap! cljc/record-types conj ~kw)\n"   /* records ARE maps; deftypes aren't */
         "       (defn ~(symbol (str \"->\" rname)) ~fsyms (hash-map :cljc/type ~kw ~@kvs))\n"
         "       (def ~(symbol (str rname \".\")) ~(symbol (str \"->\" rname)))\n"
         "       (defn ~(symbol (str \"map->\" rname)) [m] (assoc m :cljc/type ~kw))\n"

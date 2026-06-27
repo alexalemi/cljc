@@ -5168,8 +5168,10 @@ static Cljc *prim_not(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
+    (void)nargs;
     if (argv[0] == NIL || argv[0]->tag == CLJC_EMPTY) return mk_int(0);
+    /* a deftype that implements Counted/count (e.g. a matrix) counts itself */
+    { Cljc *out; if (dispatch_deftype_method(env, argv[0], "count", NULL, 0, &out)) return out; }
     /* read the tag as an int — keeping no Cljc* head copy. A live local holding
      * argv[0] would conservatively pin the whole realized chain through the walk
      * below (count O(n) live); the int dispatch leaves nothing for the scan. */
@@ -5194,11 +5196,22 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     Cljc *coll = argv[0];
     int64_t n = as_int(argv[1], "nth");
     Cljc *not_found = nargs > 2
         ? argv[2] : NULL;
+    /* a deftype with Indexed/nth uses it; one that is only Sequential (a matrix
+     * via its rows) falls back to seq-based nth, like Clojure. */
+    if (coll && coll->tag == CLJC_MAP) {
+        Cljc *out;
+        if (dispatch_deftype_method(env, coll, "nth", argv + 1, nargs - 1, &out)) return out;
+        if (dispatch_deftype_method(env, coll, "seq", NULL, 0, &out)) {
+            for (Cljc *l = to_seq(out); l != NIL; l = to_seq(l->as.cons.tail))
+                if (n-- == 0) return l->as.cons.head;
+            if (not_found) return not_found;
+            cljc_error("nth: index out of bounds");
+        }
+    }
     if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
     } else if (coll && coll->tag == CLJC_STRING) {
@@ -5388,7 +5401,6 @@ static Cljc *prim_hash_map(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     Cljc *coll = argv[0];
     Cljc *k = argv[1];
     Cljc *dflt = nargs > 2
@@ -5396,6 +5408,9 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
     if (coll != NIL && coll->tag == CLJC_MAP) {
         Cljc *out;
         if (map_find(coll, k, &out)) return out;
+        /* not a field key — a deftype implementing ILookup/valAt (e.g. a matrix
+         * indexed by row) gets the lookup; plain maps/records just fall through. */
+        if (dispatch_deftype_method(env, coll, "valAt", argv + 1, nargs - 1, &out)) return out;
     } else if (coll != NIL && coll->tag == CLJC_SET) {
         Cljc *out;
         if (set_contains(coll, k, &out)) return out;

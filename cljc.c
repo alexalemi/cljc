@@ -8716,7 +8716,7 @@ static const char *PRELUDE =
     "(defn array-seq [x] (seq x)) (defn xml-seq [x] (seq x))\n"
     "(defn re-matcher [pat s] (.matcher pat s))\n"
     "(defn re-groups [m] (:groups (deref m)))\n"
-    "(defn remove-all-methods [mm] (swap! cljc/multi-tables assoc mm {}) nil)\n"
+    "(defn remove-all-methods [mm] (swap! cljc/multi-tables assoc (cljc/mmk mm) {}) nil)\n"
     "(defn prefers [_] {})\n"
     "(defn ex-cause [e] (when (map? e) (:cause e)))\n"
     "(defn tagged-literal [tag form] {:tag tag :form form})\n"
@@ -9712,6 +9712,12 @@ CljcEnv *cljc_new_env(void) {
     /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
     cljc_eval_string(e,
         "(def cljc/multi-tables (atom {}))\n"
+        /* Multimethod tables are keyed by the BARE method name (no namespace) —
+           the model deftype/extend-type/reify/protocol-vectors already use. This
+           is what lets a (defmulti add ..) in one ns and a (defmethod g/add ..)
+           in another (via the g alias, e.g. Emmy's emmy.generic vs emmy.numbers)
+           share a table: both normalize to `add`. */
+        "(defn cljc/mmk [s] (if (symbol? s) (symbol (name s)) s))\n"
         /* deftype protocol methods live in a SEPARATE registry the special
            invoke/deref dispatch reads, so a library redefining a method name as
            a defmulti (which resets multi-tables for that name) can't wipe them. */
@@ -9728,6 +9734,7 @@ CljcEnv *cljc_new_env(void) {
          * name; otherwise methods register under `add` but dispatch reads the
          * (with-meta add ..) form's empty table. */
         "  (let [name (loop [n name] (if (and (seq? n) (= 'with-meta (first n))) (recur (second n)) n))\n"
+        "        key (cljc/mmk name)\n"
         "        args (if (string? (first args)) (rest args) args)\n"
         "        args (if (map? (first args)) (rest args) args)\n"
         "        dispatch (first args)\n"
@@ -9737,17 +9744,20 @@ CljcEnv *cljc_new_env(void) {
            globals share the table between deftype protocol methods and a later
            (defmulti same-name) a library may declare (e.g. SCI redefining deref);
            resetting would wipe deftype deref/invoke/etc. methods. */
-        "  `(do (swap! cljc/multi-tables update '~name (fn [t#] (or t# {})))\n"
+        "  `(do (swap! cljc/multi-tables update '~key (fn [t#] (or t# {})))\n"
         "       (def ~name\n"
+        "         (with-meta\n"   /* carry the table key so (defmethod multifn ..) on a
+                                  * runtime multimethod value can find it (Emmy defunary) */
         "         (let [d# ~dispatch]\n"
         "           (fn [& args#]\n"
-        "             (let [t# (get @cljc/multi-tables '~name)\n"
+        "             (let [t# (get @cljc/multi-tables '~key)\n"
         "                   dv# (apply d# args#)\n"
         "                   m# (or (get t# dv#) (cljc/multi-find t# dv#) (get t# ~default))]\n"
         "               (if m#\n"
         "                 (apply m# args#)\n"
         "                 (throw (ex-info (str \"No method in \" '~name\n"
-        "                                      \" for \" (pr-str dv#)) {}))))))))))\n"
+        "                                      \" for \" (pr-str dv#)) {}))))))\n"
+        "         {:cljc/mm-key '~key})))))\n"
         "(defmacro defmethod [name dval params & body]\n"
         /* skip a host-class dispatch value (dotted / $-inner-class) that cljc
            can't resolve — it would never match anyway; bare typos still error */
@@ -9755,26 +9765,33 @@ CljcEnv *cljc_new_env(void) {
         "           (or (str/includes? (str dval) \".\") (str/includes? (str dval) \"$\"))\n"
         "           (not (cljc/resolve-maybe (str dval))))\n"
         "    nil\n"
-        "    `(do (swap! cljc/multi-tables update '~name assoc ~dval\n"
-        "                (fn ~params ~@body))\n"
-        "         '~name)))\n"
+        /* Clojure evaluates the multifn (so it can be a runtime value, e.g. Emmy's
+       defunary passes the multimethod as a fn arg). Read its table key from the
+       dispatch fn's metadata; fall back to the literal name for a plain symbol. */
+    "    `(let [mm# ~name\n"
+        "           key# (or (:cljc/mm-key (meta mm#)) (cljc/mmk '~name))]\n"
+        "       (swap! cljc/multi-tables update key# assoc ~dval (fn ~params ~@body))\n"
+        "       mm#)))\n"
         /* multimethod API: cljc has no dispatch hierarchy, so preferences are
            moot; the rest operate on the flat method table. */
         "(defn prefer-method [& _] nil)\n"
-        "(defn remove-method [mm dval] (swap! cljc/multi-tables update mm dissoc dval) mm)\n"
-        "(defn get-method [mm dval] (get (get @cljc/multi-tables mm) dval))\n"
-        "(defn methods [mm] (get @cljc/multi-tables mm))\n"
+        "(defn remove-method [mm dval] (swap! cljc/multi-tables update (cljc/mmk mm) dissoc dval) mm)\n"
+        "(defn get-method [mm dval] (get (get @cljc/multi-tables (cljc/mmk mm)) dval))\n"
+        "(defn methods [mm] (get @cljc/multi-tables (cljc/mmk mm)))\n"
         /* print-method/print-dup: Clojure printing multimethods libraries extend
            (cljc prints via print_to; these just need to exist + be defmethod-able) */
         "(defmulti print-method (fn [x & _] (type x)))\n"
         "(defmulti print-dup (fn [x & _] (type x)))\n"
         /* protocols: each method dispatches on (type (first args)) */
+        /* drop an optional protocol docstring (and any non-list sig); each method
+           sig is (name [args].. doc?), so only `name` matters for the defmulti */
         "(defmacro defprotocol [pname & sigs]\n"
+        "  (let [sigs (filter list? sigs)]\n"
         "  `(do ~@(map (fn [sig]\n"
         "                (let [m (first sig)]\n"
         "                  `(defmulti ~m (fn [& args#] (type (first args#))))))\n"
         "              sigs)\n"
-        "       (def ~pname '~(mapv first sigs))))\n"
+        "       (def ~pname '~(mapv first sigs)))))\n"
         /* definterface: cljc has no host interfaces — bind the name to a type
            keyword so deftype/instance?/extend references to it resolve. */
         "(defmacro definterface [iname & sigs] `(def ~iname ~(keyword (str iname))))\n"
@@ -9825,7 +9842,7 @@ CljcEnv *cljc_new_env(void) {
            the protocol's methods — a reify/extend may legally omit some (they'd
            throw only if called), and `every?` would wrongly reject it. */
         "(defn satisfies? [proto x]\n"
-        "  (boolean (some (fn [m] (contains? (get @cljc/multi-tables m) (type x))) proto)))\n"
+        "  (boolean (some (fn [m] (contains? (get @cljc/multi-tables (cljc/mmk m)) (type x))) proto)))\n"
         /* records: maps tagged with :cljc/type */
         /* defrecord: like deftype but immutable (fields are direct values, no
            atoms) and with both ->R (positional) and map->R (from a map) ctors.

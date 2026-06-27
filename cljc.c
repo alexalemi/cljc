@@ -3445,8 +3445,12 @@ static void fastcall_init(Cljc *fn) {
 static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
                                     Cljc **argv, int nargs, Cljc **out) {
     if (inst == NIL || inst->tag != CLJC_MAP) return false;
+    /* cache the :cljc/type keyword: this runs on every count/get-miss/assoc/nth,
+     * so re-interning + re-allocating the keyword each time is pure waste. */
+    static Cljc *KW_CLJC_TYPE;
+    if (!KW_CLJC_TYPE) KW_CLJC_TYPE = mk_kw(intern("cljc/type", 9));
     Cljc *tykw;
-    if (!map_find(inst, mk_kw(intern("cljc/type", 9)), &tykw)) return false;
+    if (!map_find(inst, KW_CLJC_TYPE, &tykw)) return false;
     Binding *mtb = root_find(env_root(env), intern("cljc/deftype-methods", 20), NULL);
     if (!mtb || mtb->value == NIL || mtb->value->tag != CLJC_ATOM) return false;
     Cljc *tables = mtb->value->as.atom.value, *tab, *method;
@@ -5132,6 +5136,7 @@ COMPARISON(lt, <)
 COMPARISON(gt, >)
 COMPARISON(le, <=)
 COMPARISON(ge, >=)
+COMPARISON(num_eq, ==)   /* == : numeric value-equality across the tower (1 == 1.0) */
 
 static Cljc *prim_println(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -5581,10 +5586,18 @@ static Cljc *prim_cons(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── Seq library ── */
 
-/* Force a lazy cell once; thunk dropped after so its closure can be GC'd. */
+/* Force a lazy cell once; thunk dropped after so its closure can be GC'd.
+ * The thunk often returns ANOTHER lazy seq (e.g. (lazy-seq (map f xs)) yields
+ * the map's own lazy); force through that chain to a realized cons/NIL before
+ * caching, the way Clojure's LazySeq.seq() flattens nested LazySeqs. Crucially
+ * `done` stays false during this, so a self-referential seq that re-enters its
+ * own force (chunk-map* walking the tail) still sees this cell as unrealized
+ * and stops there instead of looping forever. */
 static Cljc *lazy_force(Cljc *l) {
     if (!l->as.lazy.done) {
-        l->as.lazy.cached = apply(gc_root_envs[0], l->as.lazy.thunk, NULL, 0);
+        Cljc *r = apply(gc_root_envs[0], l->as.lazy.thunk, NULL, 0);
+        while (r != NIL && r != NULL && r->tag == CLJC_LAZY) r = lazy_force(r);
+        l->as.lazy.cached = r;
         l->as.lazy.done = true;
         l->as.lazy.thunk = NIL;
     }
@@ -5661,7 +5674,10 @@ static Cljc *to_seq(Cljc *v) {
          * AutoFlattenSeq): use it instead of seqing the field map. */
         Cljc *sq;
         if (dispatch_deftype_method(gc_root_envs[0], v, "seq", NULL, 0, &sq))
-            return (sq == NIL || sq == v) ? NIL : to_seq(sq);
+            /* seq1, not to_seq: the seq method may return an INFINITE lazy seq
+             * (e.g. an Emmy power series' coefficients); keep it lazy rather
+             * than realizing the whole thing here. */
+            return (sq == NIL || sq == v) ? NIL : seq1(sq);
         /* Maps seq into [k v] entry vectors. */
         Cljc *out = NIL, **t = &out;
         for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
@@ -8594,12 +8610,7 @@ static const char *PRELUDE =
     "  `(let [t0# (cljc/now-ms*) v# ~expr]\n"
     "     (println (str \"Elapsed time: \" (- (cljc/now-ms*) t0#) \" msecs\"))\n"
     "     v#))\n"
-    /* == is numeric value-equality across the tower (1 == 1.0), unlike = which is
-       category-sensitive. Neither-less-nor-greater via the numeric comparators. */
-    "(defn ==\n"
-    "  ([_] true)\n"
-    "  ([a b] (not (or (< a b) (> a b))))\n"
-    "  ([a b & more] (if (not (or (< a b) (> a b))) (apply == b more) false)))\n"
+    /* == (numeric value-equality across the tower, 1 == 1.0) is a native prim. */
     "(defn distinct? [& xs] (= (count xs) (count (set xs))))\n"
     /* +' -' *' are real auto-promoting natives now (see prim_*q); inc'/dec'
      * are defined just below in terms of them */
@@ -9440,6 +9451,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, ">",       prim_gt);
     cljc_define_native(e, "<=",      prim_le);
     cljc_define_native(e, ">=",      prim_ge);
+    cljc_define_native(e, "==",      prim_num_eq);
     cljc_define_native(e, "println", prim_println);
     cljc_define_native(e, "str",     prim_str);
     cljc_define_native(e, "pr-str",  prim_pr_str);

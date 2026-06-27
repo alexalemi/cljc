@@ -5235,13 +5235,20 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
         } else if (r->tag == CLJC_SET) {
             r = set_conj(r, x);
         } else if (r->tag == CLJC_MAP) {
-            /* (conj m [k v]) and (conj m {k v ...}) — Clojure semantics */
-            if (x != NIL && x->tag == CLJC_VECTOR && vec_len(x) == 2) {
+            /* (conj m [k v]) and (conj m {k v ...}) — Clojure semantics; nil is
+             * a no-op, and a 2-element seq is accepted like a vector entry. */
+            if (x == NIL) { /* no-op */ }
+            else if (x->tag == CLJC_VECTOR && vec_len(x) == 2) {
                 r = map_assoc(r, vec_nth(x, 0), vec_nth(x, 1));
-            } else if (x != NIL && x->tag == CLJC_MAP) {
+            } else if (x->tag == CLJC_MAP) {
                 for (Cljc *e = map_entry_list(x); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
                     r = map_assoc(r, e->as.cons.head->as.cons.head,
                                   e->as.cons.head->as.cons.tail);
+            } else if (x->tag == CLJC_LIST || x->tag == CLJC_LAZY) {
+                Cljc *s = to_seq(x);
+                if (s != NIL && s->as.cons.tail != NIL)
+                    r = map_assoc(r, s->as.cons.head, s->as.cons.tail->as.cons.head);
+                else cljc_error("conj on map: expected a [k v] entry or a map");
             } else cljc_error("conj on map: expected a [k v] entry or a map");
         } else cljc_error("conj: not a collection");
     }
@@ -6403,11 +6410,17 @@ static Cljc *prim_ns_publics(CljcEnv *env, Cljc **argv, int nargs) {
  * if unbound. Used by `cljc -m` to find a namespace's -main without throwing. */
 static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
     (void)nargs;
-    const char *raw = as_str(argv[0], "resolve-maybe");
+    /* A symbol arg keeps its home_ns so per-ns aliases / home-ns-qualified defs
+     * resolve (a stringified name loses it); a string arg resolves globally. */
+    Cljc *arg = argv[0];
+    if (arg == NIL) return NIL;
+    const char *raw, *home_ns = NULL;
+    if (arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
+    else raw = as_str(arg, "resolve-maybe");
     const char *name = intern(raw, strlen(raw));
     /* root_find handles the (require :as) alias + clojure.core fallbacks, so
      * a qualified name like edn/read-char* resolves to its real binding. */
-    Binding *b = root_find(env_root(env), name, NULL);
+    Binding *b = root_find(env_root(env), name, home_ns);
     return b ? b->value : NIL;
 }
 
@@ -6420,8 +6433,9 @@ static Cljc *prim_resolve_var(CljcEnv *env, Cljc **argv, int nargs) {
     /* A symbol arg keeps its home_ns so per-ns aliases resolve correctly (a
      * stringified name would lose it); a string arg resolves globally. */
     Cljc *arg = argv[0];
+    if (arg == NIL) return NIL;
     const char *raw, *home_ns = NULL;
-    if (arg != NIL && arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
+    if (arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
     else raw = as_str(arg, "resolve");
     const char *name = intern(raw, strlen(raw));
     Binding *b = root_find(env_root(env), name, home_ns);
@@ -6435,6 +6449,22 @@ static Cljc *prim_resolve_var(CljcEnv *env, Cljc **argv, int nargs) {
         m = map_assoc(m, mk_kw(intern("ns", 2)), mk_sym(intern(b->name, (size_t)(slash - b->name))));
     v->meta = m;
     return v;
+}
+
+/* (cljc/fn-arities f) -> [[fixed variadic?] ..] per arity. Lets the reflective
+ * arity machinery (emmy.function uses .getDeclaredMethods) work without the JVM. */
+static Cljc *prim_fn_arities(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *f = argv[0];
+    if (f == NIL || f->tag != CLJC_FN) return mk_empty_vec();
+    Cljc *out = mk_empty_vec();
+    for (Cljc *ar = f->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
+        Cljc *params = ar->as.cons.head->as.cons.head;
+        size_t fixed; bool variadic; arity_info(params, &fixed, &variadic);
+        Cljc *pair[2] = { mk_int((int64_t)fixed), mk_bool(variadic) };
+        out = vec_conj1(out, mk_vector(pair, 2));
+    }
+    return out;
 }
 
 /* (cljc/set-var! var value) — set a Var's binding to value (backs alter-var-root). */
@@ -8247,6 +8277,8 @@ static const char *PRELUDE =
     "(defn str/split-lines [s] (re-split s \"\\r?\\n\"))\n"
     "(defmacro if-not [test then & else] `(if (not ~test) ~then ~@else))\n"
     "(defmacro fn* [& body] (cons 'fn body))\n"   /* fn* === fn (cljc fn is the special form) */
+    "(defmacro let* [& body] (cons 'let body))\n"
+    "(defmacro loop* [& body] (cons 'loop body))\n"
     "(defmacro when-not [test & body] `(when (not ~test) ~@body))\n"
     "(defmacro -> [x & forms]\n"
     "  (loop [x x forms forms]\n"
@@ -8397,6 +8429,11 @@ static const char *PRELUDE =
     "(defmacro comment [& _] nil)\n"
     "(defmacro ->clerk-only [& _] nil)\n"   /* notebook-only code (mentat.clerk-utils): dropped */
     "(defmacro ->clerk [& _] nil)\n"
+    /* taoensso.timbre logging — no-ops (Emmy warns during simplify) */
+    "(defmacro taoensso.timbre/warn [& _] nil) (defmacro taoensso.timbre/info [& _] nil)\n"
+    "(defmacro taoensso.timbre/debug [& _] nil) (defmacro taoensso.timbre/error [& _] nil)\n"
+    "(defmacro taoensso.timbre/trace [& _] nil) (defmacro taoensso.timbre/spy [& body] (last body))\n"
+    "(defmacro taoensso.timbre/warnf [& _] nil) (defmacro taoensso.timbre/errorf [& _] nil)\n"
     "(defmacro defn- [name & body] `(defn ~name ~@body))\n"
     "(defn vary-meta [x f & args] (with-meta x (apply f (meta x) args)))\n"
     /* c resolves to a type keyword (deftype name, or a host-class stub/keyword);
@@ -8432,7 +8469,17 @@ static const char *PRELUDE =
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
     "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
     "(defn sequential? [x] (or (list? x) (vector? x) (seq? x)))\n"
-    "(def class type)\n"
+    "(defn class [x] (if (fn? x) x (type x)))\n"   /* fn reflects on itself (below) */
+    /* synthesize java.lang.reflect.Method info from cljc fn arities so libraries
+       that compute arity by reflection (emmy.function) work without the JVM */
+    "(defn .getDeclaredMethods [c]\n"
+    "  (if (fn? c)\n"
+    "    (vec (mapcat (fn [a] (let [n (first a) v (second a)]\n"
+    "                           (if v [{:nm \"doInvoke\" :pt (vec (repeat n nil))} {:nm \"getRequiredArity\"}]\n"
+    "                               [{:nm \"invoke\" :pt (vec (repeat n nil))}]))) (cljc/fn-arities c)))\n"
+    "    []))\n"
+    "(defn .getParameterTypes [m] (:pt m))\n"
+    "(defn .getRequiredArity [f] (or (some (fn [a] (when (second a) (first a))) (cljc/fn-arities f)) 0))\n"
     /* regexes are strings; the :regex meta makes str/split treat them so */
     "(defn re-pattern [s] (with-meta s {:regex true}))\n"
     "(defn boolean? [x] (or (true? x) (false? x)))\n"
@@ -8467,6 +8514,20 @@ static const char *PRELUDE =
     "    (when (seq ms)\n"
     "      (val (or (some (fn [e] (when (every? (fn [e2] (isa? (key e) (key e2))) ms) e)) ms)\n"
     "               (first ms))))))\n"
+    /* cljc's collection types ARE the host's Sequential/collection interfaces, so
+       derive them — lets a (defmethod f [.. Sequential]) match a vector/list/seq
+       dispatch value (e.g. Emmy's partial-derivative on a vector of selectors). */
+    "(doseq [c [:clojure.lang.Sequential :clojure.lang.IPersistentVector :clojure.lang.PersistentVector\n"
+    "           :clojure.lang.IPersistentCollection :clojure.lang.Indexed :clojure.lang.Associative]]\n"
+    "  (derive :vector c))\n"
+    "(doseq [c [:clojure.lang.Sequential :clojure.lang.ISeq :clojure.lang.IPersistentList\n"
+    "           :clojure.lang.PersistentList :clojure.lang.IPersistentCollection]] (derive :list c))\n"
+    "(doseq [c [:clojure.lang.Sequential :clojure.lang.ISeq :clojure.lang.LazySeq\n"
+    "           :clojure.lang.IPersistentCollection]] (derive :lazy-seq c))\n"
+    "(doseq [c [:clojure.lang.IPersistentMap :clojure.lang.Associative :clojure.lang.PersistentArrayMap\n"
+    "           :clojure.lang.PersistentHashMap :clojure.lang.IPersistentCollection]] (derive :map c))\n"
+    "(doseq [c [:clojure.lang.IPersistentSet :clojure.lang.PersistentHashSet\n"
+    "           :clojure.lang.IPersistentCollection]] (derive :set c))\n"
     "(defn every-pred [& ps]\n"
     "  (fn [& args] (every? (fn [p] (every? p args)) ps)))\n"
     "(defn some-fn [& ps]\n"
@@ -8616,6 +8677,9 @@ static const char *PRELUDE =
     "(defn System/getProperty ([k] nil) ([k d] d))\n"
     "(defn System/exit [n] nil)\n"
     "(defn System/currentTimeMillis [] 0)\n"
+    "(def cljc/uuid-counter (atom 0))\n"
+    "(defn UUID/randomUUID [] (symbol (str \"uuid-\" (swap! cljc/uuid-counter inc))))\n"
+    "(defn random-uuid [] (UUID/randomUUID))\n"
     "(defn System/nanoTime [] 0)\n"
     "(defn System/lineSeparator [] \"\\n\")\n"
     /* *in* / with-in-str + a LispReader$StringReader shim: instaparse unescapes
@@ -8628,7 +8692,7 @@ static const char *PRELUDE =
     "(defn java.util.LinkedList. [] [])\n"
     /* java reflection: cljc has no classes — inert */
     "(defn Class/forName [& _] nil)\n"
-    "(defn .getName [x] (str x))\n"
+    "(defn .getName [x] (if (and (map? x) (:nm x)) (:nm x) (str x)))\n"   /* :nm = synthetic Method */
     "(defn .getSimpleName [x] (str x))\n"
     "(defn .getClass [x] (type x))\n"
     /* threads: cljc is single-threaded, so one stable identity/id */
@@ -8996,6 +9060,7 @@ static const char *PRELUDE =
     "(defn .assoc [m k v] (assoc m k v))\n"
     "(defn .nth ([c i] (nth c i)) ([c i d] (nth c i d)))\n"
     "(defn .count [c] (count c))\n"
+    "(defn .seq [c] (seq c))\n"
     "(defn .valAt ([m k] (get m k)) ([m k d] (get m k d)))\n"
     "(defn .deref [r] (deref r))\n"
     "(defn .idx [x] (:idx x))\n"   /* BindingNode field via (.idx node) in :clj */
@@ -9344,6 +9409,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
     cljc_define_native(e, "cljc/resolve-var", prim_resolve_var);
     cljc_define_native(e, "cljc/set-var!", prim_set_var);
+    cljc_define_native(e, "cljc/fn-arities", prim_fn_arities);
     cljc_define_native(e, "macroexpand-1", prim_macroexpand_1);
     cljc_define_native(e, "cljc/eval-forms*", prim_eval_forms);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
@@ -9918,7 +9984,7 @@ CljcEnv *cljc_new_env(void) {
         "                          arities (map (fn [form] `(~(vec (second form)) ~@(drop 2 form))) g)]\n"
         "                      `(cljc/reg-method! '~m ~t (fn ~@arities))))\n"
         "                  groups))\n"
-        "      `(when-let [tv# (cljc/resolve-maybe ~(str t))]\n"
+        "      `(when-let [tv# (cljc/resolve-maybe '~t)]\n"
         "         ~@(map (fn [g]\n"
         "                  (let [m (first (first g))\n"
         "                        arities (map (fn [form] `(~(vec (second form)) ~@(drop 2 form))) g)]\n"

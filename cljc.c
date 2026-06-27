@@ -238,10 +238,24 @@ static void vpush(Cljc *v);
 void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
 /* Namespace aliases for the flat-global model: (require '[x.y :as m])
  * registers "m"; on lookup miss, m/foo retries as bare foo. */
-#define MAX_ALIASES 64
+#define MAX_ALIASES 8192
 static const char *alias_table[MAX_ALIASES];   /* alias prefix */
 static const char *alias_ns[MAX_ALIASES];      /* full namespace it names */
+static const char *alias_owner[MAX_ALIASES];   /* ns that registered it (per-ns
+                                                * aliases): NULL = REPL/global */
 static int n_aliases;
+/* Resolve an alias prefix to its target ns, preferring the one registered in the
+ * referencing symbol's OWN namespace (home_ns) — so a macro defined in ns A whose
+ * body says c/foo finds A's `c`, not some other ns's `c` from the flat table.
+ * Falls back to any-owner so REPL/global aliases still work. */
+static const char *alias_lookup(const char *prefix, const char *home_ns) {
+    if (home_ns)
+        for (int i = 0; i < n_aliases; i++)
+            if (alias_table[i] == prefix && alias_owner[i] == home_ns) return alias_ns[i];
+    for (int i = 0; i < n_aliases; i++)
+        if (alias_table[i] == prefix) return alias_ns[i];
+    return NULL;
+}
 
 /* Symbol-level refer aliases: (require '[x.y :refer [v]]) inside (ns a.b)
  * registers "a.b/v" -> "x.y/v" so all referrers resolve to the ONE source
@@ -1970,9 +1984,8 @@ static Cljc *read_atom(const char **p) {
             if (slash) {
                 size_t alen = (size_t)(slash - body);
                 const char *al = intern(body, alen);
-                const char *full = cur_reader_ns;
-                for (int i = 0; i < n_aliases; i++)
-                    if (alias_table[i] == al) { full = alias_ns[i]; break; }
+                const char *full = alias_lookup(al, cur_reader_ns);
+                if (!full) full = cur_reader_ns;
                 snprintf(buf, sizeof buf, "%s/%.*s", full ? full : "",
                          (int)(blen - alen - 1), slash + 1);
             } else {
@@ -2565,18 +2578,16 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
         const char *slash = strchr(name, '/');
         if (slash && slash != name) {
             const char *pre = intern(name, (size_t)(slash - name));
-            for (int i = 0; i < n_aliases; i++) {
-                if (alias_table[i] == pre) {
-                    char buf[256];
-                    snprintf(buf, sizeof buf, "%s/%s", alias_ns[i], slash + 1);
-                    const char *qual = intern(buf, strlen(buf));
-                    const char *bare = intern(slash + 1, strlen(slash + 1));
-                    for (Binding *b = root->bindings; b; b = b->next)
-                        if (b->name == qual) return b;
-                    for (Binding *b = root->bindings; b; b = b->next)
-                        if (b->name == bare) return b;
-                    break;
-                }
+            const char *full = alias_lookup(pre, home_ns);
+            if (full) {
+                char buf[256];
+                snprintf(buf, sizeof buf, "%s/%s", full, slash + 1);
+                const char *qual = intern(buf, strlen(buf));
+                const char *bare = intern(slash + 1, strlen(slash + 1));
+                for (Binding *b = root->bindings; b; b = b->next)
+                    if (b->name == qual) return b;
+                for (Binding *b = root->bindings; b; b = b->next)
+                    if (b->name == bare) return b;
             }
         }
     }
@@ -2859,13 +2870,8 @@ static const char *strip_core_qualifier(const char *s) {
     bool core = (plen == 12 && !memcmp(s, "clojure.core", 12)) ||
                 (plen == 9  && !memcmp(s, "cljs.core", 9));
     if (!core) {
-        const char *pre = intern(s, plen);
-        for (int i = 0; i < n_aliases; i++)
-            if (alias_table[i] == pre) {
-                core = !strcmp(alias_ns[i], "clojure.core") ||
-                       !strcmp(alias_ns[i], "cljs.core");
-                break;
-            }
+        const char *full = alias_lookup(intern(s, plen), NULL);
+        if (full) core = !strcmp(full, "clojure.core") || !strcmp(full, "cljs.core");
     }
     return core ? intern(slash + 1, strlen(slash + 1)) : s;
 }
@@ -4050,14 +4056,14 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                 if (slash && slash != nm) {
                                     const char *pre = intern(nm, (size_t)(slash - nm));
                                     const char *base = slash + 1;
-                                    for (int ai = 0; ai < n_aliases && !b; ai++)
-                                        if (alias_table[ai] == pre) {
-                                            char qb[256];
-                                            snprintf(qb, sizeof qb, "%s/%s", alias_ns[ai], base);
-                                            const char *q = intern(qb, strlen(qb));
-                                            for (Binding *x = root->bindings; x; x = x->next)
-                                                if (x->name == q) { b = x; break; }
-                                        }
+                                    const char *full = alias_lookup(pre, symc->as.symc.home_ns);
+                                    if (full) {
+                                        char qb[256];
+                                        snprintf(qb, sizeof qb, "%s/%s", full, base);
+                                        const char *q = intern(qb, strlen(qb));
+                                        for (Binding *x = root->bindings; x; x = x->next)
+                                            if (x->name == q) { b = x; break; }
+                                    }
                                     if (!b) {
                                         const char *bb = intern(base, strlen(base));
                                         for (Binding *x = root->bindings; x; x = x->next)
@@ -6332,11 +6338,13 @@ static Cljc *prim_alias(CljcEnv *env, Cljc **argv, int nargs) {
     const char *ns = as_str(argv[1], "alias*");
     const char *in = intern(a, strlen(a));
     const char *nsin = intern(ns, strlen(ns));
+    const char *owner = cur_reader_ns;   /* the ns this alias belongs to */
     for (int i = 0; i < n_aliases; i++)
-        if (alias_table[i] == in) { alias_ns[i] = nsin; return NIL; }
+        if (alias_table[i] == in && alias_owner[i] == owner) { alias_ns[i] = nsin; return NIL; }
     if (n_aliases >= MAX_ALIASES) cljc_error("too many aliases");
     alias_table[n_aliases] = in;
     alias_ns[n_aliases] = nsin;
+    alias_owner[n_aliases] = owner;
     n_aliases++;
     return NIL;
 }
@@ -6409,9 +6417,14 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
  * so reflective code like potemkin's import-def can read a def's name. */
 static Cljc *prim_resolve_var(CljcEnv *env, Cljc **argv, int nargs) {
     (void)nargs;
-    const char *raw = as_str(argv[0], "resolve");
+    /* A symbol arg keeps its home_ns so per-ns aliases resolve correctly (a
+     * stringified name would lose it); a string arg resolves globally. */
+    Cljc *arg = argv[0];
+    const char *raw, *home_ns = NULL;
+    if (arg != NIL && arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
+    else raw = as_str(arg, "resolve");
     const char *name = intern(raw, strlen(raw));
-    Binding *b = root_find(env_root(env), name, NULL);
+    Binding *b = root_find(env_root(env), name, home_ns);
     if (!b) return NIL;
     Cljc *v = alloc(CLJC_VAR);
     v->as.var.name = b->name;
@@ -6422,6 +6435,16 @@ static Cljc *prim_resolve_var(CljcEnv *env, Cljc **argv, int nargs) {
         m = map_assoc(m, mk_kw(intern("ns", 2)), mk_sym(intern(b->name, (size_t)(slash - b->name))));
     v->meta = m;
     return v;
+}
+
+/* (cljc/set-var! var value) — set a Var's binding to value (backs alter-var-root). */
+static Cljc *prim_set_var(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    Cljc *var = argv[0];
+    if (var == NIL || var->tag != CLJC_VAR) cljc_error("set-var!: not a var");
+    Binding *b = root_find(env_root(env), var->as.var.name, NULL);
+    if (b) b->value = argv[1];
+    return argv[1];
 }
 
 /* (cljc/eval-forms* src) — read and eval each top-level form in turn (NOT
@@ -8996,13 +9019,14 @@ static const char *PRELUDE =
        resolve/ns-resolve/requiring-resolve return a Var too (Clojure semantics);
        a Var calls its value in call position and @-derefs to it, so most uses
        work unchanged while reflective code (import-def) can read :name. */
-    "(defmacro var [s] `(cljc/resolve-var ~(str s)))\n"
-    "(defn resolve ([sym] (cljc/resolve-var (str sym))) ([_ns sym] (cljc/resolve-var (str sym))))\n"
+    "(defmacro var [s] `(cljc/resolve-var '~s))\n"
+    "(defn resolve ([sym] (cljc/resolve-var sym)) ([_ns sym] (cljc/resolve-var sym)))\n"
     "(def ns-resolve resolve)\n"
-    "(defn requiring-resolve [sym] (cljc/resolve-var (str sym)))\n"
+    "(defn requiring-resolve [sym] (cljc/resolve-var sym))\n"
     "(defn var? [x] (= (type x) :var))\n"
     "(defn var-get [v] (deref v))\n"
-    "(defn find-var [sym] (cljc/resolve-var (str sym)))\n"
+    "(defn find-var [sym] (cljc/resolve-var sym))\n"
+    "(defn alter-var-root [v f & args] (cljc/set-var! v (apply f (deref v) args)))\n"
     /* alter-meta!/reset-meta!: a deftype with a mutable :meta field (e.g. SCI's
        Var/Namespace) keeps its metadata in a :meta atom — mutate that. */
     "(defn alter-meta! [r f & args]\n"
@@ -9308,6 +9332,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/ns-publics*", prim_ns_publics);
     cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
     cljc_define_native(e, "cljc/resolve-var", prim_resolve_var);
+    cljc_define_native(e, "cljc/set-var!", prim_set_var);
     cljc_define_native(e, "macroexpand-1", prim_macroexpand_1);
     cljc_define_native(e, "cljc/eval-forms*", prim_eval_forms);
     cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
@@ -9842,6 +9867,12 @@ CljcEnv *cljc_new_env(void) {
            (cljc prints via print_to; these just need to exist + be defmethod-able) */
         "(defmulti print-method (fn [x & _] (type x)))\n"
         "(defmulti print-dup (fn [x & _] (type x)))\n"
+        /* minimal clojure.pprint: simple-dispatch is a multimethod libraries
+           (defmethod ..) on to customize printing; pprint just prints. */
+        "(defmulti clojure.pprint/simple-dispatch type)\n"
+        "(defmethod clojure.pprint/simple-dispatch :default [x] (pr x))\n"
+        "(defn clojure.pprint/pprint [x & _] (prn x))\n"
+        "(def clojure.pprint/*print-right-margin* 72)\n"
         /* protocols: each method dispatches on (type (first args)) */
         /* drop an optional protocol docstring (and any non-list sig); each method
            sig is (name [args].. doc?), so only `name` matters for the defmulti */

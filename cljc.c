@@ -3572,6 +3572,17 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
          * / fn objects); otherwise it's a plain map used as a fn: (m key dflt) */
         Cljc *out;
         if (dispatch_deftype_method(env, fn, "invoke", argv, nargs, &out)) return out;
+        /* a reify keeps `invoke` per-instance in :cljc/impls (e.g. DataScript's
+         * Comparator reify is called as a 2-arg fn) */
+        Cljc *impls, *inv;
+        if (map_find(fn, mk_kw(intern("cljc/impls", 10)), &impls) &&
+            impls != NIL && impls->tag == CLJC_MAP &&
+            map_find(impls, mk_sym(intern("invoke", 6)), &inv)) {
+            Cljc *iargv[256]; iargv[0] = fn;
+            if (nargs + 1 > 256) cljc_error("too many args to invoke");
+            for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
+            return apply(env, inv, iargv, nargs + 1);
+        }
         if (map_find(fn, a0, &out)) return out;
         return a1;
     }
@@ -3864,11 +3875,30 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                  * field access (Java's field-access syntax === method syntax) */
                 if (s[0] == '.' && s[1] && s[1] != '-' &&
                     rest != NIL && rest->tag == CLJC_LIST &&
-                    rest->as.cons.tail == NIL &&
                     !root_find(env_root(env), s, NULL)) {
                     Cljc *obj = eval(env, rest->as.cons.head);
                     Cljc *out;
-                    if (obj != NIL && obj->tag == CLJC_MAP &&
+                    /* (.method obj args..): route to the deftype's method (sans
+                     * dot) — a reify/deftype's own methods, e.g. a Comparator's
+                     * .compare, aren't predefined global .fns. */
+                    Cljc *margv[64]; int mn = 0;
+                    for (Cljc *a = rest->as.cons.tail; a && a->tag == CLJC_LIST && mn < 64;
+                         a = a->as.cons.tail)
+                        margv[mn++] = eval(env, a->as.cons.head);
+                    if (dispatch_deftype_method(env, obj, s + 1, margv, mn, &out)) return out;
+                    /* a reify keeps its methods per-instance in :cljc/impls */
+                    if (obj != NIL && obj->tag == CLJC_MAP) {
+                        Cljc *impls, *m;
+                        if (map_find(obj, mk_kw(intern("cljc/impls", 10)), &impls) &&
+                            impls != NIL && impls->tag == CLJC_MAP &&
+                            map_find(impls, mk_sym(intern(s + 1, strlen(s + 1))), &m)) {
+                            Cljc *iargv[65]; iargv[0] = obj;
+                            for (int i = 0; i < mn; i++) iargv[i + 1] = margv[i];
+                            return apply(env, m, iargv, mn + 1);
+                        }
+                    }
+                    /* one arg, no such method -> field access on the instance map */
+                    if (rest->as.cons.tail == NIL && obj != NIL && obj->tag == CLJC_MAP &&
                         map_find(obj, mk_kw(intern(s + 1, strlen(s + 1))), &out))
                         return out;
                     err_token = s;
@@ -8643,6 +8673,12 @@ static const char *PRELUDE =
     "           :clojure.lang.PersistentHashMap :clojure.lang.IPersistentCollection]] (derive :map c))\n"
     "(doseq [c [:clojure.lang.IPersistentSet :clojure.lang.PersistentHashSet\n"
     "           :clojure.lang.IPersistentCollection]] (derive :set c))\n"
+    /* Iterable / Seqable / java.util.Map — DataScript's seqable? checks these */
+    "(def Iterable :java.lang.Iterable) (def java.lang.Iterable :java.lang.Iterable)\n"
+    "(def clojure.lang.Seqable :clojure.lang.Seqable) (def java.util.Map :java.util.Map)\n"
+    "(doseq [t [:vector :list :lazy-seq :set]]\n"
+    "  (derive t :java.lang.Iterable) (derive t :clojure.lang.Seqable))\n"
+    "(derive :map :java.util.Map) (derive :map :clojure.lang.Seqable)\n"
     /* cljc's numeric types are java.lang.Number subclasses, so (instance? Number n)
        holds — Emmy's v/number? checks exactly this */
     "(doseq [t [:int :double :bigint :ratio]] (derive t :number))\n"
@@ -8819,6 +8855,29 @@ static const char *PRELUDE =
     "(defn clojure.lang.RT/aget [a i] (aget a i))\n"
     "(defn clojure.lang.RT/aset [a i v] (aset a i v))\n"
     "(defn clojure.lang.RT/alength [a] (alength a))\n"
+    "(defn clojure.lang.RT/assoc [m k v] (assoc m k v))\n"
+    "(defn clojure.lang.RT/get ([m k] (get m k)) ([m k d] (get m k d)))\n"
+    "(defn clojure.lang.RT/conj [c x] (conj c x))\n"
+    "(defn clojure.lang.RT/count [c] (count c))\n"
+    "(defn clojure.lang.RT/nth ([c i] (nth c i)) ([c i d] (nth c i d)))\n"
+    "(defn clojure.lang.RT/seq [c] (seq c))\n"
+    "(defn clojure.lang.RT/iter [c] (clojure.lang.RT/seq c))\n"
+    "(defn clojure.lang.Numbers/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
+    "(defn Integer/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
+    "(defn Long/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
+    "(defn .compareTo [x y] (compare x y))\n"
+    /* mutable java.util collections as atoms over a persistent coll (DataScript's
+       serialization buffers + query_v3). cljc's (pkg.Class. ..) resolves to the
+       short ctor name. */
+    "(defn ArrayList. ([] (atom [])) ([_] (atom [])))\n"
+    "(defn HashMap. ([] (atom {})) ([_] (atom {})))\n"
+    "(defn HashSet. ([] (atom #{})) ([_] (atom #{})))\n"
+    "(defn .add [c x] (swap! c clojure.core/conj x) true)\n"
+    "(defn .put [m k v] (swap! m assoc k v) v)\n"
+    "(defn .toArray [c] (object-array (deref c)))\n"
+    "(defn .contains [c x] (contains? (deref c) x))\n"
+    "(defn .isArray [_] false)\n"   /* cljc arrays are vectors, not host array classes */
+    "(defn .first [c] (first c))\n"
     "(defn random-uuid [] (UUID/randomUUID))\n"
     "(defn System/nanoTime [] 0)\n"
     "(defn System/lineSeparator [] \"\\n\")\n"
@@ -9019,6 +9078,7 @@ static const char *PRELUDE =
     "(defn inst-ms [_] 0) (defn to-array-2d [coll] (mapv vec coll))\n"
     "(defn halt-when ([pred] (halt-when pred nil)) ([pred _] (fn [rf] rf)))\n"
     "(defn print-str [& xs] (str/join \" \" (map str xs)))\n"
+    "(defn prn-str [& xs] (str (apply pr-str xs) \"\\n\"))\n"
     "(defn println-str [& xs] (str (str/join \" \" (map str xs)) \"\\n\"))\n"
     "(defn test [_] :ok)\n"
     "(def char-name-string {}) (def char-escape-string {})\n"
@@ -9079,7 +9139,9 @@ static const char *PRELUDE =
     "(defn int-array [x] (transient (vec (if (int? x) (repeat x 0) x))))\n"
     "(def byte-array int-array)\n"
     "(def long-array int-array)\n"
-    "(def object-array int-array)\n"
+    /* Object arrays default to nil (not 0 like int arrays) — DataScript relies on
+       (when-some [x (aget arr i)] ..) skipping unfilled slots. */
+    "(defn object-array [x] (transient (vec (if (int? x) (repeat x nil) x))))\n"
     "(defn LazilyPersistentVector/createOwning [oa] (vec oa))\n"
     "(defn PersistentArrayMap/createWithCheck [arr]\n"
     "  (let [v (vec arr) m (apply hash-map v)]\n"
@@ -9095,7 +9157,7 @@ static const char *PRELUDE =
     /* remaining array constructors / ops as transient (mutable) arrays */
     "(def double-array int-array) (def float-array int-array) (def short-array int-array)\n"
     "(def char-array int-array) (def boolean-array int-array)\n"
-    "(defn make-array [_ & dims] (int-array (first dims)))\n"
+    "(defn make-array [_ & dims] (object-array (first dims)))\n"
     "(defn to-array [coll] (int-array (vec coll)))\n"
     "(defn into-array ([coll] (int-array (vec coll))) ([_t coll] (int-array (vec coll))))\n"
     "(defn aclone [a] (int-array (vec a)))\n"
@@ -9306,11 +9368,17 @@ static const char *PRELUDE =
     "(defn cljc/import-one [spec]\n"
     "  (when spec\n"
     "  (if (or (list? spec) (vector? spec) (seq? spec))\n"
+    /* a deftype/record imported from another cljc namespace resolves to its REAL
+       type tag (datascript.parser/BindScalar -> :BindScalar), not a fabricated
+       :pkg.Class keyword — otherwise extend-type/instance? key the wrong value. */
     "    (let [pkg (str (first spec))]\n"
     "      (doseq [c (rest spec)]\n"
-    "        (eval (list 'def (symbol (str c)) (or (cljc/class->kind (str c)) (keyword (str pkg \".\" c)))))))\n"
+    "        (eval (list 'def (symbol (str c)) (or (cljc/class->kind (str c))\n"
+    "                                              (cljc/resolve-maybe (str pkg \"/\" c))\n"
+    "                                              (keyword (str pkg \".\" c)))))))\n"
     "    (let [s (str spec) short (last (str/split s #\"\\.\"))]\n"
-    "      (eval (list 'def (symbol short) (or (cljc/class->kind short) (keyword s))))))))\n"
+    "      (eval (list 'def (symbol short) (or (cljc/class->kind short)\n"
+    "                                          (cljc/resolve-maybe s) (keyword s))))))))\n"
     "(defn cljc/require-one [spec]\n"
     "  (when spec\n"   /* a #?(:cljs ..)-only spec reads as nil under cljc */
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"

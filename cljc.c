@@ -7685,10 +7685,26 @@ STR_PRED(ends_with,   bl <= sl && strcmp(s + sl - bl, sub) == 0)
 STR_PRED(includes,    strstr(s, sub) != NULL)
 
 /* (str/index-of s sub [from]) → first index at/after from, or nil. */
+/* (str/index-of "..." \c) is valid in Clojure — a char search value. */
+static char *strval_or_char(Cljc *v, char buf[5], const char *what) {
+    if (v != NIL && v->tag == CLJC_CHAR) {
+        int cp = v->as.chr, n = 0;
+        if (cp < 0x80) buf[n++] = (char)cp;
+        else if (cp < 0x800) { buf[n++] = (char)(0xC0|(cp>>6)); buf[n++] = (char)(0x80|(cp&0x3F)); }
+        else if (cp < 0x10000) { buf[n++] = (char)(0xE0|(cp>>12)); buf[n++] = (char)(0x80|((cp>>6)&0x3F)); buf[n++] = (char)(0x80|(cp&0x3F)); }
+        else { buf[n++] = (char)(0xF0|(cp>>18)); buf[n++] = (char)(0x80|((cp>>12)&0x3F)); buf[n++] = (char)(0x80|((cp>>6)&0x3F)); buf[n++] = (char)(0x80|(cp&0x3F)); }
+        buf[n] = '\0';
+        return buf;
+    }
+    return as_str(v, what);
+}
+
 static Cljc *prim_index_of(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    if (argv[0] != NIL && argv[0]->tag != CLJC_STRING) cljc_error("str/index-of: expected a string, got %s", val_type_name(argv[0]));
     char *s = as_str(argv[0], "str/index-of");
-    char *sub = as_str(argv[1], "str/index-of");
+    char cb[5];
+    char *sub = strval_or_char(argv[1], cb, "str/index-of");
     size_t sl = strlen(s);
     size_t from = nargs > 2 ? (size_t)as_int(argv[2], "str/index-of") : 0;
     if (from > sl) return NIL;

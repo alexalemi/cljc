@@ -1764,4 +1764,12 @@
 (assert= {:a 2 :b 1} (frequencies [:a :a :b]))         ; frequencies uses reduce internally
 (assert= 10 (async/<!! (reduce + 0 (async/to-chan! [1 2 3 4]))))  ; referred reduce = async/reduce
 
+; ── namespaced :keys destructuring binds the BARE local (Clojure semantics) ──
+(assert= [1 2] (let [{:keys [a/b c]} {:a/b 1 :c 2}] [b c]))
+(assert= 9 (let [{:keys [:ns/foo]} {:ns/foo 9}] foo))
+(assert= 5 (let [{:keys [n/y] :or {y 5}} {}] y))        ; :or keys on the bare name
+; ── multi-coll transducers (sequence/into with several colls) ──
+(assert= '([:a 1] [:b 2]) (sequence (map conj) [[:a] [:b]] [1 2]))
+(assert= '([1 3] [2 4]) (sequence (map vector) [1 2] [3 4]))
+
 (println "tests complete")

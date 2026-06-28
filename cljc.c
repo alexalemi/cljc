@@ -2505,16 +2505,21 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
                         if (elt == NIL) continue;   /* a #?(:cljs ..)-only key elides to nil */
                         const char *nm = elt->tag == CLJC_KEYWORD
                                          ? elt->as.kw : sym_name(elt, ":keys");
-                        Cljc *kw = mk_kw(nm);
+                        Cljc *kw = mk_kw(nm);   /* lookup key keeps the namespace */
+                        /* a namespaced key ({:keys [a/b]} / {:keys [::foo]}) binds
+                         * the BARE local name (b / foo) to the namespaced value. */
+                        const char *slash = strrchr(nm, '/');
+                        const char *local = (slash && slash[1])
+                                            ? intern(slash + 1, strlen(slash + 1)) : nm;
                         Cljc *v = NIL;
                         bool found = value != NIL && value->tag == CLJC_MAP &&
                                      map_find(value, kw, &v);
                         if (!found && defaults && defaults->tag == CLJC_MAP) {
                             Cljc *d;
-                            if (map_find(defaults, mk_sym(intern(nm, strlen(nm))), &d))
+                            if (map_find(defaults, mk_sym(local), &d))
                                 v = eval(scope, d);
                         }
-                        env_define(scope, nm, v);
+                        env_define(scope, local, v);
                     }
                     continue;
                 }
@@ -9651,6 +9656,13 @@ static const char *PRELUDE =
     "(def *assert* true) (def *data-readers* {}) (def *default-data-reader-fn* nil)\n"
     "(def *math-context* nil) (def *file* \"NO_SOURCE_PATH\") (def *command-line-args* nil)\n"
     "(def *ns* nil) (def *e nil) (def *1 nil) (def *2 nil) (def *3 nil)\n"
+    /* &form / &env: Clojure binds these in macro bodies (the call form + compile
+       env). cljc doesn't yet thread them, so a nil global keeps macros that only
+       read them for metadata/cljs-detection working — nil &env is the clj path. */
+    "(def &form nil) (def &env nil)\n"
+    /* ns-name: with cljc's flat namespaces, *ns* carries no Namespace object, so
+       fall back to the namespace currently being loaded (meander's defsyntax). */
+    "(defn ns-name [n] (symbol (let [s (str n)] (if (or (nil? n) (= \"\" s)) (cljc/current-ns*) s))))\n"
     "(def *allow-unresolved-vars* false) (def *suppress-read* nil) (def *verbose-defrecords* false)\n"
     "(def *print-dup* false) (def *print-namespace-maps* true) (def *fn-loader* nil)\n"
     "(def *source-path* \"NO_SOURCE_FILE\") (def *use-context-classloader* true)\n"
@@ -10283,7 +10295,8 @@ CljcEnv *cljc_new_env(void) {
         "     (cat (concat a b) more))))\n"
         "(defn cycle [c] (lazy-seq (concat (seq c) (cycle c))))\n"
         "(defn map-xf [f]\n"
-        "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc)) ([acc x] (rf acc (f x))))))\n"
+        "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc)) ([acc x] (rf acc (f x)))\n"
+        "             ([acc x & xs] (rf acc (apply f x xs))))))\n"   /* multi-coll transduce */
         "(defn filter-xf [pred]\n"
         "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc))\n"
         "             ([acc x] (if (pred x) (rf acc x) acc)))))\n"
@@ -10495,7 +10508,19 @@ CljcEnv *cljc_new_env(void) {
         "(defn partition-all ([n] (partition-all-xf n)) ([n c] (cljc/partition-all-impl n c)))\n"
         "(def cljc/partition-by-impl partition-by)\n"
         "(defn partition-by ([f] (partition-by-xf f)) ([f c] (cljc/partition-by-impl f c)))\n"
-        "(defn sequence ([c] (seq c)) ([xform c] (sequence*2 xform c)))\n"
+        /* multi-coll transduce: step every coll in parallel, feeding the xform's
+           reducing fn multiple inputs ((sequence (map conj) c1 c2) — meander). */
+        "(defn cljc/transduce-n [xform rf init colls]\n"
+        "  (let [f (xform rf)]\n"
+        "    (loop [acc init css colls]\n"
+        "      (if (every? seq css)\n"
+        "        (let [step (apply f acc (map first css))]\n"
+        "          (if (reduced? step) (f (deref step)) (recur step (map rest css))))\n"
+        "        (f acc)))))\n"
+        "(defn sequence\n"
+        "  ([c] (seq c))\n"
+        "  ([xform c] (sequence*2 xform c))\n"
+        "  ([xform c1 c2 & more] (seq (cljc/transduce-n xform conj [] (list* c1 c2 more)))))\n"
         "(defn completing\n"
         "  ([f] (completing f identity))\n"
         "  ([f cf] (fn ([] (f)) ([x] (cf x)) ([x y] (f x y)))))\n"

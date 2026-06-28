@@ -9,7 +9,8 @@
 
 (defn log! [level args]
   (when (level-enabled? level)
-    (cljc/eprintln* (str (str/upper-case (name level)) " ") (apply print-str args))))
+    (binding [*out* *err*]
+      (println (str (str/upper-case (name level)) " ") (apply print-str args)))))
 
 (defmacro log   [level & args] `(log! ~level [~@args]))
 (defmacro trace [& args] `(log! :trace  [~@args]))

@@ -5434,8 +5434,39 @@ COMPARISON(le, <=)
 COMPARISON(ge, >=)
 COMPARISON(num_eq, ==)   /* == : numeric value-equality across the tower (1 == 1.0) */
 
+/* Write `len` bytes to the current value of *out* (or *err* via binding): the
+ * :cljc/stdout / :cljc/stderr sentinels go to the real streams (so nREPL capture
+ * via cljc_out still works); a StringWriter (a :StringBuilder) accumulates, which
+ * is what binds with-out-str. The *out* binding pointer is cached — cljc's
+ * `binding` mutates the binding in place, so the cache stays correct. */
+static Binding *g_out_binding;
+static const char *g_kw_stderr;
+static void emit_out(CljcEnv *env, const char *data, size_t len) {
+    if (!g_out_binding) g_out_binding = root_find(env_root(env), intern("*out*", 5), NULL);
+    Cljc *w = g_out_binding ? g_out_binding->value : NIL;
+    if (w == NIL) { fwrite(data, 1, len, COUT); return; }
+    if (w->tag == CLJC_KEYWORD) {
+        if (!g_kw_stderr) g_kw_stderr = intern("cljc/stderr", 11);
+        fwrite(data, 1, len, w->as.kw == g_kw_stderr ? CERR : COUT);
+        return;
+    }
+    if (w->tag == CLJC_MAP) {            /* a StringWriter: append to its :v atom */
+        Cljc *vv;
+        if (map_find(w, mk_kw(intern("v", 1)), &vv) && vv != NIL && vv->tag == CLJC_ATOM) {
+            Cljc *old = vv->as.atom.value;
+            const char *os = (old != NIL && old->tag == CLJC_STRING) ? old->as.str : "";
+            size_t ol = strlen(os);
+            char *buf = xmalloc(ol + len + 1);
+            memcpy(buf, os, ol); memcpy(buf + ol, data, len); buf[ol + len] = '\0';
+            vv->as.atom.value = mk_str(buf, ol + len);
+            free(buf);
+            return;
+        }
+    }
+    fwrite(data, 1, len, COUT);          /* unknown writer: fall back to stdout */
+}
+
 static Cljc *prim_println(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
     SBuf sb = {0};
     bool first = true;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
@@ -5444,7 +5475,7 @@ static Cljc *prim_println(CljcEnv *env, Cljc **argv, int nargs) {
         print_to(&sb, argv[ai_], false);
     }
     sb_putc(&sb, '\n');
-    fwrite(sb.data, 1, sb.len, COUT);
+    emit_out(env, sb.data ? sb.data : "", sb.len);
     free(sb.data);
     return NIL;
 }
@@ -8171,7 +8202,7 @@ static Cljc *prim_with_out_str(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── printing variants ── */
 
-static Cljc *print_args(Cljc **argv, int nargs, bool readably, bool newline) {
+static Cljc *print_args(CljcEnv *env, Cljc **argv, int nargs, bool readably, bool newline) {
     SBuf sb = {0};
     bool first = true;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
@@ -8180,11 +8211,12 @@ static Cljc *print_args(Cljc **argv, int nargs, bool readably, bool newline) {
         print_to(&sb, argv[ai_], readably);
     }
     if (newline) sb_putc(&sb, '\n');
-    if (sb.data) { fwrite(sb.data, 1, sb.len, COUT); free(sb.data); }
+    emit_out(env, sb.data ? sb.data : "", sb.len);
+    free(sb.data);
     return NIL;
 }
 
-/* (cljc/eprintln* ..) — like println but to stderr (logging, diagnostics). */
+/* (cljc/eprintln* ..) — like println but always to stderr (diagnostics). */
 static Cljc *prim_eprintln(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     SBuf sb = {0};
@@ -8194,9 +8226,9 @@ static Cljc *prim_eprintln(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-static Cljc *prim_pr(CljcEnv *env, Cljc **argv, int nargs)    { (void)env; return print_args(argv, nargs, true, false); }
-static Cljc *prim_prn(CljcEnv *env, Cljc **argv, int nargs)   { (void)env; return print_args(argv, nargs, true, true); }
-static Cljc *prim_print(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return print_args(argv, nargs, false, false); }
+static Cljc *prim_pr(CljcEnv *env, Cljc **argv, int nargs)    { return print_args(env, argv, nargs, true, false); }
+static Cljc *prim_prn(CljcEnv *env, Cljc **argv, int nargs)   { return print_args(env, argv, nargs, true, true); }
+static Cljc *prim_print(CljcEnv *env, Cljc **argv, int nargs) { return print_args(env, argv, nargs, false, false); }
 
 
 /* ── format / string-replace / regex string ops ── */
@@ -9824,6 +9856,12 @@ static const char *PRELUDE =
     "(def *assert* true) (def *data-readers* {}) (def *default-data-reader-fn* nil)\n"
     "(def *math-context* nil) (def *file* \"NO_SOURCE_PATH\") (def *command-line-args* nil)\n"
     "(def *ns* nil) (def *e nil) (def *1 nil) (def *2 nil) (def *3 nil)\n"
+    /* print/println/pr/prn write to the current value of the *out* var. The
+       default sentinels route to the real streams; bind it to a (StringWriter.)
+       to capture (with-out-str), or to the *err* sentinel to reach stderr. */
+    "(def ^:dynamic *out* :cljc/stdout) (def ^:dynamic *err* :cljc/stderr)\n"
+    "(defmacro with-out-str [& body] `(let [s# (StringWriter.)] (binding [*out* s#] ~@body) (str s#)))\n"
+    "(defmacro with-err-str [& body] `(let [s# (StringWriter.)] (binding [*err* s#] ~@body) (str s#)))\n"
     /* &form / &env: Clojure binds these in macro bodies (the call form + compile
        env). cljc doesn't yet thread them, so a nil global keeps macros that only
        read them for metadata/cljs-detection working — nil &env is the clj path. */

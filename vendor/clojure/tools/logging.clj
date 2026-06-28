@@ -9,9 +9,10 @@
 (defn log*
   [level throwable message]
   (when (enabled? level)
-    (cljc/eprintln* (str "[" (clojure.string/upper-case (name level)) "]")
-                    message
-                    (if throwable (str \newline throwable) ""))))
+    (binding [*out* *err*]
+      (println (str "[" (clojure.string/upper-case (name level)) "]")
+               message
+               (if throwable (str \newline throwable) "")))))
 
 (defmacro log   [level & args] `(log* ~level nil (print-str ~@args)))
 (defmacro trace [& args] `(log* :trace nil (print-str ~@args)))

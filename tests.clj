@@ -1808,4 +1808,9 @@
 (assert= true (clojure.string/includes? (emsg #(swap! {} inc)) "expected an atom"))
 (assert= true (clojure.string/includes? (emsg #((fn ([a] a)) 1 2)) "no matching arity"))
 
+; ── *out* / *err*: print routes through the *out* var; with-out-str captures ──
+(assert= "a\nb" (with-out-str (println "a") (print "b")))
+(assert= "x12" (with-out-str (print "x") (pr 1) (print 2)))
+(assert= "" (with-out-str (binding [*out* *err*] (println "to stderr"))))  ; not captured
+
 (println "tests complete")

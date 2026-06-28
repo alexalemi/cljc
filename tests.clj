@@ -1787,4 +1787,17 @@
 (assert= "hello" (.replace "heLLo" "LL" "ll"))
 (assert= "42" (String/valueOf 42))
 
+; ── :pre / :post conditions (% is the return value) ──
+(defn pp-checked [x] {:pre [(pos? x)] :post [(> % x)]} (* x 2))
+(assert= 6 (pp-checked 3))
+(assert= true (try (pp-checked -1) false (catch Exception e (clojure.string/includes? (ex-message e) "Assert"))))
+; ── partition 4-arity (pad) + when-first ──
+(assert= '((1 2 3) (4 5 :p)) (partition 3 3 [:p :p] [1 2 3 4 5]))
+(assert= :a (when-first [x [:a :b]] x))
+(assert= nil (when-first [x []] x))
+; ── clojure.string completeness under a non-:str alias ──
+(assert= ["ab" "Foo" "cba"] (let [s clojure.string/triml] [(clojure.string/trimr "ab  ") (clojure.string/capitalize "foo") (clojure.string/reverse "abc")]))
+; ── qualified host constructor resolves to the short ctor ──
+(assert= "" (str (java.io.StringWriter.)))
+
 (println "tests complete")

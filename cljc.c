@@ -2674,6 +2674,21 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
             }
         }
     }
+    /* a qualified constructor name (pkg.Class.) resolves to the bare Class.
+     * ctor — cljc registers host constructors under the short class name. */
+    {
+        size_t ln = strlen(name);
+        if (ln > 1 && name[ln - 1] == '.') {
+            const char *lastdot = NULL;
+            for (const char *p = name; p < name + ln - 1; p++)
+                if (*p == '.') lastdot = p;
+            if (lastdot) {
+                const char *shortn = intern(lastdot + 1, strlen(lastdot + 1));
+                for (Binding *b = root->bindings; b; b = b->next)
+                    if (b->name == shortn) return b;
+            }
+        }
+    }
     /* Host-class fallback: an unresolved DOTTED, Capitalized-last-segment name
      * (e.g. sci.lang.IVar, java.io.Writer) is a JVM class cljc has no instance
      * of. Synthesize (and memoize) a keyword token so references to it resolve
@@ -3700,6 +3715,40 @@ static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
             cljc_error("fn params: unsupported binding form");
         *t = mk_cons(p, NIL);
         t = &(*t)->as.cons.tail;
+    }
+    /* {:pre [..] :post [..]} as the first of MULTIPLE body forms: assert each
+     * :pre before the body, each :post after with % bound to the return value
+     * — (assert p)... (let [% (do body)] (assert q)... %). */
+    if (body != NIL && body->tag == CLJC_LIST && body->as.cons.head != NIL &&
+        body->as.cons.head->tag == CLJC_MAP && body->as.cons.tail != NIL) {
+        Cljc *pp = body->as.cons.head, *pres = NIL, *posts = NIL;
+        map_find(pp, mk_kw(intern("pre", 3)), &pres);
+        map_find(pp, mk_kw(intern("post", 4)), &posts);
+        if ((pres != NIL && pres->tag == CLJC_VECTOR) ||
+            (posts != NIL && posts->tag == CLJC_VECTOR)) {
+            const char *ASSERT = intern("assert", 6);
+            Cljc *rest = body->as.cons.tail, *out = NIL, **ot = &out;
+            if (pres != NIL && pres->tag == CLJC_VECTOR)
+                for (size_t i = 0; i < vec_len(pres); i++) {
+                    *ot = mk_cons(mk_cons(mk_sym(ASSERT), mk_cons(vec_nth(pres, i), NIL)), NIL);
+                    ot = &(*ot)->as.cons.tail;
+                }
+            if (posts != NIL && posts->tag == CLJC_VECTOR) {
+                Cljc *pct = mk_sym(intern("%", 1));
+                Cljc *bv[2] = { pct, mk_cons(mk_sym(intern("do", 2)), rest) };
+                Cljc *lbody = NIL, **lt = &lbody;
+                for (size_t i = 0; i < vec_len(posts); i++) {
+                    *lt = mk_cons(mk_cons(mk_sym(ASSERT), mk_cons(vec_nth(posts, i), NIL)), NIL);
+                    lt = &(*lt)->as.cons.tail;
+                }
+                *lt = mk_cons(pct, NIL);   /* the return value */
+                *ot = mk_cons(mk_cons(mk_sym(intern("let", 3)),
+                                      mk_cons(mk_vector(bv, 2), lbody)), NIL);
+            } else {
+                *ot = rest;
+            }
+            body = out;
+        }
     }
     return mk_cons(params, body);
 }
@@ -8909,7 +8958,15 @@ static const char *PRELUDE =
     "     (let [chunk (take n s)]\n"
     "       (if (< (count chunk) n)\n"
     "         (reverse acc)\n"
-    "         (recur (seq (drop step s)) (cons chunk acc)))))))\n"
+    "         (recur (seq (drop step s)) (cons chunk acc))))))\n"
+    "  ([n step pad coll]\n"          /* pad the final short partition (Clojure's 4-arity) */
+    "   (loop [s (seq coll) acc (list)]\n"
+    "     (if s\n"
+    "       (let [chunk (take n s)]\n"
+    "         (if (= n (count chunk))\n"
+    "           (recur (seq (drop step s)) (cons chunk acc))\n"
+    "           (reverse (cons (take n (concat chunk pad)) acc))))\n"
+    "       (reverse acc)))))\n"
     "(defn distinct [coll]\n"
     "  (reverse (loop [s (seq coll) acc (list)]\n"
     "    (if s\n"
@@ -8953,6 +9010,9 @@ static const char *PRELUDE =
     "(defmacro when-let [bindings & body]\n"
     "  `(let [t# ~(nth bindings 1)]\n"
     "     (when t# (let [~(nth bindings 0) t#] ~@body))))\n"
+    "(defmacro when-first [bindings & body]\n"   /* (when-first [x coll] ..) */
+    "  `(when-let [xs# (seq ~(nth bindings 1))]\n"
+    "     (let [~(nth bindings 0) (first xs#)] ~@body)))\n"
     "(defmacro dotimes [bindings & body]\n"
     "  `(loop [~(nth bindings 0) 0]\n"
     "     (when (< ~(nth bindings 0) ~(nth bindings 1))\n"
@@ -9326,6 +9386,23 @@ static const char *PRELUDE =
     "(defn .toArray [c] (object-array (deref c)))\n"
     "(defn .contains [c x] (contains? (deref c) x))\n"
     "(defn .isArray [_] false)\n"   /* cljc arrays are vectors, not host array classes */
+    /* java.io char readers over a string, for libs like clojure.data.csv: a
+       reader is {:cljc/type <class-kw> :rdr (atom {:s :pos :pb})}; .read returns
+       the next codepoint (or -1), .unread pushes one back. */
+    "(defn StringReader. [s] {:cljc/type :java.io.Reader :rdr (atom {:s (str s) :pos 0 :pb nil})})\n"
+    "(defn PushbackReader. ([r] (assoc r :cljc/type :java.io.PushbackReader))\n"
+    "                      ([r _] (assoc r :cljc/type :java.io.PushbackReader)))\n"
+    "(defn .read [r] (let [a (:rdr r) m (deref a)]\n"
+    "                  (if-some [pb (:pb m)] (do (swap! a assoc :pb nil) pb)\n"
+    "                    (let [s (:s m) pos (:pos m)]\n"
+    "                      (if (< pos (count s)) (do (swap! a assoc :pos (inc pos)) (int (nth s pos))) -1)))))\n"
+    "(defn .unread [r ch] (swap! (:rdr r) assoc :pb (long ch)) nil)\n"
+    "(defn .close [_] nil)\n"
+    /* java.io char writer: a StringBuilder prints as its content, so (str w)
+       yields what was written. .write takes a string or an int codepoint. */
+    "(defn StringWriter. [] (StringBuilder.))\n"
+    "(defn .write [w x] (.append w (if (number? x) (char x) x)) nil)\n"
+    "(defn .flush [_] nil)\n"
     "(defn .first [c] (first c))\n"
     "(defn random-uuid [] (UUID/randomUUID))\n"
     "(defn System/nanoTime [] (long (* (cljc/now-ms*) 1000000.0)))\n"

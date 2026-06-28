@@ -1820,4 +1820,28 @@
 (assert= ["the the" "the"] (re-find #"(\w+) \1" "the the end"))   ; doubled word
 (assert= ["<b>x</b>" "b"] (re-find #"<(\w+)>.*</\1>" "<b>x</b>")) ; matching tag
 
+; ── clj-yaml.core: pure-Clojure YAML subset (no SnakeYAML) ──
+(require '[clj-yaml.core :as yaml])
+(assert= {:name "Alex" :age 42 :ok true :nil nil}
+         (yaml/parse-string "name: Alex\nage: 42\nok: true\nnil: null"))
+(assert= {:server {:host "localhost" :port 8080}}
+         (yaml/parse-string "server:\n  host: localhost\n  port: 8080"))
+(assert= {:fruits ["apple" "banana"]}              ; seq value flush with key
+         (yaml/parse-string "fruits:\n- apple\n- banana"))
+(assert= [{:name "a" :id 1} {:name "b" :id 2}]      ; compact "- key: val"
+         (yaml/parse-string "- name: a\n  id: 1\n- name: b\n  id: 2"))
+(assert= {:nums [1 2 3] :pt {:x 1 :y 2}}            ; flow collections
+         (yaml/parse-string "nums: [1, 2, 3]\npt: {x: 1, y: 2}"))
+(assert= {:a "hello: world" :b "it's ok"}           ; quoted scalars
+         (yaml/parse-string "a: \"hello: world\"\nb: 'it''s ok'"))
+(assert= {:a 1 :b 2}                                 ; comments + doc markers
+         (yaml/parse-string "---\n# top\na: 1 # trailing\nb: 2\n..."))
+(assert= {"a" 1 "b" 2} (yaml/parse-string "a: 1\nb: 2" :keywords false))
+(assert= {:script "line1\nline2\n"}                 ; literal block scalar
+         (yaml/parse-string "script: |\n  line1\n  line2\n"))
+(assert= {:text "a b\n"}                             ; folded block scalar
+         (yaml/parse-string "text: >\n  a\n  b\n"))
+(let [data {:name "config" :count 3 :tags ["x" "y"] :nested {:a 1 :b [2 3]}}]
+  (assert= data (yaml/parse-string (yaml/generate-string data))))  ; round-trip
+
 (println "tests complete")

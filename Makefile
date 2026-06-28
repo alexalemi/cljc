@@ -56,6 +56,8 @@ install: cljc
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals
 	install -m 644 vendor/camel_snake_kebab/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/
 	install -m 644 vendor/camel_snake_kebab/internals/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/clj_yaml
+	install -m 644 vendor/clj_yaml/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clj_yaml/
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/cljc (batteries: $(SHAREDIR))"
 
 uninstall:

@@ -159,6 +159,7 @@ multi-file libraries with internal cross-references load in isolation — `defty
 | `clojure.data.json` / `cheshire.core` | JSON read/write |
 | `clojure.tools.logging` / `taoensso.timbre` | console loggers (to `*err*`) |
 | `nextjournal.markdown` | markdown → hiccup (pure-Clojure CommonMark subset) |
+| `clj-yaml.core` | YAML ↔ Clojure data (pure-Clojure subset; block/flow, `\|`/`>` scalars) |
 | `babashka.fs` `babashka.process` `babashka.cli` `bencode.core` | scripting batteries |
 | medley, edamame | |
 
@@ -176,9 +177,9 @@ multi-file libraries with internal cross-references load in isolation — `defty
 | **clojure.data.csv** / **clojure.tools.cli** | CSV, command-line parsing |
 | **test.check** | generative property testing |
 
-**Not yet** — these need a JVM library reimplemented from scratch (a real XML/YAML
-parser, a host serializer): `clojure.data.xml` (StAX), `clj-yaml` (SnakeYAML),
-`cognitect.transit`, `core.rrb-vector`. The line: pure-Clojure libraries — even
+**Not yet** — these need a JVM library reimplemented from scratch (a real XML
+parser, a host serializer): `clojure.data.xml` (StAX), `cognitect.transit`,
+`core.rrb-vector`. The line: pure-Clojure libraries — even
 big, multi-file, deftype-heavy ones — are reachable; libraries that lean on a
 specific Java library for their core work are not, until that library is ported.
 

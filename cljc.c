@@ -8168,6 +8168,16 @@ static Cljc *print_args(Cljc **argv, int nargs, bool readably, bool newline) {
     return NIL;
 }
 
+/* (cljc/eprintln* ..) — like println but to stderr (logging, diagnostics). */
+static Cljc *prim_eprintln(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    SBuf sb = {0};
+    for (int i = 0; i < nargs; i++) { if (i) sb_putc(&sb, ' '); print_to(&sb, argv[i], false); }
+    sb_putc(&sb, '\n');
+    if (sb.data) { fwrite(sb.data, 1, sb.len, CERR); free(sb.data); }
+    return NIL;
+}
+
 static Cljc *prim_pr(CljcEnv *env, Cljc **argv, int nargs)    { (void)env; return print_args(argv, nargs, true, false); }
 static Cljc *prim_prn(CljcEnv *env, Cljc **argv, int nargs)   { (void)env; return print_args(argv, nargs, true, true); }
 static Cljc *prim_print(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return print_args(argv, nargs, false, false); }
@@ -10188,6 +10198,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, ">=",      prim_ge);
     cljc_define_native(e, "==",      prim_num_eq);
     cljc_define_native(e, "println", prim_println);
+    cljc_define_native(e, "cljc/eprintln*", prim_eprintln);
     cljc_define_native(e, "str",     prim_str);
     cljc_define_native(e, "pr-str",  prim_pr_str);
     cljc_define_native(e, "list",    prim_list);

@@ -44,6 +44,14 @@ install: cljc
 	install -m 644 vendor/medley/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/medley/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/cheshire
 	install -m 644 vendor/cheshire/*.clj $(DESTDIR)$(SHAREDIR)/vendor/cheshire/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/tools
+	install -m 644 vendor/clojure/tools/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/tools/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/taoensso
+	install -m 644 vendor/taoensso/*.clj $(DESTDIR)$(SHAREDIR)/vendor/taoensso/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/bencode
+	install -m 644 vendor/bencode/*.clj $(DESTDIR)$(SHAREDIR)/vendor/bencode/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/babashka
+	install -m 644 vendor/babashka/*.clj $(DESTDIR)$(SHAREDIR)/vendor/babashka/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals
 	install -m 644 vendor/camel_snake_kebab/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/
 	install -m 644 vendor/camel_snake_kebab/internals/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals/

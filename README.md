@@ -1,9 +1,9 @@
 # cljc
 
 A small Clojure in a single C file. Inspired by [Janet](https://janet-lang.org/)'s
-embeddability, aimed at [babashka](https://babashka.org/)-flavored scripting
-coverage: persistent collections, macros, destructuring, exceptions, regex —
-in ~4,000 lines of C99 with no dependencies.
+embeddability, aimed at [babashka](https://babashka.org/)-flavored scripting and
+beyond: persistent collections, macros, destructuring, protocols, ratios,
+namespaces, coroutines, regex — in ~12,000 lines of C99 with no dependencies.
 
 ```clojure
 (defn top-words [text n]
@@ -16,41 +16,54 @@ in ~4,000 lines of C99 with no dependencies.
   (println (format "%-12s %d" word count)))
 ```
 
+It's grown well past a scripting toy: real libraries run on it unmodified —
+[Emmy](https://github.com/mentat-collective/emmy) (a computer-algebra system),
+[DataScript](https://github.com/tonsky/datascript) (Datalog),
+[core.logic](https://github.com/clojure/core.logic) (miniKanren),
+[core.async](https://github.com/clojure/core.async),
+[hiccup](https://github.com/weavejester/hiccup),
+[instaparse](https://github.com/Engelberg/instaparse), and ~30 of babashka's
+built-in namespaces. See [Running real libraries](#running-real-libraries).
+
 ## Quick start
 
 ```sh
 make            # builds ./cljc (cc, -lm -ldl, nothing else)
 ./cljc          # REPL: editing, history, tab-completion, highlighting, *1 *2 *3
 ./cljc file.clj # run a script
-make test       # 600+ assertions, run twice: normal + GC-stress mode
+make test       # 1000+ assertions, run twice: normal + GC-stress mode
 
 ./install.sh                      # install to ~/.local (no sudo)
 PREFIX=/usr/local ./install.sh    # system-wide
 ```
 
 Installed, `cljc` works from anywhere: batteries (`json.clj`, `fs.clj`,
-`process.clj`, …) and vendored libraries (`clojure.set`, medley, …) resolve
-through `$PREFIX/share/cljc`, with `CLJC_PATH` (colon-separated) for extra
-roots. `cljc --version` tells you what you have.
+`process.clj`, …) and vendored libraries (`clojure.set`, `clojure.tools.logging`,
+`nextjournal.markdown`, medley, …) resolve through `$PREFIX/share/cljc`, with
+`CLJC_PATH` (colon-separated) for extra roots. `cljc --version` tells you what
+you have.
 
 ## What's inside
 
 | Area | Coverage |
 |---|---|
-| **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need |
-| **Data** | nil, bools, int64, doubles, strings (with escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, amortized O(1) `conj`, transients: `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT), **persistent sets**, atoms |
-| **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote` |
-| **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets); `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` (with `:when`/`:let`) `doseq` `dotimes` `doto` `letfn` … all written in cljc itself (the prelude) |
-| **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`) in `let`/`fn` params |
-| **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`satisfies?` (dispatch on `type` keywords), `defrecord` (tagged maps), `binding`/`with-redefs` |
-| **Errors** | `throw` any value, `try`/`catch`/`finally` (finally runs on every exit path), `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable |
-| **Regex** | self-contained backtracking engine: `\d \w \s`, classes, groups, `(?:…)`, alternation, lazy quantifiers; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (with `$1` refs) `re-split`; guarded against catastrophic backtracking |
-| **Errors** (DX) | Elm-style: header + message + offending source line with caret + `Did you mean \`count\`?` suggestions (levenshtein over live bindings) + dimmed trace, colorized on ttys |
-| **Transducers** | `map-xf`/`filter-xf`/`take-xf`/`mapcat-xf`/…, `transduce`, `eduction` — compose over infinite seqs with `reduced` early-exit |
-| **Library** | ~150 core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops (`str/split str/join str/trim …`), `format`, `slurp`/`spit`, `Math/*`, `sort`/`compare`, `read-string`/`eval` |
-| **Memory** | mark-and-sweep GC over pooled cells, conservative C-stack scanning (interpreter C code needs no root registration), structural sharing throughout |
-| **FFI** | s7/cload-style: `(ffi/define [[:double cos [:double]]] {:headers ["math.h"] :libs "-lm"})` declares C signatures as data, generates glue, compiles a .so at runtime, dlopens it — `cos` becomes a cljc fn. Modules cache by content hash; `ffi/defstruct` generates struct accessors; `libc.clj` ships the libc surface (`(load-file "libc.clj")` → `getpid`, `file-exists?`, `cwd`, `env`…); `json.clj` (JSON), `fs.clj` (babashka.fs-flavored: `list-dir` via real readdir, `exists?`, `create-dir`…), `process.clj` (escaped `sh`/`shell`/`out`), `test.clj` are the battery shelf. Plus `(sh "cmd")` → `{:exit :out}` |
-| **Modes** | REPL, script file, piped stdin, embedded, **nREPL server** |
+| **Numbers** | int64, **bignums** (`123…890N` literals and the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
+| **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need, 32-element chunking |
+| **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
+| **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote var` |
+| **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets), **auto-gensym `x#`**; `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` `doseq` `dotimes` `doto` `letfn` `with-out-str` `with-redefs` … most written in cljc itself (the prelude) |
+| **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
+| **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*` |
+| **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`extend-protocol`/`satisfies?`, **`deftype`/`defrecord`** with real method dispatch (this is what lets Emmy/DataScript/instaparse run), `binding` |
+| **Errors** | `throw` any value, `try`/`catch`/`finally`, `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type |
+| **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit`, string readers/writers |
+| **Regex** | self-contained backtracking engine: `\d \w \s`, classes, groups, `(?:…)`, lookahead `(?=)`, alternation, `{n,m}` quantifiers, lazy quantifiers, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
+| **Transducers** | `map`/`filter`/`take`/`mapcat`/… as transducers, `transduce`, `eduction`, `into` with an xform — compose over infinite seqs with `reduced` early-exit |
+| **Concurrency** | stackful **coroutines** (`coro/new`/`resume`/`yield`) — the substrate for a genuine `clojure.core.async` (`go`/`<!`/`>!`/`alts!`, channels, timeouts) on a single thread |
+| **Library** | hundreds of core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops, `format`, `sort`/`compare`, `read-string`/`eval`, `Math/*` |
+| **Memory** | mark-and-sweep GC over pooled cells, conservative C-stack scanning (interpreter C code needs no root registration), structural sharing throughout, adaptive collection floor for high-churn workloads |
+| **Execution** | tree-walking evaluator with a **bytecode VM** for hot functions, plus proper tail calls (general TCO, beyond Clojure) and `trampoline` |
+| **Modes** | REPL, script file, piped stdin, embedded C library, **nREPL server** |
 
 ## Editor integration (nREPL)
 
@@ -82,6 +95,20 @@ Outside the subset, `jit/compile!` errors cleanly and the interpreted
 version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
 630 ms — it's real machine code.
 
+## FFI: call C from Clojure
+
+```clojure
+(ffi/define [[:double cos [:double]]] {:headers ["math.h"] :libs "-lm"})
+(cos 0.0)   ;=> 1.0
+```
+
+s7/cload-style: declare C signatures as data, cljc generates glue, compiles a
+`.so` at runtime, `dlopen`s it, and the C function becomes a cljc fn. Modules
+cache by content hash; `ffi/defstruct` generates struct accessors. The battery
+shelf builds on it: `libc.clj` (the libc surface — `getpid`, `cwd`, `env`…),
+`fs.clj` (babashka.fs-flavored, `list-dir` via real `readdir`), `process.clj`
+(`sh`/`shell`/`out`), `json.clj`, `http.clj`, plus `(sh "cmd")` ⇒ `{:exit :out}`.
+
 ## Standalone binaries
 
 ```sh
@@ -91,17 +118,14 @@ version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
 ```
 
 `bundle.clj` embeds your script — plus every `.clj` it transitively `require`s
-or `load-file`s (batteries, vendored libs like `clojure.test`/`clojure.set`) —
-next to the runtime and compiles the result: a genuinely self-contained binary
-that runs anywhere, no `vendor/` or share dir needed. Janet-style deployment.
-Script arguments arrive as `*args*`. This is bundling,
-not compilation: the script still runs on the interpreter inside. (True
-function-to-C compilation is plausible future work — the FFI's
-generate→cc→dlopen→rebind pipeline is exactly a JIT's plumbing — but it isn't
-built.)
+or `load-file`s (batteries, vendored libs) — next to the runtime and compiles
+the result: a genuinely self-contained binary that runs anywhere, no `vendor/`
+or share dir needed. Janet-style deployment. Script arguments arrive as
+`*args*`. This is bundling, not compilation: the script still runs on the
+interpreter inside.
 
 A bundle is native code for the platform that built it, so match your friend's
-machine. Flags steer the compiler for that:
+machine. Flags steer the compiler:
 
 | target | command | needs |
 |---|---|---|
@@ -112,49 +136,62 @@ machine. Flags steer the compiler for that:
 
 `--cc=`, `--libs=`, and `--cflags=` (plus the `CLJC_CC` env var) expose the
 compiler directly for any other cross toolchain, e.g. `zig cc`. On Windows the
-interactive REPL drops to plain line input (no in-line editing) and the nREPL
-server is unavailable — script execution and bundles are unaffected.
+interactive REPL drops to plain line input and the nREPL server is unavailable —
+script execution and bundles are unaffected.
 
-## Running Clojure libraries
+## Running real libraries
 
-`require` resolves namespaces against `*load-path*` (`.` and `vendor/`),
-loads `.clj`/`.cljc` files once, and registers `:as` aliases (`m/foo`
-resolves to the flat global `foo`). Survey results, all suite-tested from
-unmodified upstream sources vendored in `vendor/`:
+`require` resolves namespaces against `*load-path*` (`.`, `vendor/`, the share
+dir) and `CLJC_PATH`, loads `.clj`/`.cljc` files once, and registers per-namespace
+`:as`/`:refer` aliases. Each namespace's defs resolve own-namespace-first, so
+multi-file libraries with internal cross-references load in isolation — `deftype`,
+`defrecord`, and protocols are real, which is what unlocks the heavy hitters.
 
-| library | status |
+**Bundled** — `require` works out of the box (vendored under the share dir):
+
+| | |
 |---|---|
-| **clojure.set** | ✅ complete — `union`/`join`/`project`/`index`/`map-invert`/… |
-| **clojure.walk** | ✅ complete — `postwalk`/`keywordize-keys`/`prewalk-replace`/… |
-| **medley** | ✅ substantially — `assoc-some`, `deep-merge`, `index-by`, `distinct-by`, `interleave-all`, lazy + `reduced`-based fns |
-| **clojure.zip** | ✅ complete — metadata is real now (`with-meta`/`meta`, `^{}` evaluated) |
-| data.json | ❌ Java interop throughout (our `json.clj` covers the need) |
-| Clerk | ❌ JVM-bound (doesn't run on babashka either) |
+| `clojure.set` `clojure.string` `clojure.walk` `clojure.zip` `clojure.edn` | core utilities, complete |
+| `clojure.data` `clojure.datafy` `clojure.math` `clojure.pprint` `clojure.stacktrace` | |
+| `clojure.test` | `deftest`/`is`/`testing`/`are`/`run-tests` |
+| `clojure.core.async` | `go`/`<!`/`>!`/`alts!`, channels, timeouts (coroutine-backed) |
+| `clojure.core.match` | pattern matching |
+| `clojure.data.json` / `cheshire.core` | JSON read/write |
+| `clojure.tools.logging` / `taoensso.timbre` | console loggers (to `*err*`) |
+| `nextjournal.markdown` | markdown → hiccup (pure-Clojure CommonMark subset) |
+| `babashka.fs` `babashka.process` `babashka.cli` `bencode.core` | scripting batteries |
+| medley, edamame | |
 
-Libraries load **isolated**: each lib's defs land under `ns/name`, its
-internal references resolve own-ns-first (stamped on symbols at read time,
-cached after first resolution), and consumers use `:as` aliases or
-`:refer`. `clojure.zip` + medley + set + walk coexist; zip's `next` no
-longer shadows core.
+**Runs with the library's own source on `CLJC_PATH`** (clone it, point cljc at
+`src`) — these exercise deftype, multimethods, multi-file graphs, the lot:
 
-The line: pure-data single-file libraries are reachable; Java interop,
-`deftype`, and multi-file namespace graphs are not — babashka's line, drawn
-tighter.
+| library | what runs |
+|---|---|
+| **Emmy** | symbolic + numerical calculus, `simplify`, `D` (autodiff), Lagrangian/Hamiltonian mechanics |
+| **DataScript** | `q`/`pull`/`transact!` — Datalog over an in-memory db |
+| **core.logic** | `run*`/`conde`/`membero`/`appendo` — relational/logic programming |
+| **hiccup** / **hiccup2** | HTML generation, CSS sugar, escaping |
+| **instaparse** | context-free grammars → parse trees |
+| **SCI** | a Clojure interpreter, running *inside* cljc |
+| **clojure.data.csv** / **clojure.tools.cli** | CSV, command-line parsing |
+| **test.check** | generative property testing |
+
+**Not yet** — these need a JVM library reimplemented from scratch (a real XML/YAML
+parser, a host serializer): `clojure.data.xml` (StAX), `clj-yaml` (SnakeYAML),
+`cognitect.transit`, `core.rrb-vector`. The line: pure-Clojure libraries — even
+big, multi-file, deftype-heavy ones — are reachable; libraries that lean on a
+specific Java library for their core work are not, until that library is ported.
 
 ## Tooling
 
-- **Linting**: ships a `.clj-kondo/config.edn` tuned for the dialect — flat
-  pseudo-namespaces, slash-`defn`s, throw-anything. `clj-kondo --lint your.clj`
-  works out of the box in this repo; name files `.cljc` if they use
-  `#?(:cljc …)` reader conditionals (kondo gates those on the extension —
-  and the dialect wearing the `.cljc` extension is only right). Real mistakes (unresolved symbols, unused
-  bindings) still surface. For runtime-defined vars (`ffi/define`), add a
-  `(declare …)` like `libc.clj` does.
-- **Tests**: `(load-file "test.clj")` gives a `clojure.test`-compatible
-  runner — `deftest`, `is` (with `thrown?`), `testing`, `run-tests`.
-- **Editor/LSP**: `./cljc --nrepl` for eval (Conjure/CIDER/Calva);
-  clojure-lsp's static features (navigation, completion) work on cljc files
-  since it reads the same clj-kondo analysis — point it at this repo's config.
+- **Linting**: ships a `.clj-kondo/config.edn` tuned for the dialect.
+  `clj-kondo --lint your.clj` works in this repo; name files `.cljc` if they use
+  `#?(:cljc …)` reader conditionals. For runtime-defined vars (`ffi/define`), add
+  a `(declare …)` like `libc.clj` does.
+- **Tests**: `clojure.test` is bundled — `deftest`, `is` (with `thrown?`),
+  `testing`, `run-tests`.
+- **Editor/LSP**: `./cljc --nrepl` for eval (Conjure/CIDER/Calva); clojure-lsp's
+  static features work on cljc files via the same clj-kondo analysis.
 
 ## Embedding
 
@@ -202,48 +239,39 @@ treat as orders of magnitude):
 | startup (hello world) | **2 ms** | 10 ms | 440 ms |
 | fib(27), interpreted recursion | 88 ms | **56 ms** | 563 ms |
 | 5M-iteration loop/recur | 439 ms | **239 ms** | 563 ms |
-| seq pipeline (1M: filter→map→reduce) | 332 ms¹ | **58 ms** | 488 ms |
+| seq pipeline (1M: filter→map→reduce) | 332 ms | **58 ms** | 488 ms |
 | build+read 100k-entry map | 231 ms | **107 ms** | 699 ms |
 | build 1M-element vector | 223 ms | **107 ms** | 542 ms |
 | sort 200k | **126 ms** | 185 ms | 641 ms |
 | regex word-frequency | **23 ms** | 23 ms | 632 ms |
 | fib(32), ~1 s of compute | 1.00 s | **0.54 s** | 0.63 s |
 
-Real-program benchmarks — [Advent of Code](https://adventofcode.com/) solutions
-in `benchmarks/aoc/`, identical sources and answers on all three runtimes:
-
-| puzzle (AoC 2017) | cljc | babashka | Clojure |
-|---|---|---|---|
-| day 1: digit pairs | **5 ms** | 12 ms | 586 ms |
-| day 4: passphrases (sets + regex) | **11 ms** | 16 ms | 608 ms |
-| day 5: jump tape (25M vector assocs) | 17.0 s | 8.2 s | **2.9 s** |
-| day 6: redistribution (vectors as hash keys) | 186 ms | **101 ms** | 640 ms |
-
-¹ lazy seqs with 32-element chunking (Clojure's own design): one thunk per
-chunk, with the chunk walk in C. Was 2.9 s per-element-lazy, 321 ms when
-eager — laziness costs ~38% here and buys infinite seqs + call-by-need.
-
 Honest reading: babashka wins most compute because its `clojure.core` is
 AOT-compiled native code — SCI only interprets your glue, while cljc interprets
-*everything*. That cljc stays within ~1.5–4× of bb with a 4,000-line tree-walker
-(and beats it on sort and startup) is the trade we wanted. JVM Clojure pays
-~440 ms of startup, which dominates at script scale; for long-running compute
-the JIT inverts everything. Use cljc where its 2 ms startup, ~100 KB binary,
-and zero dependencies matter; use bb/JVM where throughput does.
+*everything*. That cljc stays within ~1.5–4× of bb (and beats it on sort and
+startup) is the trade we wanted. JVM Clojure pays ~440 ms of startup, which
+dominates at script scale; for long-running compute the JIT inverts everything.
+Use cljc where its 2 ms startup, ~300 KB binary, zero dependencies, and
+embeddability matter; use bb/JVM where throughput does.
 
 ## Deliberate divergences from Clojure
 
-- `()` ≡ `nil`; no Ratio type (`(/ 7 2)` ⇒ `3.5`); no namespaces or vars
-  (`Math/sqrt` is just a symbol)
-- `catch` is untyped — the class in `(catch Exception e …)` is ignored
-- Map/set iteration order is hash order, not insertion order
-- Patterns are plain strings (`#"…"` is raw-string sugar); `{n,m}` braces are
-  literals; `str/replace` is literal — regex replace is spelled `re-replace`
-- Quasiquote: no auto-gensym `x#`, no nesting levels
-- Metadata works (`with-meta`/`meta`/`^{}`) and propagates through
-  collection ops (`conj`/`assoc`/`dissoc`/`into`, incl. transient roundtrips)
-- `ns` is a tolerated no-op; `require` loads; `#?(:cljc …)` reader conditionals;
-  `#(…)`, `\a` char literals (1-char strings), `^meta` (discarded) supported
+- `catch` is untyped — the class in `(catch Exception e …)` is ignored; the
+  first `catch` wins
+- Plain integer arithmetic wraps on int64 overflow (Clojure's `*`/`+` throw);
+  use the auto-promoting `*'`/`+'`/`-'` or `…N` literals for bignums
+- Hash maps/sets iterate in hash order, not insertion order (use sorted
+  collections for ordered traversal)
+- `str/replace` is literal even with a `#"…"` pattern; regex replace is spelled
+  `re-replace` (whose `$1` group refs are the substitution syntax)
+- Quasiquote auto-gensym (`x#`) works; nested quasiquote levels do not
+- `()` is the empty list (not `nil`), but seq fns treat an exhausted seq as
+  `nil`, as in Clojure
+- Namespaces are a flat global with per-namespace aliases (not separate var
+  interning per ns); `Math/sqrt` resolves as a host-method symbol
+- Metadata works (`with-meta`/`meta`/`^{}`) and propagates through collection
+  ops (`conj`/`assoc`/`into`, incl. transient roundtrips)
+- `#?(:cljc …)` reader conditionals; `#(…)`, `\a` char literals, `^meta` supported
 
 The full list, the roadmap, and the GC invariants live in [PLAN.md](PLAN.md).
 

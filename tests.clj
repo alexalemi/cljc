@@ -1755,4 +1755,13 @@
   (async/<!! (async/timeout 30))
   (assert= true (>= (- (cljc/now-ms*) t0) 25)))
 
+; ── refer of a core-shadowing name is a per-ns (user) alias, NOT a global clobber ──
+; (must stay LAST: it shadows `reduce` in the user ns for forms that follow)
+(assert= 6 (clojure.core/reduce + [1 2 3]))            ; core reduce intact before
+(require '[clojure.core.async :refer [reduce]])        ; shadows reduce in `user`
+(assert= 6 (clojure.core/reduce + [1 2 3]))            ; core reduce STILL intact
+(assert= 24 (clojure.core/reduce * [1 2 3 4]))         ; and other core fns (frequencies etc.)
+(assert= {:a 2 :b 1} (frequencies [:a :a :b]))         ; frequencies uses reduce internally
+(assert= 10 (async/<!! (reduce + 0 (async/to-chan! [1 2 3 4]))))  ; referred reduce = async/reduce
+
 (println "tests complete")

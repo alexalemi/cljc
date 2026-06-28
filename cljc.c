@@ -664,7 +664,8 @@ static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
      * — without this a library that redefines / (e.g. a generic-arithmetic ns
      * with :refer-clojure :exclude [/]) would clobber the global core / for
      * everyone instead of isolating it under its own ns. */
-    if (cur_reader_ns && (!strchr(name, '/') || !strcmp(name, "/"))) {
+    if (cur_reader_ns && strcmp(cur_reader_ns, "user") &&
+        (!strchr(name, '/') || !strcmp(name, "/"))) {
         char buf[256];
         snprintf(buf, sizeof buf, "%s/%s", cur_reader_ns, name);
         name = intern(buf, strlen(buf));
@@ -6650,19 +6651,21 @@ static Cljc *prim_refer(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-/* (cljc/current-ns*) — the namespace being loaded ("" at top level). */
+/* (cljc/current-ns*) — the namespace being loaded ("user" at the top level). */
 static Cljc *prim_current_ns(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     return cur_reader_ns ? mk_str(cur_reader_ns, strlen(cur_reader_ns))
                          : mk_str("", 0);
 }
 
-/* (cljc/in-ns* name-or-nil) — set the reader/def namespace, return the old. */
+/* (cljc/in-ns* name-or-nil) — set the reader/def namespace, return the old.
+ * nil means "back to the top level", which is the `user` namespace (so a later
+ * top-level (:refer [reduce ..]) aliases under user/ instead of clobbering core). */
 static Cljc *prim_in_ns(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     const char *old = cur_reader_ns;
     Cljc *v = argv[0];
-    cur_reader_ns = (v == NIL) ? NULL
+    cur_reader_ns = (v == NIL) ? intern("user", 4)
         : intern(v->as.str, strlen(v->as.str));
     return old ? mk_str(old, strlen(old)) : NIL;
 }
@@ -10859,6 +10862,13 @@ CljcEnv *cljc_new_env(void) {
     "                (throw (ex-info (str \"load-file: not found on *load-path*: \" path) {})))]\n"
     /* incremental: a leading (ns ..) is active when later forms are read */
     "    (cljc/eval-forms* src)))\n");
+    /* Top-level user code runs in the `user` namespace (like Clojure's REPL), so
+     * a top-level (:refer [reduce ..]) of a core-shadowing name registers a
+     * "user/reduce" refer ALIAS instead of clobbering the global core binding.
+     * The preamble above loaded with cur_reader_ns NULL, so core defs stay bare
+     * and core code (NULL home-ns) never sees the user refers. `user` defs are
+     * kept bare too (see env_define_root) so nothing else shifts. */
+    cur_reader_ns = intern("user", 4);
     return e;
 }
 

@@ -1800,4 +1800,12 @@
 ; ── qualified host constructor resolves to the short ctor ──
 (assert= "" (str (java.io.StringWriter.)))
 
+; ── friendlier error messages name the value's type / the fn ──
+(defn- emsg [f] (try (f) "no-error" (catch Exception e (ex-message e))))
+(assert= true (clojure.string/includes? (emsg #(+ 1 :x)) "got a keyword"))
+(assert= true (clojure.string/includes? (emsg #(42 1)) "not callable"))
+(assert= true (clojure.string/includes? (emsg #(count 5)) "not countable"))
+(assert= true (clojure.string/includes? (emsg #(swap! {} inc)) "expected an atom"))
+(assert= true (clojure.string/includes? (emsg #((fn ([a] a)) 1 2)) "no matching arity"))
+
 (println "tests complete")

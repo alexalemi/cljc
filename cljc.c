@@ -399,6 +399,33 @@ static void cljc_error(const char *fmt, ...) {
     cljc_raise();
 }
 
+/* A short human description of a value's type, for friendlier error messages
+ * ("expected a number, got a keyword"). */
+static const char *val_type_name(Cljc *v) {
+    if (v == NIL || v == NULL) return "nil";
+    switch (v->tag) {
+        case CLJC_BOOL:    return "a boolean";
+        case CLJC_INT: case CLJC_BIGINT: return "an integer";
+        case CLJC_DOUBLE:  return "a float";
+        case CLJC_RATIO:   return "a ratio";
+        case CLJC_STRING:  return "a string";
+        case CLJC_CHAR:    return "a character";
+        case CLJC_KEYWORD: return "a keyword";
+        case CLJC_SYMBOL:  return "a symbol";
+        case CLJC_LIST: case CLJC_EMPTY: return "a list";
+        case CLJC_LAZY:    return "a lazy seq";
+        case CLJC_VECTOR:  return "a vector";
+        case CLJC_TVEC:    return "a transient vector";
+        case CLJC_MAP:     return "a map";
+        case CLJC_SET:     return "a set";
+        case CLJC_SORTED:  return v->as.sorted.is_map ? "a sorted map" : "a sorted set";
+        case CLJC_FN: case CLJC_NATIVE: return "a function";
+        case CLJC_ATOM:    return "an atom";
+        case CLJC_VAR:     return "a var";
+        default:           return "a value";
+    }
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn))
 #endif
@@ -3688,7 +3715,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
         if (a0 != NIL && a0->tag == CLJC_MAP && map_find(a0, fn, &out)) return out;
         return a1;
     }
-    cljc_error("not callable");
+    cljc_error("%s is not callable as a function", val_type_name(fn));
     return NIL;
 }
 
@@ -5098,7 +5125,7 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         if (v->tag == CLJC_DOUBLE) is_float = true;
         else if (v->tag == CLJC_BIGINT) is_big = true;
         else if (v->tag == CLJC_RATIO) is_ratio = true;
-        else if (v->tag != CLJC_INT) cljc_error("expected number");
+        else if (v->tag != CLJC_INT) cljc_error("expected a number, got %s", val_type_name(v));
     }
     if (n == 0) {
         if (op == OP_ADD) return mk_int(0);
@@ -5368,7 +5395,7 @@ static double as_num(Cljc *v) {
     if (v->tag == CLJC_DOUBLE) return v->as.d;
     if (v->tag == CLJC_BIGINT) return big_to_double(v);
     if (v->tag == CLJC_RATIO) return ratio_to_double(v);
-    cljc_error("expected number");
+    cljc_error("expected a number, got %s", val_type_name(v));
     return 0;
 }
 
@@ -5378,7 +5405,8 @@ static double as_num(Cljc *v) {
 static int num_cmp(Cljc *a, Cljc *b) {
     int ta = a->tag, tb = b->tag;
 #define CLJC_ISNUM(t) ((t) == CLJC_INT || (t) == CLJC_DOUBLE || (t) == CLJC_BIGINT || (t) == CLJC_RATIO)
-    if (!CLJC_ISNUM(ta) || !CLJC_ISNUM(tb)) cljc_error("expected number");
+    if (!CLJC_ISNUM(ta) || !CLJC_ISNUM(tb))
+        cljc_error("can't compare numerically: got %s", val_type_name(!CLJC_ISNUM(ta) ? a : b));
     if (ta == CLJC_DOUBLE || tb == CLJC_DOUBLE) {
         double x = as_num(a), y = as_num(b); return x < y ? -1 : (x > y ? 1 : 0);
     }
@@ -5480,7 +5508,7 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
     if (tag == CLJC_SORTED)
         return mk_int((int64_t)sorted_count(argv[0]));
     if (tag == CLJC_STRING) return mk_int((int64_t)strlen(argv[0]->as.str));
-    cljc_error("count: not countable");
+    cljc_error("count: %s is not countable", val_type_name(argv[0]));
     return NIL;
 }
 
@@ -5564,7 +5592,7 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
                     r = map_assoc(r, s->as.cons.head, s->as.cons.tail->as.cons.head);
                 else cljc_error("conj on map: expected a [k v] entry or a map");
             } else cljc_error("conj on map: expected a [k v] entry or a map");
-        } else cljc_error("conj: not a collection");
+        } else cljc_error("conj: can't add to %s", val_type_name(r));
     }
     return r;
 }
@@ -5753,7 +5781,7 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
             if (k->tag != CLJC_INT || k->as.i < 0)
                 cljc_error("assoc on vector: index out of bounds");
             r = vec_assoc_idx(r, (size_t)k->as.i, v);  /* assoc at len appends */
-        } else cljc_error("assoc: not associative");
+        } else cljc_error("assoc: %s is not associative", val_type_name(r));
     }
     return r;
 }
@@ -5765,7 +5793,7 @@ static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs) {
         for (int i = 1; i < nargs; i++) m = sorted_remove(env, m, argv[i]);
         return m;
     }
-    if (m->tag != CLJC_MAP) cljc_error("dissoc: not a map");
+    if (m->tag != CLJC_MAP) cljc_error("dissoc: expected a map, got %s", val_type_name(m));
     for (int i = 1; i < nargs; i++)
         m = map_dissoc_one(m, argv[i]);
     return m;
@@ -5792,7 +5820,7 @@ static Cljc *prim_keys(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("keys: not a map");
+    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("keys: expected a map, got %s", val_type_name(m));
     return map_kv_list(m, 0);
 }
 
@@ -5800,7 +5828,7 @@ static Cljc *prim_vals(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("vals: not a map");
+    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("vals: expected a map, got %s", val_type_name(m));
     return map_kv_list(m, 1);
 }
 
@@ -5813,7 +5841,7 @@ static Cljc *prim_contains_p(CljcEnv *env, Cljc **argv, int nargs) {
     if (coll->tag == CLJC_SORTED) return mk_bool(sorted_contains(env, coll, k));
     if (coll->tag == CLJC_VECTOR)  /* contains? checks INDEX presence on vectors */
         return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
-    cljc_error("contains?: not associative");
+    cljc_error("contains?: %s is not associative", val_type_name(coll));
     return NIL;
 }
 
@@ -5997,7 +6025,7 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
-    cljc_error("not seqable");
+    cljc_error("don't know how to make a seq from %s", val_type_name(v));
     return NIL;
 }
 
@@ -7116,7 +7144,7 @@ static Cljc *prim_ex_data(CljcEnv *env, Cljc **argv, int nargs) {
 /* ── Atoms ── */
 
 static Cljc *as_atom(Cljc *v, const char *what) {
-    if (v == NIL || v->tag != CLJC_ATOM) cljc_error("%s: expected an atom", what);
+    if (v == NIL || v->tag != CLJC_ATOM) cljc_error("%s: expected an atom, got %s", what, val_type_name(v));
     return v;
 }
 

@@ -1813,4 +1813,11 @@
 (assert= "x12" (with-out-str (print "x") (pr 1) (print 2)))
 (assert= "" (with-out-str (binding [*out* *err*] (println "to stderr"))))  ; not captured
 
+; ── regex backreferences \1..\9 ──
+(assert= ["aa" "a"] (re-find #"(\w)\1" "aa"))
+(assert= nil (re-find #"(\w)\1" "ab"))
+(assert= ["abba" "a" "b"] (re-matches #"(.)(.)\2\1" "abba"))      ; palindrome
+(assert= ["the the" "the"] (re-find #"(\w+) \1" "the the end"))   ; doubled word
+(assert= ["<b>x</b>" "b"] (re-find #"<(\w+)>.*</\1>" "<b>x</b>")) ; matching tag
+
 (println "tests complete")

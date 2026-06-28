@@ -6211,13 +6211,13 @@ static Cljc *prim_seq_p(CljcEnv *env, Cljc **argv, int nargs) {
  * (?=X) (?!X) lookahead, | alternation, * + ? quantifiers with lazy
  * variants (*? +? ??), X{n} X{n,} X{n,m} bounded repeats (n,m ≤ 64,
  * desugared to copies).
- * Not supported: backreferences, lookbehind. Patterns are plain
+ * Not supported: lookbehind. Patterns are plain
  * strings; the #"..." reader literal passes backslashes through raw.
  * Parse-time desugaring: X+ => X X* (atom re-parsed), X? => ALT(X, empty);
  * only star is a real loop, guarded against empty-match cycles. */
 
 enum { RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL, RX_STAR, RX_LOOP,
-       RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA };
+       RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA, RX_BACKREF };
 
 typedef struct Rx Rx;
 struct Rx {
@@ -6344,6 +6344,8 @@ static RxChain rx_parse_atom(RxC *c) {
             r = rx_node(c, RX_CLASS); rx_class_shorthand(r, e);
         } else if (e == 'D' || e == 'W' || e == 'S') {
             r = rx_node(c, RX_CLASS); rx_class_shorthand(r, (char)tolower(e)); r->neg = true;
+        } else if (e >= '1' && e <= '9') {        /* \1..\9 backreference */
+            r = rx_node(c, RX_BACKREF); r->group = e - '0';
         } else {
             r = rx_node(c, RX_CHAR);
             r->ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
@@ -6520,6 +6522,14 @@ static bool rx_m(Rx *r, const char *s) {
             if (rx_m(r->next, s)) return true;
             rx_cap_e[r->group] = save;
             return false;
+        }
+        case RX_BACKREF: {
+            /* match the exact text captured by group N (empty if it never matched) */
+            const char *cs = rx_cap_s[r->group], *ce = rx_cap_e[r->group];
+            if (!cs || !ce || ce < cs) return rx_m(r->next, s);
+            size_t len = (size_t)(ce - cs);
+            if (strncmp(s, cs, len) != 0) return false;
+            return rx_m(r->next, s + len);
         }
         case RX_LA: {
             /* zero-width lookahead: sub-match here, consume nothing */

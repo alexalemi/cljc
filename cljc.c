@@ -9292,6 +9292,8 @@ static const char *PRELUDE =
     "(defn clojure.lang.RT/seq [c] (seq c))\n"
     "(defn clojure.lang.RT/iter [c] (clojure.lang.RT/seq c))\n"
     "(defn clojure.lang.Numbers/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
+    "(defn clojure.lang.Numbers/toRatio [x] (rationalize x))\n"   /* cljc ratios already support numerator/denominator */
+    "(defn clojure.lang.Numbers/divide [x y] (/ x y))\n"
     "(defn Integer/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
     "(defn Long/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
     "(defn .compareTo [x y] (compare x y))\n"

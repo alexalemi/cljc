@@ -1,0 +1,42 @@
+(ns clojure.math
+  "Wrappers over cljc's Math/* host primitives (clojure.math, Clojure 1.11).")
+
+(def PI Math/PI)
+(def E  2.718281828459045)
+
+(defn sqrt  [x] (Math/sqrt x))
+(defn cbrt  [x] (Math/cbrt x))
+(defn pow   [x y] (Math/pow x y))
+(defn exp   [x] (Math/exp x))
+(defn log   [x] (Math/log x))
+(defn log10 [x] (/ (Math/log x) (Math/log 10.0)))
+(defn sin   [x] (Math/sin x))
+(defn cos   [x] (Math/cos x))
+(defn tan   [x] (Math/tan x))
+(defn asin  [x] (Math/asin x))
+(defn acos  [x] (Math/acos x))
+(defn atan  [x] (Math/atan x))
+(defn sinh  [x] (Math/sinh x))
+(defn cosh  [x] (Math/cosh x))
+(defn tanh  [x] (Math/tanh x))
+(defn floor [x] (Math/floor x))
+(defn ceil  [x] (Math/ceil x))
+(defn rint  [x] (double (Math/round x)))
+(defn round [x] (Math/round x))
+(defn abs   [x] (Math/abs x))
+(defn hypot [x y] (Math/hypot x y))
+(defn signum [x] (cond (pos? x) 1.0 (neg? x) -1.0 :else 0.0))
+(defn to-radians [d] (* d (/ PI 180.0)))
+(defn to-degrees [r] (* r (/ 180.0 PI)))
+(defn floor-div [x y] (long (Math/floor (/ (double x) (double y)))))
+(defn floor-mod [x y] (- x (* (floor-div x y) y)))
+
+;; atan2(y, x): the angle of (x, y), full range, by quadrant.
+(defn atan2 [y x]
+  (cond
+    (> x 0)            (Math/atan (/ y x))
+    (and (< x 0) (>= y 0)) (+ (Math/atan (/ y x)) PI)
+    (and (< x 0) (< y 0))  (- (Math/atan (/ y x)) PI)
+    (and (zero? x) (> y 0)) (/ PI 2.0)
+    (and (zero? x) (< y 0)) (- (/ PI 2.0))
+    :else 0.0))

@@ -32,6 +32,8 @@ install: cljc
 	install -m 644 vendor/clojure/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/core
 	install -m 644 vendor/clojure/core/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/core/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/java
+	install -m 644 vendor/clojure/java/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/java/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/data
 	install -m 644 vendor/clojure/data/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/data/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/math
@@ -40,6 +42,8 @@ install: cljc
 	install -m 644 vendor/nextjournal/*.clj $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/medley
 	install -m 644 vendor/medley/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/medley/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/cheshire
+	install -m 644 vendor/cheshire/*.clj $(DESTDIR)$(SHAREDIR)/vendor/cheshire/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals
 	install -m 644 vendor/camel_snake_kebab/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/
 	install -m 644 vendor/camel_snake_kebab/internals/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals/

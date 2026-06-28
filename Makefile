@@ -38,8 +38,9 @@ install: cljc
 	install -m 644 vendor/clojure/data/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/data/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/math
 	install -m 644 vendor/clojure/math/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/math/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/nextjournal
-	install -m 644 vendor/nextjournal/*.clj $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/
+	install -d $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/markdown
+	install -m 644 vendor/nextjournal/*.clj* $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/
+	install -m 644 vendor/nextjournal/markdown/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/markdown/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/medley
 	install -m 644 vendor/medley/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/medley/
 	install -d $(DESTDIR)$(SHAREDIR)/vendor/cheshire

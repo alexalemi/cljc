@@ -1772,4 +1772,19 @@
 (assert= '([:a 1] [:b 2]) (sequence (map conj) [[:a] [:b]] [1 2]))
 (assert= '([1 3] [2 4]) (sequence (map vector) [1 2] [3 4]))
 
+; ── case with a multi-constant clause key built by a macro (a LAZY seq) ──
+(assert= :b (case :y (:x :y :z) :b :other))                 ; literal list
+(assert= :b (let [k (map identity [:x :y])]                 ; lazy-seq clause key (hiccup)
+              (eval (list 'case :y k :b :other))))
+; ── (str deftype) routes to its toString; pr-str keeps the structural form ──
+(deftype Boxed [v] Object (toString [_] (str "Box:" v)))
+(assert= "Box:7" (str (->Boxed 7)))
+; ── thread-binding primitives (with-bindings / push-/pop-) ──
+(def ^:dynamic *probe* 1)
+(assert= 10 (with-bindings {(var *probe*) 10} *probe*))
+(assert= 1 *probe*)                                          ; restored
+; ── host method stubs ──
+(assert= "hello" (.replace "heLLo" "LL" "ll"))
+(assert= "42" (String/valueOf 42))
+
 (println "tests complete")

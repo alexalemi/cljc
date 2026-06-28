@@ -4620,6 +4620,17 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                     sb_puts(sb, vv->as.atom.value->as.str);
                 break;
             }
+            /* (str x) on a deftype with a toString method renders via toString
+             * (hiccup's RawString); pr-str / print keep the structural map form.
+             * `out != v` guards a toString that returns its own instance. */
+            if (!readably && ty != NULL) {
+                Cljc *out;
+                if (dispatch_deftype_method(gc_root_envs[0], v, "toString", NULL, 0, &out) &&
+                    out != v) {
+                    print_to(sb, out, false);
+                    break;
+                }
+            }
             (void)ty;
             sb_putc(sb, '{');
             bool first = true;
@@ -8945,7 +8956,7 @@ static const char *PRELUDE =
     "(defmacro case [e & clauses]\n"
     "  (let [g (gensym \"case\")\n"
     "        pred (fn [t]\n"
-    "               (if (and (list? t) (seq t))\n"
+    "               (if (and (seq? t) (seq t))\n"   /* a LIST/seq clause key (incl. a lazy seq from a macro) is multi-constant; a vector is a single constant */
     "                 (cons 'or (map (fn [v] (list '= g (list 'quote v))) t))\n"
     "                 (list '= g (list 'quote t))))]\n"
     "    (list 'let [g e]\n"
@@ -9394,6 +9405,12 @@ static const char *PRELUDE =
     "(defn .endsWith [s suf] (str/ends-with? (str s) suf))\n"
     "(defn .startsWith [s pre] (str/starts-with? (str s) pre))\n"
     "(defn .substring ([s a] (subs (str s) a)) ([s a b] (subs (str s) a b)))\n"
+    "(defn .replace [s old new] (clojure.string/replace (str s) old new))\n"  /* String.replace: literal */
+    "(defn String/valueOf [x] (str x))\n"
+    "(defn Integer/parseInt ([s] (parse-long s)) ([s _radix] (parse-long s)))\n"
+    "(defn Long/parseLong ([s] (parse-long s)) ([s _radix] (parse-long s)))\n"
+    "(defn Double/parseDouble [s] (parse-double s))\n"
+    "(defn .toString [x] (str x))\n"
     "(defn .subSequence [s a b]\n"
     "  (if-let [m (cljc/dt-method 'subSequence s)] (m s a b) (subs (str s) a b)))\n"
     "(defn .contains [s x]\n"
@@ -9717,6 +9734,22 @@ static const char *PRELUDE =
     "(defn var-get [v] (deref v))\n"
     "(defn find-var [sym] (cljc/resolve-var sym))\n"
     "(defn alter-var-root [v f & args] (cljc/set-var! v (apply f (deref v) args)))\n"
+    /* thread-binding primitives (hiccup's binding* / clojure.core internals):
+       cljc is single-threaded, so a global save/restore stack suffices. */
+    "(def cljc/tbind-stack (atom ()))\n"
+    "(defn push-thread-bindings [m]\n"
+    "  (swap! cljc/tbind-stack conj (into {} (map (fn [[v _]] [v (deref v)]) m)))\n"
+    "  (doseq [[v val] m] (cljc/set-var! v val)))\n"
+    "(defn pop-thread-bindings []\n"
+    "  (let [saved (first (deref cljc/tbind-stack))]\n"
+    "    (swap! cljc/tbind-stack rest)\n"
+    "    (doseq [[v val] saved] (cljc/set-var! v val))))\n"
+    "(defn get-thread-bindings [] (apply merge {} (reverse (deref cljc/tbind-stack))))\n"
+    "(defn with-bindings* [m f & args]\n"
+    "  (push-thread-bindings m) (try (apply f args) (finally (pop-thread-bindings))))\n"
+    "(defmacro with-bindings [m & body] `(with-bindings* ~m (fn [] ~@body)))\n"
+    "(defn bound-fn* [f] (let [b (get-thread-bindings)] (fn [& a] (with-bindings* b #(apply f a)))))\n"
+    "(defmacro bound-fn [& fntail] `(bound-fn* (fn ~@fntail)))\n"
     /* alter-meta!/reset-meta!: a deftype with a mutable :meta field (e.g. SCI's
        Var/Namespace) keeps its metadata in a :meta atom — mutate that. */
     "(defn alter-meta! [r f & args]\n"

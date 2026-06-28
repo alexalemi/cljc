@@ -3567,7 +3567,25 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
                     if (variadic && (size_t)nargs >= fixed && !fallback) fallback = arity;
                 }
                 if (!chosen) chosen = fallback;
-                if (!chosen) cljc_error("no matching arity for %d args", nargs);
+                if (!chosen) {
+                    /* name the fn and list the arities it DOES take, so the
+                     * caller knows which call is wrong (not just the count). */
+                    char ab[160]; int al = 0; ab[0] = '\0';
+                    for (Cljc *ar = fn->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
+                        size_t fx; bool va; arity_info(ar->as.cons.head->as.cons.head, &fx, &va);
+                        int n = snprintf(ab + al, sizeof(ab) - al, "%s%zu%s",
+                                         al ? " " : "", fx, va ? "+" : "");
+                        if (n > 0 && al + n < (int)sizeof(ab)) al += n; else break;
+                    }
+                    const char *nm = NULL;
+                    if (fn->meta && fn->meta->tag == CLJC_MAP) {
+                        Cljc *o;
+                        if (map_find(fn->meta, mk_kw(intern("name", 4)), &o) &&
+                            o != NIL && o->tag == CLJC_SYMBOL) nm = o->as.sym;
+                    }
+                    cljc_error("no matching arity: %s called with %d arg%s (takes %s)",
+                               nm ? nm : "fn", nargs, nargs == 1 ? "" : "s", ab);
+                }
                 call = env_new(fn->as.fn.env);
                 bind_params(call, chosen->as.cons.head, argv, nargs);
             }

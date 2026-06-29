@@ -4875,6 +4875,15 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                     print_to(sb, out, false);
                     break;
                 }
+                /* a reify keeps its methods per-instance in :cljc/impls */
+                Cljc *impls, *ts;
+                if (map_find(v, mk_kw(intern("cljc/impls", 10)), &impls) &&
+                    impls != NIL && impls->tag == CLJC_MAP &&
+                    map_find(impls, mk_sym(intern("toString", 8)), &ts) && ts != NIL) {
+                    Cljc *args1[1] = { v };
+                    Cljc *rr = apply(gc_root_envs[0], ts, args1, 1);
+                    if (rr != v) { print_to(sb, rr, false); break; }
+                }
             }
             (void)ty;
             if (print_too_deep()) { sb_putc(sb, '#'); break; }
@@ -9554,16 +9563,20 @@ static const char *PRELUDE =
     "(def cljc/global-hierarchy (atom {}))\n"
     "(defn cljc/tag-isa? [c p]\n"
     "  (or (= c p) (boolean (some (fn [x] (cljc/tag-isa? x p)) (get (deref cljc/global-hierarchy) c)))))\n"
-    "(defn isa? [c p]\n"
-    "  (or (= c p) (cljc/tag-isa? c p)\n"
-    "      (and (vector? c) (vector? p) (= (count c) (count p))\n"
-    "           (every? identity (map isa? c p)))))\n"
-    "(defn parents [t] (get (deref cljc/global-hierarchy) t))\n"
-    "(defn ancestors [t]\n"
-    "  (let [ps (get (deref cljc/global-hierarchy) t)]\n"
-    "    (reduce (fn [acc p] (into (conj acc p) (ancestors p))) #{} ps)))\n"
-    "(defn descendants [t]\n"
-    "  (set (filter (fn [k] (and (not= k t) (cljc/tag-isa? k t))) (keys (deref cljc/global-hierarchy)))))\n"
+    "(defn isa?\n"
+    "  ([c p]\n"
+    "   (or (= c p) (= p :default) (cljc/tag-isa? c p)\n"  /* :default = Object, universal super */
+    "       (and (vector? c) (vector? p) (= (count c) (count p))\n"
+    "            (every? identity (map isa? c p)))))\n"
+    "  ([h c p] (isa? c p)))\n"          /* cljc derive always writes the global hierarchy */
+    "(defn parents ([t] (get (deref cljc/global-hierarchy) t)) ([h t] (parents t)))\n"
+    "(defn ancestors\n"
+    "  ([t] (let [ps (get (deref cljc/global-hierarchy) t)]\n"
+    "         (reduce (fn [acc p] (into (conj acc p) (ancestors p))) #{} ps)))\n"
+    "  ([h t] (ancestors t)))\n"
+    "(defn descendants\n"
+    "  ([t] (set (filter (fn [k] (and (not= k t) (cljc/tag-isa? k t))) (keys (deref cljc/global-hierarchy)))))\n"
+    "  ([h t] (descendants t)))\n"
     "(defn derive\n"
     "  ([t parent] (swap! cljc/global-hierarchy update t (fn [s] (conj (or s #{}) parent))) nil)\n"
     "  ([h t parent] (derive t parent)))\n"
@@ -10141,7 +10154,8 @@ static const char *PRELUDE =
     /* map host classes to cljc's actual type-keyword dispatch values so a
        protocol extension to e.g. String actually fires for cljc strings, and
        Object becomes the multimethod :default catch-all. */
-    "(def Object :default) (def String :string) (def CharSequence :string)\n"
+    "(def Object :default) (def java.lang.Object :default) (def clojure.lang.Object :default)\n"
+    "(def String :string) (def CharSequence :string)\n"
     "(def Character :char) (def Boolean :bool) (def Number :int)\n"
     "(def Long :int) (def Integer :int) (def Double :double)\n"
     "(def Float :double) (def Byte :int) (def Short :int) (def Number :number)\n"

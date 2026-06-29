@@ -1982,5 +1982,11 @@
 (assert= "(1 (2 #))" (binding [*print-level* 2] (pr-str '(1 (2 (3 (4)))))))
 (assert= 1 (:person/name #:person{:name 1 :age 2}))     ; namespaced map literal
 (assert= 1 (:bare #:m{:_/bare 1 :x 2}))                 ; :_/k means no namespace
+(assert= "R" (str (reify Object (toString [_] "R"))))   ; reify toString via str
+(assert= true (isa? java.lang.String java.lang.Object)) ; Object universal super
+(assert= true (isa? [java.lang.String java.lang.Long] [java.lang.Object java.lang.Object]))
+(do (derive ::cat ::feline)                             ; hierarchy 3-arg forms
+    (assert= true (isa? (make-hierarchy) ::cat ::feline))
+    (assert= #{::feline} (parents (make-hierarchy) ::cat)))
 
 (println "tests complete")

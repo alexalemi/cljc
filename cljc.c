@@ -2234,9 +2234,16 @@ static Cljc *read_form(const char **p) {
     }
     if (c == '#' && (*p)[1] == '_') {
         *p += 2;
-        read_form(p);   /* read and discard */
-        return mk_cons(mk_sym(intern("**reader-splice**", 17)),
-                       mk_cons(NIL, NIL));   /* splices zero elements */
+        read_form(p);   /* read and discard the next form */
+        skip_ws(p);
+        /* return the FOLLOWING real form (so stacked #_ #_ discard two, and a
+         * #_ at a call/collection position yields the next element). At a
+         * closing delimiter or EOF there is none → splice zero elements. */
+        char d = **p;
+        if (d == '\0' || d == ')' || d == ']' || d == '}')
+            return mk_cons(mk_sym(intern("**reader-splice**", 17)),
+                           mk_cons(NIL, NIL));
+        return read_form(p);
     }
     if (c == '#' && (*p)[1] == '\'') {  /* #'x => (var x) */
         *p += 2;
@@ -4696,6 +4703,15 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_SYMBOL: sb_puts(sb, v->as.sym); break;
         case CLJC_KEYWORD: sb_putc(sb, ':'); sb_puts(sb, v->as.kw); break;
         case CLJC_STRING:
+            if (v->meta) {   /* a #"..."/re-pattern carries {:regex true} → #"..." */
+                Cljc *rg;
+                if (map_find(v->meta, mk_kw(intern("regex", 5)), &rg) && is_truthy(rg)) {
+                    sb_putc(sb, '#'); sb_putc(sb, '"');
+                    sb_puts(sb, v->as.str);
+                    sb_putc(sb, '"');
+                    break;
+                }
+            }
             if (readably) {
                 sb_putc(sb, '"');
                 for (const char *c = v->as.str; *c; c++) {
@@ -7306,11 +7322,11 @@ static Cljc *prim_ex_info(CljcEnv *env, Cljc **argv, int nargs) {
     /* (ex-info msg data) => {:message msg :data data} — exceptions are plain
      * maps here, so all map functions work on them. */
     (void)env;
-    Cljc *msg = argv[0];
-    Cljc *data = argv[1];
     Cljc *m = mk_map();
-    m = map_assoc(m, mk_kw(kw_message()), msg);
-    m = map_assoc(m, mk_kw(kw_data()), data);
+    m = map_assoc(m, mk_kw(kw_message()), argv[0]);
+    m = map_assoc(m, mk_kw(kw_data()), argv[1]);
+    if (nargs >= 3 && argv[2] != NIL)           /* (ex-info msg data cause) */
+        m = map_assoc(m, mk_kw(intern("cause", 5)), argv[2]);
     return m;
 }
 
@@ -7765,6 +7781,17 @@ static Cljc *prim_keyword(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     /* (keyword \a) => nil, like Clojure — keyword rejects chars. */
     if (argv[0] != NIL && argv[0]->tag == CLJC_CHAR) return NIL;
+    if (nargs >= 2) {                       /* (keyword ns name) => :ns/name */
+        const char *ns = as_named(argv[0], "keyword");
+        const char *nm = as_named(argv[1], "keyword");
+        size_t ln = strlen(ns), lm = strlen(nm);
+        char *buf = xmalloc(ln + lm + 2);
+        memcpy(buf, ns, ln); buf[ln] = '/';
+        memcpy(buf + ln + 1, nm, lm); buf[ln + lm + 1] = '\0';
+        Cljc *r = mk_kw(intern(buf, ln + lm + 1));
+        free(buf);
+        return r;
+    }
     const char *n = as_named(argv[0], "keyword");
     return mk_kw(intern(n, strlen(n)));
 }
@@ -9299,7 +9326,8 @@ static const char *PRELUDE =
     /* string helpers */
     "(defn str/join\n"
     "  ([coll] (apply str coll))\n"
-    "  ([sep coll] (if (empty? coll) \"\" (reduce (fn [a b] (str a sep b)) coll))))\n"
+    "  ([sep coll] (if (empty? coll) \"\"\n"
+    "                  (reduce (fn [a b] (str a sep b)) (str (first coll)) (rest coll)))))\n"
     /* control-flow macros */
     "(defmacro if-let [bindings then & else]\n"
     "  `(let [t# ~(nth bindings 1)]\n"
@@ -9871,7 +9899,9 @@ static const char *PRELUDE =
     "(defn bounded-count [n coll] (loop [i 0 s (seq coll)] (if (and s (< i n)) (recur (inc i) (next s)) i)))\n"
     "(defn comparator [f] (fn [a b] (cond (f a b) -1 (f b a) 1 :else 0)))\n"
     "(defn shuffle [coll] (vec coll))\n"
-    "(defn replace [smap coll] (mapv (fn [x] (if (contains? smap x) (get smap x) x)) coll))\n"
+    "(defn replace\n"
+    "  ([smap] (map (fn [x] (if (contains? smap x) (get smap x) x))))\n"
+    "  ([smap coll] (mapv (fn [x] (if (contains? smap x) (get smap x) x)) coll)))\n"
     "(defn replicate [n x] (repeat n x))\n"
     "(defn nthnext [coll n] (loop [n n s (seq coll)] (if (and (pos? n) s) (recur (dec n) (next s)) s)))\n"
     "(defn rseq [v] (seq (reverse v))) (defn supers [_] #{})\n"
@@ -9891,7 +9921,10 @@ static const char *PRELUDE =
     "(defn random-uuid [] \"00000000-0000-0000-0000-000000000000\")\n"
     "(defn hash-ordered-coll [c] (hash (vec c))) (defn hash-unordered-coll [c] (hash (set c)))\n"
     "(defn hash-combine [a b] (bit-xor (hash a) (hash b)))\n"
-    "(defn pop! [coll] coll) (defn random-sample ([_ coll] coll) ([_ coll _] coll))\n"
+    "(defn pop! [coll] coll)\n"
+    "(defn random-sample\n"
+    "  ([prob] (filter (fn [_] (< (rand) prob))))\n"
+    "  ([prob coll] (filter (fn [_] (< (rand) prob)) coll)))\n"
     /* chunked-seq stubs (cljc seqs are unchunked) */
     "(defn chunk-buffer [_] (atom [])) (defn chunk-append [b x] (swap! b conj x) nil)\n"
     "(defn chunk [b] (deref b)) (defn chunk-cons [c s] (concat c s))\n"
@@ -10313,7 +10346,13 @@ static const char *PRELUDE =
     "                    acc (seq m)))\n"
     "          {} ms))\n"
     "(defn reduce-kv [f init m]\n"
-    "  (reduce (fn [acc [k v]] (f acc k v)) init (seq m)))\n"
+    "  (if (map? m)\n"
+    "    (reduce (fn [acc [k v]] (f acc k v)) init (seq m))\n"
+    "    (let [n (count m)]\n"            /* vectors/indexed: keys are indices */
+    "      (loop [i 0 acc init]\n"
+    "        (cond (reduced? acc) (unreduced acc)\n"
+    "              (< i n) (recur (inc i) (f acc i (nth m i)))\n"
+    "              :else acc)))))\n"
     "(defn repeatedly [n f] (map (fn [_] (f)) (range n)))\n"
     "(defmacro doto [x & forms]\n"
     "  (let [g (gensym \"doto\")]\n"
@@ -10365,11 +10404,16 @@ static const char *PRELUDE =
     "(defn rand-nth [coll] (nth (vec coll) (rand-int (count coll))))\n"
     "(defn max-key [f x & xs] (reduce (fn [a b] (if (> (f a) (f b)) a b)) x xs))\n"
     "(defn min-key [f x & xs] (reduce (fn [a b] (if (< (f a) (f b)) a b)) x xs))\n"
-    "(defn set/union [& sets] (reduce (fn [a s] (reduce conj a (seq s))) #{} sets))\n"
+    /* preserve the first set's type (e.g. a sorted-set stays sorted): seed from
+       s1 and conj/disj, never rebuild a plain hash-set */
+    "(defn set/union\n"
+    "  ([] #{})\n"
+    "  ([s1] s1)\n"
+    "  ([s1 & ss] (reduce (fn [a s] (reduce conj a (seq s))) s1 ss)))\n"
     "(defn set/intersection [s1 & ss]\n"
-    "  (reduce (fn [a s] (set (filter (fn [x] (contains? s x)) (seq a)))) s1 ss))\n"
+    "  (reduce (fn [a s] (reduce (fn [r x] (if (contains? s x) r (disj r x))) a (seq a))) s1 ss))\n"
     "(defn set/difference [s1 & ss]\n"
-    "  (reduce (fn [a s] (set (remove (fn [x] (contains? s x)) (seq a)))) s1 ss))\n"
+    "  (reduce (fn [a s] (reduce disj a (seq s))) s1 ss))\n"
     "(defmacro some-> [expr & forms]\n"
     "  (if (empty? forms)\n"
     "    expr\n"
@@ -11004,8 +11048,10 @@ CljcEnv *cljc_new_env(void) {
         "                        (reductions f (first s) (rest s))\n"
         "                        (list (f)))))\n"
         "  ([f init coll]\n"
-        "   (cons init (lazy-seq (when-let [s (seq coll)]\n"
-        "                          (reductions f (f init (first s)) (rest s)))))))\n"
+        "   (if (reduced? init)\n"
+        "     (list (unreduced init))\n"
+        "     (cons init (lazy-seq (when-let [s (seq coll)]\n"
+        "                            (reductions f (f init (first s)) (rest s))))))))\n"
         "(defn take-nth-xf [n]\n"
         "  (fn [rf]\n"
         "    (let [i (volatile! -1)]\n"
@@ -11097,12 +11143,19 @@ CljcEnv *cljc_new_env(void) {
         "           key# (or (:cljc/mm-key (meta mm#)) (cljc/mmk '~name))]\n"
         "       (swap! cljc/multi-tables update key# assoc ~dval (fn ~params ~@body))\n"
         "       mm#))))\n"
-        /* multimethod API: cljc has no dispatch hierarchy, so preferences are
-           moot; the rest operate on the flat method table. */
-        "(defn prefer-method [& _] nil)\n"
-        "(defn remove-method [mm dval] (swap! cljc/multi-tables update (cljc/mmk mm) dissoc dval) mm)\n"
-        "(defn get-method [mm dval] (get (get @cljc/multi-tables (cljc/mmk mm)) dval))\n"
-        "(defn methods [mm] (get @cljc/multi-tables (cljc/mmk mm)))\n"
+        /* multimethod API. The table key lives in the multifn's :cljc/mm-key
+           meta (set by defmulti/read by defmethod) — introspection must use the
+           SAME key, not (cljc/mmk mm) on the fn value (which differs). */
+        "(defn cljc/mm-key [mm] (or (:cljc/mm-key (meta mm)) (cljc/mmk mm)))\n"
+        "(def cljc/multi-prefs (atom {}))\n"
+        "(defn prefer-method [mm x y]\n"
+        "  (swap! cljc/multi-prefs update (cljc/mm-key mm)\n"
+        "         (fn [p] (update (or p {}) x (fn [s] (conj (or s #{}) y))))) mm)\n"
+        "(defn prefers [mm] (get @cljc/multi-prefs (cljc/mm-key mm) {}))\n"
+        "(defn remove-method [mm dval] (swap! cljc/multi-tables update (cljc/mm-key mm) dissoc dval) mm)\n"
+        "(defn remove-all-methods [mm] (swap! cljc/multi-tables assoc (cljc/mm-key mm) {}) mm)\n"
+        "(defn get-method [mm dval] (get (get @cljc/multi-tables (cljc/mm-key mm)) dval))\n"
+        "(defn methods [mm] (get @cljc/multi-tables (cljc/mm-key mm)))\n"
         /* print-method/print-dup: Clojure printing multimethods libraries extend
            (cljc prints via print_to; these just need to exist + be defmethod-able) */
         "(defmulti print-method (fn [x & _] (type x)))\n"

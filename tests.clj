@@ -1943,4 +1943,30 @@
 (assert= [1 2 3 4 5] (into [] (map inc (range 5))))
 (assert= 10 (count (filter even? (range 20))))          ; lazy range through filter
 
+; ── differential bug-hunt + fuzzer fixes ──
+(require '[clojure.set :as cset2])
+(assert= "5" (clojure.string/join "," [5]))             ; join single elt → string
+(assert= "1-2-3" (clojure.string/join "-" [1 2 3]))
+(assert= true (sorted? (cset2/union (sorted-set 3 1) (sorted-set 2 5))))   ; type preserved
+(assert= '(1 2 3 5) (seq (cset2/union (sorted-set 3 1) (sorted-set 2 5))))
+(assert= true (sorted? (cset2/intersection (sorted-set 1 2 3 4) (sorted-set 2 3))))
+(assert= 63 (reduce-kv + 0 [10 20 30]))                 ; reduce-kv on a vector
+(assert= [[0 :x] [1 :y]] (reduce-kv (fn [a k v] (conj a [k v])) [] [:x :y]))
+(assert= '(1 1) (reductions (fn [a b] (reduced a)) [1 2 3]))  ; reductions honors reduced
+(assert= [:a 2 :a] (into [] (replace {1 :a}) [1 2 1]))  ; replace transducer arity
+(assert= [0 1 2] (into [] (random-sample 1.0) (range 3))) ; random-sample transducer arity
+(assert= :a/b (keyword "a" "b"))                        ; 2-arg keyword keeps ns
+(assert= "a" (namespace (keyword "a" "b")))
+(assert= "b" (ex-message (ex-cause (ex-info "a" {} (ex-info "b" {})))))  ; ex-info cause
+(assert= "#\"ab.c\"" (pr-str #"ab.c"))                  ; regex prints as #"..."
+(assert= 3 (read-string "#_ #_ 1 2 3"))                 ; nested discard
+(assert= [1 3] (read-string "[1 #_2 3]"))
+(do (defmulti mmf identity) (defmethod mmf :a [_] 1) (defmethod mmf :default [_] 0)
+    (assert= true (contains? (methods mmf) :a))          ; method table visible
+    (assert= 1 ((get-method mmf :a) nil))
+    (remove-method mmf :a)
+    (assert= 0 (mmf :a)))                                ; remove-method works
+(do (defmulti mmg identity) (prefer-method mmg :a :b)
+    (assert= {:a #{:b}} (prefers mmg)))
+
 (println "tests complete")

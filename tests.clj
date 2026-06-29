@@ -1969,4 +1969,18 @@
 (do (defmulti mmg identity) (prefer-method mmg :a :b)
     (assert= {:a #{:b}} (prefers mmg)))
 
+; ── backlog fixes ──
+(assert= 1 (into [] (halt-when odd?) [2 4 6 1 8]))      ; halt-when terminates
+(assert= 4 (transduce (halt-when #(> % 3)) conj (range 10)))
+(do (defprotocol Pml (gml [this] [this x]))             ; multi-arity protocol via extend-type
+    (extend-type java.lang.String Pml (gml ([s] s) ([s x] (str s x))))
+    (assert= ["a" "ab"] [(gml "a") (gml "a" "b")]))
+(assert= "\\µ" (pr-str (char 181)))                     ; char >127 prints literal (µ = 181)
+(assert= 17 017)                                        ; leading zero stays decimal (kept)
+(assert= "(0 1 2 ...)" (binding [*print-length* 3] (pr-str (range 10))))
+(assert= "[1 2 ...]" (binding [*print-length* 2] (pr-str [1 2 3 4 5])))
+(assert= "(1 (2 #))" (binding [*print-level* 2] (pr-str '(1 (2 (3 (4)))))))
+(assert= 1 (:person/name #:person{:name 1 :age 2}))     ; namespaced map literal
+(assert= 1 (:bare #:m{:_/bare 1 :x 2}))                 ; :_/k means no namespace
+
 (println "tests complete")

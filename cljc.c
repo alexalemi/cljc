@@ -2032,6 +2032,8 @@ static Cljc *read_atom(const char **p) {
         for (size_t i = 0; i < n; i++)
             if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') is_float = true;
         if (is_float) return mk_double(strtod(buf, NULL));
+        /* NB: leading-zero stays DECIMAL (017 => 17), not octal — a deliberate
+         * cljc choice to avoid the octal footgun (see tests.clj). */
         return mk_int(strtoll(buf, NULL, 10));
     }
 
@@ -2375,6 +2377,42 @@ static Cljc *read_form(const char **p) {
          * rebuilt per literal (cheap; a static would dodge the GC roots). */
         r->meta = map_assoc(mk_map(), mk_kw(intern("regex", 5)), TRUE);
         return r;
+    }
+    if (c == '#' && (*p)[1] == ':') {
+        /* namespaced map: #:ns{...} => {:ns/k v}; #::{...} uses the current ns.
+         * A key that's already qualified is kept; :_/k means "no namespace". */
+        *p += 2;
+        bool auto_ns = (**p == ':');
+        if (auto_ns) (*p)++;
+        char nsbuf[256]; size_t nl = 0;
+        while (**p && **p != '{' && !isspace((unsigned char)**p) && nl < 255) nsbuf[nl++] = *(*p)++;
+        nsbuf[nl] = '\0';
+        skip_ws(p);
+        if (**p != '{') cljc_error("namespaced map literal expects {");
+        const char *ns = nl ? nsbuf : (cur_reader_ns ? cur_reader_ns : "user");
+        Cljc *list = read_list(p, '}');
+        if (list_len(list) % 2 != 0) cljc_error("map literal must contain an even number of forms");
+        Cljc *m = mk_map();
+        for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail->as.cons.tail) {
+            Cljc *k = l->as.cons.head, *val = l->as.cons.tail->as.cons.head;
+            const char *nm = k->tag == CLJC_KEYWORD ? k->as.kw : k->tag == CLJC_SYMBOL ? k->as.sym : NULL;
+            if (nm) {
+                const char *slash = strchr(nm, '/');
+                if (slash) {                       /* already qualified (or _/k) */
+                    if (nm[0] == '_' && nm[1] == '/') {
+                        const char *bare = nm + 2;
+                        k = k->tag == CLJC_KEYWORD ? mk_kw(intern(bare, strlen(bare)))
+                                                   : mk_sym(intern(bare, strlen(bare)));
+                    }
+                } else {
+                    char buf[512]; snprintf(buf, sizeof buf, "%s/%s", ns, nm);
+                    k = k->tag == CLJC_KEYWORD ? mk_kw(intern(buf, strlen(buf)))
+                                               : mk_sym(intern(buf, strlen(buf)));
+                }
+            }
+            m = map_assoc(m, k, val);
+        }
+        return m;
     }
     if (c == '#' && (*p)[1] == '{') {
         (*p)++;  /* consume '#'; read_list consumes '{' */
@@ -4686,6 +4724,22 @@ static void format_double(SBuf *sb, double d) {
     }
 }
 
+/* *print-length* / *print-level* support. Printing is non-reentrant, so a
+ * static depth counter suffices; the var values are read through cached root
+ * bindings (a binding mutates in place, so the cache stays valid). -1 = unset. */
+static int g_print_depth;
+static Binding *g_plen_b, *g_plevel_b;
+static int print_var_int(Binding **cache, const char *nm, size_t n) {
+    if (!*cache && gc_root_envs[0])
+        *cache = root_find(env_root(gc_root_envs[0]), intern(nm, n), NULL);
+    Cljc *v = *cache ? (*cache)->value : NIL;
+    return (v != NIL && v->tag == CLJC_INT) ? (int)v->as.i : -1;
+}
+#define PRINT_LEN()   print_var_int(&g_plen_b,   "*print-length*", 14)
+#define PRINT_LEVEL() print_var_int(&g_plevel_b, "*print-level*",  13)
+/* at a collection: true if we're too deep to print it (render "#" instead) */
+static bool print_too_deep(void) { int l = PRINT_LEVEL(); return l >= 0 && g_print_depth >= l; }
+
 /* readably=true  → pr semantics: strings get quotes (read-back form)
  * readably=false → str/print semantics: strings render raw */
 static void print_to(SBuf *sb, Cljc *v, bool readably) {
@@ -4741,6 +4795,17 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                     case '\b': sb_puts(sb, "\\backspace"); break;
                     default:
                         if (cp >= 33 && cp < 127) { sb_putc(sb, '\\'); sb_putc(sb, (char)cp); }
+                        else if (cp >= 127) {       /* printable non-ASCII: \<utf8>, like Clojure */
+                            sb_putc(sb, '\\');
+                            if (cp < 0x800) {
+                                sb_putc(sb, (char)(0xC0 | (cp >> 6)));
+                                sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+                            } else {
+                                sb_putc(sb, (char)(0xE0 | (cp >> 12)));
+                                sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+                                sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+                            }
+                        }
                         else { char tmp[8]; snprintf(tmp, sizeof tmp, "\\u%04X", cp); sb_puts(sb, tmp); }
                 }
             } else {                       /* (str \a) => "a": UTF-8 encode */
@@ -4757,23 +4822,33 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             break;
         }
         case CLJC_LIST: {
+            if (print_too_deep()) { sb_putc(sb, '#'); break; }
             sb_putc(sb, '(');
-            bool first = true;
+            bool first = true; int plen = PRINT_LEN(), cnt = 0;
+            g_print_depth++;
             /* seq1 step: a lazy tail (cons onto lazy-seq) keeps printing */
             for (Cljc *l = v; l && l->tag == CLJC_LIST; l = seq1(l->as.cons.tail)) {
                 if (!first) sb_putc(sb, ' ');
                 first = false;
+                if (plen >= 0 && cnt >= plen) { sb_puts(sb, "..."); break; }
                 print_to(sb, l->as.cons.head, readably);
+                cnt++;
             }
+            g_print_depth--;
             sb_putc(sb, ')');
             break;
         }
         case CLJC_VECTOR: {
+            if (print_too_deep()) { sb_putc(sb, '#'); break; }
             sb_putc(sb, '[');
+            int plen = PRINT_LEN();
+            g_print_depth++;
             for (size_t i = 0; i < vec_len(v); i++) {
                 if (i) sb_putc(sb, ' ');
+                if (plen >= 0 && (int)i >= plen) { sb_puts(sb, "..."); break; }
                 print_to(sb, vec_nth(v, i), readably);
             }
+            g_print_depth--;
             sb_putc(sb, ']');
             break;
         }
@@ -4802,26 +4877,36 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                 }
             }
             (void)ty;
+            if (print_too_deep()) { sb_putc(sb, '#'); break; }
             sb_putc(sb, '{');
-            bool first = true;
+            bool first = true; int plen = PRINT_LEN(), cnt = 0;
+            g_print_depth++;
             for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
                 if (!first) sb_puts(sb, ", ");
                 first = false;
+                if (plen >= 0 && cnt >= plen) { sb_puts(sb, "..."); break; }
                 print_to(sb, e->as.cons.head->as.cons.head, readably);
                 sb_putc(sb, ' ');
                 print_to(sb, e->as.cons.head->as.cons.tail, readably);
+                cnt++;
             }
+            g_print_depth--;
             sb_putc(sb, '}');
             break;
         }
         case CLJC_SET: {
+            if (print_too_deep()) { sb_putc(sb, '#'); break; }
             sb_puts(sb, "#{");
-            bool sfirst = true;
+            bool sfirst = true; int plen = PRINT_LEN(), cnt = 0;
+            g_print_depth++;
             for (Cljc *e = set_element_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
                 if (!sfirst) sb_putc(sb, ' ');
                 sfirst = false;
+                if (plen >= 0 && cnt >= plen) { sb_puts(sb, "..."); break; }
                 print_to(sb, e->as.cons.head, readably);
+                cnt++;
             }
+            g_print_depth--;
             sb_putc(sb, '}');
             break;
         }
@@ -9934,7 +10019,17 @@ static const char *PRELUDE =
     "(defn update-proxy [& _] nil) (defn proxy-mappings [_] {}) (defn proxy-call-with-super [f _ _] (f))\n"
     "(defn reader-conditional [form splicing?] {:form form :splicing? splicing?})\n"
     "(defn inst-ms [_] 0) (defn to-array-2d [coll] (mapv vec coll))\n"
-    "(defn halt-when ([pred] (halt-when pred nil)) ([pred _] (fn [rf] rf)))\n"
+    "(defn halt-when\n"
+    "  ([pred] (halt-when pred nil))\n"
+    "  ([pred retf]\n"
+    "   (fn [rf]\n"
+    "     (fn ([] (rf))\n"
+    "       ([result] (if (and (map? result) (contains? result :cljc/halt))\n"
+    "                   (:cljc/halt result) (rf result)))\n"
+    "       ([result input]\n"
+    "        (if (pred input)\n"
+    "          (reduced {:cljc/halt (if retf (retf (rf result) input) input)})\n"
+    "          (rf result input)))))))\n"
     "(defn print-str [& xs] (str/join \" \" (map str xs)))\n"
     "(defn prn-str [& xs] (str (apply pr-str xs) \"\\n\"))\n"
     "(defn println-str [& xs] (str (str/join \" \" (map str xs)) \"\\n\"))\n"
@@ -11195,13 +11290,17 @@ CljcEnv *cljc_new_env(void) {
         "    (if (or (keyword? t) (nil? t))\n"
         "      `(do ~@(map (fn [g]\n"
         "                    (let [m (first (first g))\n"
-        "                          arities (map (fn [form] `(~(vec (second form)) ~@(drop 2 form))) g)]\n"
+        "                          arities (mapcat (fn [form] (if (vector? (second form))\n"
+        "                                                       [`(~(vec (second form)) ~@(drop 2 form))]\n"
+        "                                                       (map (fn [a] `(~(vec (first a)) ~@(rest a))) (rest form)))) g)]\n"
         "                      `(cljc/reg-method! '~m ~t (fn ~@arities))))\n"
         "                  groups))\n"
         "      `(when-let [tv# (cljc/resolve-maybe '~t)]\n"
         "         ~@(map (fn [g]\n"
         "                  (let [m (first (first g))\n"
-        "                        arities (map (fn [form] `(~(vec (second form)) ~@(drop 2 form))) g)]\n"
+        "                        arities (mapcat (fn [form] (if (vector? (second form))\n"
+        "                                                     [`(~(vec (second form)) ~@(drop 2 form))]\n"
+        "                                                     (map (fn [a] `(~(vec (first a)) ~@(rest a))) (rest form)))) g)]\n"
         "                    `(cljc/reg-method! '~m tv# (fn ~@arities))))\n"
         "                groups)))))\n"
         /* (extend-protocol P T1 (m [x] ...) (m2 [x] ...) T2 (m [x] ...)) —

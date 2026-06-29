@@ -1988,5 +1988,9 @@
 (do (derive ::cat ::feline)                             ; hierarchy 3-arg forms
     (assert= true (isa? (make-hierarchy) ::cat ::feline))
     (assert= #{::feline} (parents (make-hierarchy) ::cat)))
+(do (derive ::ha ::hx) (derive ::ha ::hy)               ; prefer-method disambiguates dispatch
+    (defmulti pmf identity) (defmethod pmf ::hx [_] :x) (defmethod pmf ::hy [_] :y)
+    (prefer-method pmf ::hx ::hy)
+    (assert= :x (pmf ::ha)))
 
 (println "tests complete")

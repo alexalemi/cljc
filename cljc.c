@@ -9585,11 +9585,16 @@ static const char *PRELUDE =
     "  ([h t parent] (underive t parent)))\n"
     /* resolve a method by walking the hierarchy: among method keys that dv isa?,
      * pick the most specific (the one that isa? all the other matches). */
-    "(defn cljc/multi-find [t dv]\n"
-    "  (let [ms (filter (fn [e] (isa? dv (key e))) t)]\n"
-    "    (when (seq ms)\n"
-    "      (val (or (some (fn [e] (when (every? (fn [e2] (isa? (key e) (key e2))) ms) e)) ms)\n"
-    "               (first ms))))))\n"
+    "(defn cljc/multi-find\n"
+    "  ([t dv] (cljc/multi-find t dv nil))\n"
+    "  ([t dv prefs]\n"   /* prefs: {dispatch-val #{preferred-over...}} from prefer-method */
+    "   (let [ms (filter (fn [e] (isa? dv (key e))) t)]\n"
+    "     (when (seq ms)\n"
+    "       (val (or (some (fn [e] (when (every? (fn [e2]\n"
+    "                                              (or (= e e2) (isa? (key e) (key e2))\n"
+    "                                                  (contains? (get prefs (key e)) (key e2))))\n"
+    "                                            ms) e)) ms)\n"
+    "                (first ms)))))))\n"
     /* cljc's collection types ARE the host's Sequential/collection interfaces, so
        derive them — lets a (defmethod f [.. Sequential]) match a vector/list/seq
        dispatch value (e.g. Emmy's partial-derivative on a vector of selectors). */
@@ -11228,7 +11233,9 @@ CljcEnv *cljc_new_env(void) {
         "           (fn [& args#]\n"
         "             (let [t# (get @cljc/multi-tables '~key)\n"
         "                   dv# (apply d# args#)\n"
-        "                   m# (or (get t# dv#) (cljc/multi-find t# dv#) (get t# ~default))]\n"
+        "                   m# (or (get t# dv#)\n"
+        "                          (cljc/multi-find t# dv# (get (deref cljc/multi-prefs) '~key))\n"
+        "                          (get t# ~default))]\n"
         "               (if m#\n"
         "                 (apply m# args#)\n"
         "                 (throw (ex-info (str \"No method in \" '~name\n"

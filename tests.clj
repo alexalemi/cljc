@@ -1204,7 +1204,7 @@
 (assert= true ((every-pred pos? odd?) 3 5))
 (assert= false ((every-pred pos? odd?) 3 4))
 (assert= true ((some-fn neg? odd?) 2 3))
-(assert= nil ((some-fn neg? odd?) 2 4))
+(assert= false ((some-fn neg? odd?) 2 4))   ; some-fn returns logical false, not nil
 (assert= 3 ((memoize +) 1 2))
 (assert= '(3 4) (take-last 2 [1 2 3 4]))
 (assert= '(1 2) (drop-last [1 2 3]))
@@ -1889,5 +1889,45 @@
 (require '[babashka.cli :as cli])
 (assert= {:threshold -5} (cli/parse-opts ["--threshold" "-5"] {:coerce {:threshold :int}}))
 (assert= {:id [1 2]} (cli/parse-opts ["--id" "1" "--id" "2"] {:coerce {:id [:int]}}))
+
+;; ── second bug pass (2026-06-28): differential-tested against real Clojure ──
+; doubles print at full precision (was %g, 6 sig figs), Clojure Double.toString style
+(assert= "0.3333333333333333" (pr-str (/ 1.0 3.0)))
+(assert= "1.2100000000000002" (pr-str (* 1.1 1.1)))
+(assert= "1.0" (pr-str 1.0))
+(assert= "1000000.0" (pr-str 1000000.0))
+(assert= "1.0E10" (pr-str 1.0e10))
+(assert= "1.0E-6" (pr-str 0.000001))
+(assert= "##Inf" (pr-str (/ 1.0 0.0)))
+(assert= "##-Inf" (pr-str (/ -1.0 0.0)))
+(assert= "##NaN" (pr-str (Math/sqrt -1)))
+; regex: lazy/possessive counted quantifiers, word boundaries
+(assert= "aa" (re-find #"a{2,4}?" "aaaa"))
+(assert= "aaa" (re-find #"a++" "aaa"))
+(assert= "cat" (re-find #"\bcat\b" "the cat sat"))
+(assert= "var" (re-find #"\Bvar" "myvar"))
+; str/split: limit, negative limit, empty pattern, empty input
+(assert= ["a" "b,c,d"] (clojure.string/split "a,b,c,d" #"," 2))
+(assert= ["a" "b" "" "" ""] (clojure.string/split "a,b,,," #"," -1))
+(assert= ["a" "b" "c"] (clojure.string/split "abc" #""))
+(assert= [""] (clojure.string/split "" #","))
+(assert= [] (clojure.string/split ",," #","))
+; str/replace: function replacement, backslash escapes; replace-first zero-width at EOS
+(assert= "a[1]b[2]" (clojure.string/replace "a1b2" #"\d" (fn [m] (str "[" m "]"))))
+(assert= "a<1>" (clojure.string/replace "a1" #"(\d)" (fn [[_ g]] (str "<" g ">"))))
+(assert= "a$c" (clojure.string/replace "abc" #"b" "\\$"))
+(assert= "abcX" (clojure.string/replace-first "abc" #"$" "X"))
+; misc number / seq / destructure fixes
+(assert= -2 (Math/round -2.5))               ; Java half-up (was -3)
+(assert= 0 (Math/round -0.5))
+(assert= '(1.0 1.5 2.0 2.5) (range 1.0 3.0 0.5))   ; range accepts floats
+(assert= nil (nth nil 0))                    ; nth on nil
+(assert= :d (nth nil 5 :d))
+(assert= nil (parse-long " 42"))             ; leading whitespace rejected
+(assert= [1 2] (let [{:strs [a b]} {"a" 1 "b" 2}] [a b]))      ; :strs destructure
+(assert= [3 4] (let [{:syms [p q]} '{p 3 q 4}] [p q]))         ; :syms destructure
+(assert= false ((some-fn neg? even?) 3))     ; some-fn returns false not nil
+(assert= [1 2] (swap-vals! (atom 1) inc))
+(assert= [1 9] (reset-vals! (atom 1) 9))
 
 (println "tests complete")

@@ -2485,11 +2485,13 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
         return;
     }
     if (pattern != NIL && pattern->tag == CLJC_MAP) {
-        static const char *KW_KEYS, *KW_AS, *KW_OR;
+        static const char *KW_KEYS, *KW_AS, *KW_OR, *KW_STRS, *KW_SYMS;
         if (!KW_KEYS) {
             KW_KEYS = intern("keys", 4);
             KW_AS = intern("as", 2);
             KW_OR = intern("or", 2);
+            KW_STRS = intern("strs", 4);
+            KW_SYMS = intern("syms", 4);
         }
         Cljc *defaults = NULL;  /* the :or map, if present */
         Cljc *pentries = map_entry_list(pattern);
@@ -2530,6 +2532,27 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
                                 v = eval(scope, d);
                         }
                         env_define(scope, local, v);
+                    }
+                    continue;
+                }
+                if (k->as.kw == KW_STRS || k->as.kw == KW_SYMS) {
+                    /* {:strs [a b]} → (get m "a"); {:syms [a b]} → (get m 'a) */
+                    if (spec == NIL || spec->tag != CLJC_VECTOR)
+                        cljc_error("destructure: :%s needs a vector of symbols", k->as.kw);
+                    bool syms = (k->as.kw == KW_SYMS);
+                    for (size_t j = 0; j < vec_len(spec); j++) {
+                        Cljc *elt = vec_nth(spec, j);
+                        if (elt == NIL) continue;
+                        const char *nm = sym_name(elt, syms ? ":syms" : ":strs");
+                        Cljc *key = syms ? mk_sym(nm) : mk_str(nm, strlen(nm));
+                        Cljc *v = NIL;
+                        bool found = value != NIL && value->tag == CLJC_MAP &&
+                                     map_find(value, key, &v);
+                        if (!found && defaults && defaults->tag == CLJC_MAP) {
+                            Cljc *d;
+                            if (map_find(defaults, mk_sym(nm), &d)) v = eval(scope, d);
+                        }
+                        env_define(scope, nm, v);
                     }
                     continue;
                 }
@@ -4599,6 +4622,54 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
 
 /* ───── Printer ──────────────────────────────────────────────────────── */
 
+/* Format a double like Clojure's Double.toString: the SHORTEST decimal that
+ * round-trips, with decimal notation for 1e-3 <= |d| < 1e7 and d.dddExx
+ * scientific otherwise; ##NaN / ##Inf / ##-Inf for non-finite. (C's %g loses
+ * precision at its 6-sig-fig default and uses an "e+NN" exponent.) */
+static void format_double(SBuf *sb, double d) {
+    if (isnan(d)) { sb_puts(sb, "##NaN"); return; }
+    if (isinf(d)) { sb_puts(sb, d < 0 ? "##-Inf" : "##Inf"); return; }
+    if (d == 0.0) { sb_puts(sb, signbit(d) ? "-0.0" : "0.0"); return; }
+    /* fewest significant digits that parse back to exactly d */
+    int prec = 17;
+    char tmp[64];
+    for (int p = 1; p <= 17; p++) {
+        snprintf(tmp, sizeof tmp, "%.*e", p - 1, d);
+        if (strtod(tmp, NULL) == d) { prec = p; break; }
+    }
+    snprintf(tmp, sizeof tmp, "%.*e", prec - 1, d);   /* -d.ddde±xx */
+    char digits[20]; int ndig = 0, exp10 = 0; bool neg = false;
+    const char *q = tmp;
+    if (*q == '-') { neg = true; q++; }
+    digits[ndig++] = *q++;                              /* leading digit */
+    if (*q == '.') q++;
+    while (*q && *q != 'e' && *q != 'E') digits[ndig++] = *q++;
+    if (*q == 'e' || *q == 'E') exp10 = atoi(q + 1);
+    while (ndig > 1 && digits[ndig - 1] == '0') ndig--; /* trim trailing zeros */
+    digits[ndig] = '\0';
+    if (neg) sb_putc(sb, '-');
+    if (exp10 >= -3 && exp10 < 7) {                     /* decimal notation */
+        if (exp10 >= 0) {
+            int intlen = exp10 + 1;
+            for (int i = 0; i < intlen; i++) sb_putc(sb, i < ndig ? digits[i] : '0');
+            sb_putc(sb, '.');
+            if (intlen >= ndig) sb_putc(sb, '0');
+            else for (int i = intlen; i < ndig; i++) sb_putc(sb, digits[i]);
+        } else {
+            sb_puts(sb, "0.");
+            for (int i = 0; i < -exp10 - 1; i++) sb_putc(sb, '0');
+            for (int i = 0; i < ndig; i++) sb_putc(sb, digits[i]);
+        }
+    } else {                                            /* d.dddExx scientific */
+        sb_putc(sb, digits[0]);
+        sb_putc(sb, '.');
+        if (ndig == 1) sb_putc(sb, '0');
+        else for (int i = 1; i < ndig; i++) sb_putc(sb, digits[i]);
+        char ebuf[8]; snprintf(ebuf, sizeof ebuf, "E%d", exp10);
+        sb_puts(sb, ebuf);
+    }
+}
+
 /* readably=true  → pr semantics: strings get quotes (read-back form)
  * readably=false → str/print semantics: strings render raw */
 static void print_to(SBuf *sb, Cljc *v, bool readably) {
@@ -4612,15 +4683,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
             sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
         case CLJC_VAR: sb_puts(sb, "#'"); sb_puts(sb, v->as.var.name); break;
-        case CLJC_DOUBLE: {
-            char tmp[32];
-            snprintf(tmp, sizeof tmp, "%g", v->as.d);
-            sb_puts(sb, tmp);
-            /* %g prints 1.0 as "1" — append ".0" so doubles stay visually
-             * distinct from ints ("inf"/"nan" pass the strpbrk too). */
-            if (!strpbrk(tmp, ".ein")) sb_puts(sb, ".0");
-            break;
-        }
+        case CLJC_DOUBLE: format_double(sb, v->as.d); break;
         case CLJC_SYMBOL: sb_puts(sb, v->as.sym); break;
         case CLJC_KEYWORD: sb_putc(sb, ':'); sb_puts(sb, v->as.kw); break;
         case CLJC_STRING:
@@ -5132,7 +5195,7 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         if (n == 1) {
             if (op == OP_SUB) {  /* negate; INT64_MIN overflows -> promote */
                 if (promote && acc == INT64_MIN) return big_addsub(mk_int(0), argv[0], 1);
-                return mk_int(-acc);
+                return mk_int((int64_t)(0u - (uint64_t)acc));  /* unsigned: no UB at MIN */
             }
             if (op == OP_DIV) {
                 if (acc == 0) cljc_error("Divide by zero");
@@ -5159,13 +5222,15 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
                     return b;
                 }
                 acc = r;
-            } else {
+            } else {   /* unchecked: wrap in unsigned to keep it well-defined (no UB) */
+                uint64_t u = (uint64_t)acc, ux = (uint64_t)x;
                 switch (op) {
-                    case OP_ADD: acc += x; break;
-                    case OP_SUB: acc -= x; break;
-                    case OP_MUL: acc *= x; break;
+                    case OP_ADD: u += ux; break;
+                    case OP_SUB: u -= ux; break;
+                    case OP_MUL: u *= ux; break;
                     default: break;
                 }
+                acc = (int64_t)u;
             }
         }
         return mk_int(acc);
@@ -5537,6 +5602,7 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
     int64_t orig_idx = n;            /* n is consumed by the seq loops below */
     Cljc *not_found = nargs > 2
         ? argv[2] : NULL;
+    if (coll == NIL) return not_found ? not_found : NIL;  /* (nth nil i) => nil */
     /* a deftype with Indexed/nth uses it; one that is only Sequential (a matrix
      * via its rows) falls back to seq-based nth, like Clojure. */
     if (coll && coll->tag == CLJC_MAP) {
@@ -6109,8 +6175,22 @@ static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_range(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    int64_t start = 0, end = 0, step = 1;
     size_t n = (size_t)nargs;
+    bool flt = false;                       /* float range if any arg is a double */
+    for (size_t i = 0; i < n && i < 3; i++)
+        if (argv[i] != NIL && argv[i]->tag == CLJC_DOUBLE) flt = true;
+    if (flt) {
+        double start = 0, end = 0, step = 1;
+        if (n == 1) end = as_num(argv[0]);
+        else { start = as_num(argv[0]); end = as_num(argv[1]); if (n >= 3) step = as_num(argv[2]); }
+        if (step == 0) cljc_error("range: step must be nonzero");
+        Cljc *out = NIL, **t = &out;
+        for (double i = start; step > 0 ? i < end : i > end; i += step) {
+            *t = mk_cons(mk_double(i), NIL); t = &(*t)->as.cons.tail;
+        }
+        return out;
+    }
+    int64_t start = 0, end = 0, step = 1;
     if (n == 1) end = as_int(argv[0], "range");
     else if (n >= 2) {
         start = as_int(argv[0], "range");
@@ -6212,7 +6292,7 @@ static Cljc *prim_seq_p(CljcEnv *env, Cljc **argv, int nargs) {
  * only star is a real loop, guarded against empty-match cycles. */
 
 enum { RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL, RX_STAR, RX_LOOP,
-       RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA, RX_BACKREF };
+       RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA, RX_BACKREF, RX_WB };
 
 typedef struct Rx Rx;
 struct Rx {
@@ -6341,6 +6421,8 @@ static RxChain rx_parse_atom(RxC *c) {
             r = rx_node(c, RX_CLASS); rx_class_shorthand(r, (char)tolower(e)); r->neg = true;
         } else if (e >= '1' && e <= '9') {        /* \1..\9 backreference */
             r = rx_node(c, RX_BACKREF); r->group = e - '0';
+        } else if (e == 'b' || e == 'B') {        /* \b / \B word boundary */
+            r = rx_node(c, RX_WB); r->neg = (e == 'B');
         } else {
             r = rx_node(c, RX_CHAR);
             r->ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
@@ -6395,6 +6477,9 @@ static RxChain rx_parse_cat(RxC *c) {
             }
             if (*c->p != '}') cljc_error("regex: bad {n,m} quantifier");
             c->p++;
+            bool qlazy = false;
+            if (*c->p == '?') { qlazy = true; c->p++; }   /* {n,m}? lazy */
+            else if (*c->p == '+') c->p++;                /* {n,m}+ possessive → greedy */
             if (hi == -1) hi = lo;
             if (lo > 64 || (hi != -2 && (hi > 64 || hi < lo)))
                 cljc_error("regex: {n,m} out of range");
@@ -6413,7 +6498,7 @@ static RxChain rx_parse_cat(RxC *c) {
                 c->ngroups = groups_before;
                 RxChain copy = rx_parse_atom(c);
                 c->ngroups = groups_after;
-                RxChain star = rx_star(c, copy, false);
+                RxChain star = rx_star(c, copy, qlazy);
                 if (!seq.h) seq = star;
                 else { seq.t->next = star.h; seq.t = star.t; }
             } else {
@@ -6426,8 +6511,9 @@ static RxChain rx_parse_cat(RxC *c) {
                     Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
                     Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
                     if (copy.t) copy.t->next = j1;
-                    a->child = copy.h ? copy.h : j1;
-                    a->alt = j2;
+                    Rx *xbranch = copy.h ? copy.h : j1;
+                    a->child = qlazy ? j2 : xbranch;   /* lazy prefers the empty branch */
+                    a->alt   = qlazy ? xbranch : j2;
                     if (!seq.h) { seq.h = seq.t = a; }
                     else { seq.t->next = a; seq.t = a; }
                 }
@@ -6441,6 +6527,7 @@ static RxChain rx_parse_cat(RxC *c) {
             c->p++;
             bool lazy = *c->p == '?';
             if (lazy) c->p++;
+            else if (*c->p == '+') c->p++;   /* possessive (a++, a*+) → treat greedy */
             if (q == '*') {
                 unit = rx_star(c, atom, lazy);
             } else if (q == '+') {
@@ -6506,6 +6593,11 @@ static bool rx_m(Rx *r, const char *s) {
         case RX_CLASS: return *s && rx_bit_test(r, (unsigned char)*s) && rx_m(r->next, s + 1);
         case RX_BOL:   return s == rx_str_begin && rx_m(r->next, s);
         case RX_EOL:   return *s == '\0' && rx_m(r->next, s);
+        case RX_WB: {  /* \b boundary / \B non-boundary (\w = [A-Za-z0-9_]) */
+            int wprev = (s != rx_str_begin) && (isalnum((unsigned char)s[-1]) || s[-1] == '_');
+            int wcur  = (*s != '\0') && (isalnum((unsigned char)*s) || *s == '_');
+            return ((wprev != wcur) != r->neg) && rx_m(r->next, s);
+        }
         case RX_GS: {
             const char *save = rx_cap_s[r->group];
             rx_cap_s[r->group] = s;
@@ -8312,9 +8404,11 @@ static Cljc *prim_str_replace(CljcEnv *env, Cljc **argv, int nargs) {
     return res;
 }
 
-/* Append replacement text, expanding $0..$9 to capture groups; $$ => $. */
+/* Append replacement text, expanding $0..$9 to capture groups; $$ => $;
+ * a backslash escapes the next char (\$ => literal $, \\ => literal \). */
 static void rx_subst(SBuf *out, const char *repl) {
     for (const char *r = repl; *r; r++) {
+        if (*r == '\\' && r[1]) { sb_putc(out, r[1]); r++; continue; }
         if (*r == '$' && r[1] == '$') { sb_putc(out, '$'); r++; continue; }
         if (*r == '$' && isdigit((unsigned char)r[1])) {
             int g = r[1] - '0';
@@ -8327,12 +8421,28 @@ static void rx_subst(SBuf *out, const char *repl) {
     }
 }
 
+/* The value passed to a replacement FUNCTION: the matched string when the
+ * pattern has no groups, else [match g1 .. gn] (nil for non-participating). */
+static Cljc *rx_match_value(int ngroups) {
+    /* ngroups counts group 0; ==1 means no user groups (pass the match string) */
+    if (ngroups == 1)
+        return mk_str(rx_cap_s[0], (size_t)(rx_cap_e[0] - rx_cap_s[0]));
+    Cljc *v = mk_empty_vec();
+    for (int g = 0; g < ngroups; g++)
+        v = vec_conj1(v, (rx_cap_s[g] && rx_cap_e[g] && rx_cap_e[g] >= rx_cap_s[g])
+                         ? mk_str(rx_cap_s[g], (size_t)(rx_cap_e[g] - rx_cap_s[g])) : NIL);
+    return v;
+}
+
 static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
-    /* (re-replace s pattern replacement) — all matches; $1..$9 in repl. */
-    (void)env;
+    /* (re-replace s pattern replacement) — all matches. replacement is a string
+     * ($1..$9 group refs) or a function (called with the match / [match g1..]). */
+    (void)nargs;
     char *s = as_str(argv[0], "re-replace");
     char *pat = as_str(argv[1], "re-replace");
-    char *repl = as_str(argv[2], "re-replace");
+    Cljc *replv = argv[2];
+    bool is_fn = replv != NIL && (replv->tag == CLJC_FN || replv->tag == CLJC_NATIVE);
+    char *repl = is_fn ? NULL : as_str(argv[2], "re-replace");
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
     rx_str_begin = s;
@@ -8343,9 +8453,14 @@ static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
         rx_reset_caps();
         rx_cap_s[0] = p;
         if (rx_m(prog, p)) {
-            rx_cap_e[0] = rx_match_end;
-            rx_subst(&out, repl);
-            if (rx_match_end > p) { p = rx_match_end; continue; }
+            const char *mend = rx_match_end;          /* save: a fn may clobber rx_* */
+            rx_cap_e[0] = mend;
+            if (is_fn) {
+                Cljc *mv = rx_match_value(ngroups);
+                sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
+                rx_str_begin = s;                     /* restore after the call */
+            } else rx_subst(&out, repl);
+            if (mend > p) { p = mend; continue; }
             /* empty match: emit one char and advance to avoid looping */
             sb_putc(&out, *p);
         } else {
@@ -8359,7 +8474,10 @@ static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
     rx_cap_s[0] = p;
     if (rx_m(prog, p) && rx_match_end == p) {
         rx_cap_e[0] = p;
-        rx_subst(&out, repl);
+        if (is_fn) {
+            Cljc *mv = rx_match_value(ngroups);
+            sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
+        } else rx_subst(&out, repl);
     }
     free(pool);
     Cljc *res = mk_str(out.data, out.len);
@@ -8368,34 +8486,48 @@ static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs) {
-    /* (re-split s pattern) => vector of segments; trailing empties dropped. */
+    /* (split s pattern [limit]) — Java/Clojure semantics: zero-width matches
+     * split between chars (empty pattern → chars); limit=0 (default) drops
+     * trailing empties, limit>0 caps the count, limit<0 keeps trailing empties.
+     * A no-match returns [s] (so (split "" #",") => [""]). */
     (void)env;
     char *s = as_str(argv[0], "re-split");
     char *pat = as_str(argv[1], "re-split");
+    long limit = (nargs > 2) ? (long)as_int(argv[2], "split") : 0;
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
     rx_str_begin = s;
-    Cljc *segs = NIL, **t = &segs;  /* list of segment strings, in order */
-    size_t nsegs = 0, last_nonempty = 0;
-    const char *seg = s, *p = s;
+    Cljc *segs = NIL, **t = &segs;
+    size_t nsegs = 0;
+    bool any_match = false;
+    const char *seg = s, *p = s, *end = s + strlen(s);
     while (*p) {
-        rx_reset_caps();
-        if (rx_m(prog, p) && rx_match_end > p) {
-            *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL);
-            t = &(*t)->as.cons.tail;
-            nsegs++;
-            if (p > seg) last_nonempty = nsegs;
-            p = rx_match_end;
-            seg = p;
+        if (limit > 0 && (long)nsegs == limit - 1) break;  /* last seg keeps the rest */
+        rx_reset_caps(); rx_cap_s[0] = p;
+        if (rx_m(prog, p)) {
+            any_match = true;
+            const char *mend = rx_match_end;
+            if (mend > p) {                                /* non-empty match */
+                *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL); t = &(*t)->as.cons.tail; nsegs++;
+                p = mend; seg = p;
+            } else if (p == s) { p++; }                    /* zero-width at index 0: skip */
+            else {                                         /* zero-width between chars */
+                *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL); t = &(*t)->as.cons.tail; nsegs++;
+                seg = p; p++;
+            }
         } else p++;
     }
-    *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL);
-    nsegs++;
-    if (p > seg) last_nonempty = nsegs;
+    *t = mk_cons(mk_str(seg, (size_t)(end - seg)), NIL); nsegs++;   /* final segment */
     free(pool);
+    size_t keep = nsegs;
+    if (limit == 0 && any_match) {                         /* drop trailing empties */
+        keep = 0; size_t i = 0;
+        for (Cljc *l = segs; l && l->tag == CLJC_LIST; l = l->as.cons.tail, i++)
+            if (l->as.cons.head->as.str[0]) keep = i + 1;
+    }
     Cljc *v = mk_empty_vec();
     size_t i = 0;
-    for (Cljc *l = segs; l && l->tag == CLJC_LIST && i < last_nonempty; l = l->as.cons.tail, i++)
+    for (Cljc *l = segs; l && l->tag == CLJC_LIST && i < keep; l = l->as.cons.tail, i++)
         v = vec_conj1(v, l->as.cons.head);
     return v;
 }
@@ -8456,15 +8588,18 @@ MATH2(atan2, atan2)     /* note arg order: (atan2 y x) */
 MATH2(hypot, hypot)     /* sqrt(x*x + y*y) without overflow */
 
 static Cljc *prim_round(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
-    return mk_int((int64_t)llround(as_num(argv[0])));
+    (void)env; (void)nargs;
+    /* Java's Math.round: floor(x + 0.5) — round half toward +infinity
+     * (so -2.5 → -2), not C llround's round-half-away-from-zero. */
+    return mk_int((int64_t)floor(as_num(argv[0]) + 0.5));
 }
 
 static Cljc *prim_math_abs(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
+    (void)env; (void)nargs;
     Cljc *v = argv[0];
     if (v != NIL && v->tag == CLJC_DOUBLE) return mk_double(fabs(v->as.d));
-    return mk_int(v->as.i < 0 ? -v->as.i : v->as.i);
+    /* unsigned negate avoids UB on INT64_MIN (returns INT64_MIN, as Java does) */
+    return mk_int(v->as.i < 0 ? (int64_t)(0u - (uint64_t)v->as.i) : v->as.i);
 }
 
 static Cljc *prim_rand(CljcEnv *env, Cljc **argv, int nargs) {
@@ -8565,7 +8700,9 @@ static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
     if (argv[1] != NIL && argv[1]->tag == CLJC_STRING && argv[1]->meta) {
         char *s = as_str(argv[0], "str/replace-first");
         char *pat = as_str(argv[1], "str/replace-first");
-        char *repl = as_str(argv[2], "str/replace-first");
+        Cljc *replv = argv[2];
+        bool is_fn = replv != NIL && (replv->tag == CLJC_FN || replv->tag == CLJC_NATIVE);
+        char *repl = is_fn ? NULL : as_str(argv[2], "str/replace-first");
         Rx *pool; int ngroups;
         Rx *prog = rx_compile(pat, &pool, &ngroups);
         rx_str_begin = s;
@@ -8573,16 +8710,22 @@ static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
         sb_grow(&out, 1); out.data[0] = '\0';
         const char *p = s;
         bool done = false;
-        while (*p && !done) {
+        while (!done) {                            /* note: tests at the EOS NUL too */
             rx_reset_caps();
             rx_cap_s[0] = p;
             if (rx_m(prog, p)) {
-                rx_cap_e[0] = rx_match_end;
-                rx_subst(&out, repl);
-                if (rx_match_end > p) p = rx_match_end;
-                else { sb_putc(&out, *p); p++; }   /* empty match: advance one */
+                const char *mend = rx_match_end;
+                rx_cap_e[0] = mend;
+                if (is_fn) {
+                    Cljc *mv = rx_match_value(ngroups);
+                    sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
+                    rx_str_begin = s;
+                } else rx_subst(&out, repl);
+                if (mend > p) p = mend;
+                else if (*p) { sb_putc(&out, *p); p++; }  /* empty match mid-string */
                 done = true;
-            } else { sb_putc(&out, *p); p++; }
+            } else if (*p) { sb_putc(&out, *p); p++; }
+            else done = true;                      /* end of string, no match */
         }
         sb_puts(&out, p);                          /* tail after the match */
         free(pool);
@@ -8613,6 +8756,7 @@ static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_parse_long(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     char *s = as_str(argv[0], "parse-long");
+    if (isspace((unsigned char)s[0])) return NIL;  /* no leading whitespace (Clojure) */
     char *end;
     errno = 0;
     long long v = strtoll(s, &end, 10);
@@ -9229,6 +9373,8 @@ static const char *PRELUDE =
     "(def volatile! atom)\n"
     "(def vreset! reset!)\n"
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
+    "(defn swap-vals! [a f & args] (let [old @a] [old (apply swap! a f args)]))\n"
+    "(defn reset-vals! [a v] (let [old @a] (reset! a v) [old v]))\n"
     /* a deftype (no longer map?) is sequential? when it derives Sequential —
        check the type tag directly, not map?. */
     "(defn sequential? [x] (boolean (or (list? x) (vector? x) (seq? x)\n"
@@ -9304,7 +9450,7 @@ static const char *PRELUDE =
     "(defn every-pred [& ps]\n"
     "  (fn [& args] (every? (fn [p] (every? p args)) ps)))\n"
     "(defn some-fn [& ps]\n"
-    "  (fn [& args] (some (fn [p] (some p args)) ps)))\n"
+    "  (fn [& args] (or (some (fn [p] (some p args)) ps) false)))\n"
     "(defn memoize [f]\n"
     "  (let [cache (atom {})]\n"
     "    (fn [& args]\n"

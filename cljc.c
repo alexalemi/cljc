@@ -151,7 +151,9 @@ struct Cljc {
         const char *sym;
         /* Wider view of the same symbol cell: name aliases .sym; root_cache
          * memoizes the resolved ROOT binding (stable — root def mutates). */
-        struct { const char *name; Binding *root_cache; const char *home_ns; } symc;
+        struct { const char *name; Binding *root_cache; const char *home_ns;
+                 bool plain; } symc;  /* plain: an unqualified, non-special, non-dot
+                                       * call head — skip the dispatch cascade */
         const char *kw;
         char *str;
         struct { Cljc *head; Cljc *tail; } cons;
@@ -4016,8 +4018,10 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
             Cljc *head = form->as.cons.head;
             Cljc *rest = form->as.cons.tail;
 
-            /* Special forms — dispatch by interned symbol pointer. */
-            if (head->tag == CLJC_SYMBOL) {
+            /* Special forms — dispatch by interned symbol pointer. A head that
+             * resolved to an ordinary call last time is flagged `plain`, so we
+             * skip the strip + dot + special-form cascade on every repeat. */
+            if (head->tag == CLJC_SYMBOL && !head->as.symc.plain) {
                 const char *s = strip_core_qualifier(head->as.sym);
                 /* (.-field obj): deftype field access -> field of the instance
                  * map (cljc represents a deftype instance as a tagged map) */
@@ -4585,6 +4589,11 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     env_define(fenv, self_name, f);
                     return f;
                 }
+                /* Fell through every special/dot form → an ordinary call. Cache
+                 * it on the head cell so repeats skip the cascade. Unqualified
+                 * only: then strip_core_qualifier was a guaranteed no-op and the
+                 * classification can't change under a later alias. */
+                if (!strchr(head->as.sym, '/')) head->as.symc.plain = true;
             }
 
             /* Application. Macros get the unevaluated forms; the expansion
@@ -7229,20 +7238,20 @@ static Cljc *prim_chunk_filter(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_vector(pair, 2);
 }
 
-/* (cljc/onto strict-list tail) — copy the list's conses onto tail (which
- * may be lazy), without per-element lazy cells. */
+/* (cljc/onto strict-list tail) — splice `tail` (possibly lazy) onto the end of
+ * `lst`. lst is a fresh, unshared chunk list from the chunk-map / chunk-filter
+ * natives, so we mutate its last cons in place instead of copying every element
+ * (this is the hot map/filter chunk-splice — copying doubled conses per item). */
 static Cljc *prim_onto(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
+    (void)env; (void)nargs;
     Cljc *lst = argv[0];
     Cljc *tail = argv[1];
-    if (lst == NIL) return tail;
-    Cljc *out = NIL, **t = &out;
-    for (Cljc *l = lst; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
-        *t = mk_cons(l->as.cons.head, NIL);
-        t = &(*t)->as.cons.tail;
-    }
-    *t = tail;
-    return out;
+    if (lst == NIL || lst->tag != CLJC_LIST) return tail;
+    Cljc *l = lst;
+    while (l->as.cons.tail != NIL && l->as.cons.tail->tag == CLJC_LIST)
+        l = l->as.cons.tail;
+    l->as.cons.tail = tail;
+    return lst;
 }
 
 static Cljc *prim_gc(CljcEnv *env, Cljc **argv, int nargs) {

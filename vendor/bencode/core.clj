@@ -8,11 +8,14 @@
     (or (string? x) (keyword? x) (symbol? x))
     (let [s (if (string? x) x (name x))] (.write out (str (count s) ":" s)))
     (map? x)
-    (do (.write out "d")
-        (doseq [k (sort (map #(if (or (keyword? %) (symbol? %)) (name %) (str %)) (keys x)))]
-          (write-bencode out k)
-          (write-bencode out (or (get x k) (get x (keyword k)))))
-        (.write out "e"))
+    (let [keystr (fn [k] (if (or (keyword? k) (symbol? k)) (name k) (str k)))]
+      (.write out "d")
+      ;; sort by the bencoded key string, but retrieve values by the ORIGINAL
+      ;; key so false/nil values aren't dropped by an `or` fallback
+      (doseq [k (sort-by keystr (keys x))]
+        (write-bencode out (keystr k))
+        (write-bencode out (get x k)))
+      (.write out "e"))
     (sequential? x)
     (do (.write out "l") (doseq [v x] (write-bencode out v)) (.write out "e"))
     :else (write-bencode out (str x)))

@@ -42,7 +42,7 @@
       (str/replace (subs s 1 (dec (count s))) "''" "'")
       (str/starts-with? s "[") (first (pf s 0 kw))
       (str/starts-with? s "{") (first (pf s 0 kw))
-      (re-matches int-re s) (parse-long s)
+      (re-matches int-re s) (or (parse-long s) s)   ; parse-long → nil on overflow: keep the string
       (and (re-matches float-re s) (re-find #"[.eE]" s)) (parse-double s)
       :else s)))
 
@@ -55,19 +55,23 @@
 
 (defn- pf-dq [s i]                      ; i past opening "
   (loop [i i acc []]
-    (let [c (nth s i)]
-      (cond
-        (= c \") [(unescape-dq (apply str acc)) (inc i)]
-        (and (= c \\) (< (inc i) (count s))) (recur (+ i 2) (conj acc c (nth s (inc i))))
-        :else (recur (inc i) (conj acc c))))))
+    (if (>= i (count s))
+      [(unescape-dq (apply str acc)) i]  ; unterminated quote: degrade gracefully
+      (let [c (nth s i)]
+        (cond
+          (= c \") [(unescape-dq (apply str acc)) (inc i)]
+          (and (= c \\) (< (inc i) (count s))) (recur (+ i 2) (conj acc c (nth s (inc i))))
+          :else (recur (inc i) (conj acc c)))))))
 
 (defn- pf-sq [s i]                      ; i past opening '
   (loop [i i acc []]
-    (let [c (nth s i)]
-      (cond
-        (and (= c \') (< (inc i) (count s)) (= (nth s (inc i)) \')) (recur (+ i 2) (conj acc \'))
-        (= c \') [(apply str acc) (inc i)]
-        :else (recur (inc i) (conj acc c))))))
+    (if (>= i (count s))
+      [(apply str acc) i]                ; unterminated quote: degrade gracefully
+      (let [c (nth s i)]
+        (cond
+          (and (= c \') (< (inc i) (count s)) (= (nth s (inc i)) \')) (recur (+ i 2) (conj acc \'))
+          (= c \') [(apply str acc) (inc i)]
+          :else (recur (inc i) (conj acc c)))))))
 
 (defn- pf-plain [s i kw stops]
   (loop [j i]
@@ -85,12 +89,15 @@
         :else (let [[v ni] (pf s i kw)] (recur ni (conj acc v)))))))
 
 (defn- pf-key [s i kw]
-  (let [i (skip-sp s i) c (nth s i)]
-    (cond
-      (= c \") (let [[v ni] (pf-dq s (inc i))] [(if kw (keyword v) v) ni])
-      (= c \') (let [[v ni] (pf-sq s (inc i))] [(if kw (keyword v) v) ni])
-      :else (let [[v ni] (pf-plain s i false #{\: \, \}})]
-              [(if (and kw (string? v)) (keyword v) v) ni]))))
+  (let [i (skip-sp s i)]
+    (if (>= i (count s))
+      [nil i]
+      (let [c (nth s i)]
+        (cond
+          (= c \") (let [[v ni] (pf-dq s (inc i))] [(if kw (keyword v) v) ni])
+          (= c \') (let [[v ni] (pf-sq s (inc i))] [(if kw (keyword v) v) ni])
+          :else (let [[v ni] (pf-plain s i false #{\: \, \}})]
+                  [(if (and kw (string? v)) (keyword v) v) ni]))))))
 
 (defn- pf-map [s i kw]
   (loop [i i acc {}]
@@ -106,13 +113,16 @@
                 (recur nni (assoc acc k v)))))))
 
 (defn- pf [s i kw]
-  (let [i (skip-sp s i) c (nth s i)]
-    (cond
-      (= c \[) (pf-seq s (inc i) kw)
-      (= c \{) (pf-map s (inc i) kw)
-      (= c \") (pf-dq s (inc i))
-      (= c \') (pf-sq s (inc i))
-      :else (pf-plain s i kw #{\, \] \}}))))
+  (let [i (skip-sp s i)]
+    (if (>= i (count s))
+      [nil i]
+      (let [c (nth s i)]
+        (cond
+          (= c \[) (pf-seq s (inc i) kw)
+          (= c \{) (pf-map s (inc i) kw)
+          (= c \") (pf-dq s (inc i))
+          (= c \') (pf-sq s (inc i))
+          :else (pf-plain s i kw #{\, \] \}}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Line model: strip comments, record indent. Raw lines kept for block scalars.
@@ -131,13 +141,34 @@
 
 (defn- indent-of [line] (count (take-while #(= % \space) line)))
 
+(defn- doc-marker? [t] (or (= t "---") (= t "...")))
+
+(defn- first-doc
+  "A YAML stream may hold several documents separated by `---`/`...`.
+   parse-string returns the first; this slices the source to that document."
+  [s]
+  (let [lines (str/split-lines s)
+        ;; drop a leading `---`/`...` (and any leading blanks before it)
+        lines (drop-while (fn [l] (let [t (str/trim l)] (or (str/blank? t) (doc-marker? t)))) lines)
+        ;; keep up to (not including) the next document marker
+        doc (take-while (fn [l] (not (doc-marker? (str/trim l)))) lines)]
+    (str/join "\n" doc)))
+
 (defn- to-lines [s]
-  ;; vector of [indent text rawline]; blank/comment/`---`/`...` lines dropped
+  ;; vector of [indent text raw blank?]. Blank/comment-only/`%`-directive lines
+  ;; are KEPT (blank? = true) so block scalars can preserve interior blanks; the
+  ;; block parsers skip them via `sig`.
   (->> (str/split-lines s)
-       (map (fn [raw] (let [t (str/trimr (strip-comment raw))]
-                        [(indent-of raw) (str/trim t) raw])))
-       (remove (fn [[_ t _]] (or (str/blank? t) (= t "---") (= t "...") (str/starts-with? t "%"))))
+       (map (fn [raw]
+              (let [t (str/trim (str/trimr (strip-comment raw)))]
+                [(indent-of raw) t raw (or (str/blank? t) (str/starts-with? t "%"))])))
        vec))
+
+(defn- sig
+  "Index of the next significant (non-blank) line at or after i, or (count lines)."
+  [lines i]
+  (loop [i i]
+    (if (and (< i (count lines)) (nth (nth lines i) 3)) (recur (inc i)) i)))
 
 ;; ---------------------------------------------------------------------------
 ;; Block parser
@@ -198,11 +229,10 @@
         joined (if (= kind \|)
                  (str/join "\n" stripped)
                  (fold-lines stripped))
-        clipped (str/replace joined #"\n+$" "")
         result (case chomp
-                 \- clipped
-                 \+ (str clipped "\n")
-                 (str clipped "\n"))]
+                 \- (str/replace joined #"\n+$" "")        ; strip: no trailing newline
+                 \+ (str joined "\n")                      ; keep: preserve trailing blanks
+                 (str (str/replace joined #"\n+$" "") "\n"))] ; clip (default): exactly one
     [result nexti]))
 
 (defn- parse-value-after-key
@@ -219,7 +249,7 @@
     [(parse-scalar vstr kw) (inc i)]
     ;; empty: nested block on following lines
     :else
-    (let [ni (inc i)]
+    (let [ni (sig lines (inc i))]
       (if (and (< ni (count lines))
                (let [[ci ct] (nth lines ni)]
                  (or (> ci indent) (and (= ci indent) (dash? ct)))))
@@ -238,7 +268,7 @@
             kv (parse-scalar kstr false)
             k (if (and kw (string? kv)) (keyword kv) kv)
             [v ni] (parse-value-after-key lines i indent vstr kw)]
-        (recur ni (assoc acc k v)))
+        (recur (sig lines ni) (assoc acc k v)))
       [acc i])))
 
 (defn- parse-seq [lines i indent kw]
@@ -252,14 +282,15 @@
             content (subs after lead)
             child-indent (+ indent 1 lead)]
         (if (= content "")
-          (let [ni (inc i)]
+          (let [ni (sig lines (inc i))]
             (if (and (< ni (count lines)) (> (first (nth lines ni)) indent))
-              (let [[v nni] (parse-block lines ni kw)] (recur nni (conj acc v)))
+              (let [[v nni] (parse-block lines ni kw)] (recur (sig lines nni) (conj acc v)))
               (recur ni (conj acc nil))))
           ;; compact "- content": re-anchor this line at child-indent and parse a block
-          (let [lines2 (assoc lines i [child-indent content (nth (nth lines i) 2)])
+          (let [e (nth lines i)
+                lines2 (assoc lines i [child-indent content (nth e 2) (nth e 3)])
                 [v ni] (parse-block lines2 i kw)]
-            (recur ni (conj acc v)))))
+            (recur (sig lines ni) (conj acc v)))))
       [acc i])))
 
 (defn- parse-block [lines i kw]
@@ -279,8 +310,9 @@
   [s & opts]
   (let [opts (apply hash-map opts)
         kw (get opts :keywords true)
-        lines (to-lines s)]
-    (if (empty? lines) nil (first (parse-block lines 0 kw)))))
+        lines (to-lines (first-doc s))
+        start (sig lines 0)]
+    (if (>= start (count lines)) nil (first (parse-block lines start kw)))))
 
 (def parse-stream parse-string)
 

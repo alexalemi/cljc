@@ -8,7 +8,7 @@
   (cond
     (nil? c) v
     (fn? c)  (c v)
-    (vector? c) v
+    (vector? c) (coerce1 (first c) v)   ; [:int] — coerce one element by its type
     :else (case c
             (:long :int)     (if (string? v) (parse-long v) v)
             :double          (if (string? v) (parse-double v) v)
@@ -20,6 +20,21 @@
 
 (defn- coerce-val [coerce k v] (coerce1 (get coerce k) v))
 
+(defn- value-token?
+  "Whether the next token is an option value rather than a flag — true unless it
+   looks like a flag (`-x`/`--x`), with negative numbers (`-5`, `-5.5`) allowed."
+  [s]
+  (and (string? s)
+       (or (not (str/starts-with? s "-"))
+           (boolean (re-matches #"-\d+(\.\d+)?" s)))))
+
+(defn- put
+  "assoc the value, accumulating into a vector when the coerce spec is `[type]`."
+  [m coerce k v]
+  (if (vector? (get coerce k))
+    (update m k (fnil conj []) (coerce-val coerce k v))
+    (assoc m k (coerce-val coerce k v))))
+
 (defn- parse* [args {:keys [coerce alias exec-args]}]
   (loop [args (seq args) m (or exec-args {}) extra []]
     (if (empty? args)
@@ -30,17 +45,17 @@
 
           (and (string? a) (str/starts-with? a "--") (str/includes? a "="))
           (let [[k v] (str/split (subs a 2) #"=" 2) kk (keyword k)]
-            (recur (next args) (assoc m kk (coerce-val coerce kk v)) extra))
+            (recur (next args) (put m coerce kk v) extra))
 
           (and (string? a) (str/starts-with? a "--"))
           (let [kk (keyword (subs a 2)) nx (second args)]
-            (if (and (string? nx) (not (str/starts-with? nx "-")))
-              (recur (nnext args) (assoc m kk (coerce-val coerce kk nx)) extra)
+            (if (value-token? nx)
+              (recur (nnext args) (put m coerce kk nx) extra)
               (recur (next args) (assoc m kk true) extra)))
 
           (or (keyword? a) (and (string? a) (str/starts-with? a ":")))
           (let [kk (if (keyword? a) a (keyword (subs a 1))) nx (second args)]
-            (recur (nnext args) (assoc m kk (coerce-val coerce kk nx)) extra))
+            (recur (nnext args) (put m coerce kk nx) extra))
 
           (and (string? a) (str/starts-with? a "-") (> (count a) 1))
           (let [kk (let [s (keyword (subs a 1))] (get alias s s))]

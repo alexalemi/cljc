@@ -15,38 +15,74 @@
 
 (defn- text-node [t] {:type :text :text t})
 
-(defn parse-inline [s]
-  (loop [s s, acc []]
+(defn- ws? [c] (or (nil? c) (= c \space) (= c \tab) (= c \newline)))
+(defn- alnum? [c] (boolean (and c (re-find #"[A-Za-z0-9]" (str c)))))
+
+(defn- emph-ok?
+  "CommonMark flanking (simplified): a `*`/`_` run opens/closes emphasis only
+   when content is non-empty and not space-flanked; `_` additionally may not be
+   intraword (no alphanumeric on either outer side). Kills spurious emphasis in
+   `snake_case_var` and `2 * 3 * 4`."
+  [content underscore? prev after]
+  (and (seq content)
+       (not (ws? (first content)))
+       (not (ws? (last content)))
+       (or (not underscore?)
+           (and (not (alnum? prev)) (not (alnum? after))))))
+
+(defn- char-at [s i] (when (< i (count s)) (nth s i)))
+
+(defn- coalesce
+  "Merge consecutive :text nodes (a non-marker `*`/`_` splits a run into
+   fragments; rejoin them so e.g. `snake_case_var` is one text node)."
+  [nodes]
+  (reduce (fn [acc n]
+            (let [p (peek acc)]
+              (if (and (= :text (:type n)) (map? p) (= :text (:type p)))
+                (conj (pop acc) (text-node (str (:text p) (:text n))))
+                (conj acc n))))
+          [] nodes))
+
+(defn parse-inline [s0]
+  (loop [s s0, prev nil, acc []]
     (if (or (nil? s) (= "" s))
-      acc
+      (coalesce acc)
       (cond
         ;; code span  `code`
         (and (str/starts-with? s "`") (find-close (subs s 1) "`"))
         (let [e (inc (find-close (subs s 1) "`"))]
-          (recur (subs s (inc e)) (conj acc {:type :monospace :content [(text-node (subs s 1 e))]})))
+          (recur (subs s (inc e)) \` (conj acc {:type :monospace :content [(text-node (subs s 1 e))]})))
         ;; strong  **x**  or  __x__
-        (and (str/starts-with? s "**") (find-close (subs s 2) "**"))
+        (and (str/starts-with? s "**") (find-close (subs s 2) "**")
+             (let [e (+ 2 (find-close (subs s 2) "**"))]
+               (emph-ok? (subs s 2 e) false prev (char-at s (+ e 2)))))
         (let [e (+ 2 (find-close (subs s 2) "**"))]
-          (recur (subs s (+ e 2)) (conj acc {:type :strong :content (parse-inline (subs s 2 e))})))
-        (and (str/starts-with? s "__") (find-close (subs s 2) "__"))
+          (recur (subs s (+ e 2)) \* (conj acc {:type :strong :content (parse-inline (subs s 2 e))})))
+        (and (str/starts-with? s "__") (find-close (subs s 2) "__")
+             (let [e (+ 2 (find-close (subs s 2) "__"))]
+               (emph-ok? (subs s 2 e) true prev (char-at s (+ e 2)))))
         (let [e (+ 2 (find-close (subs s 2) "__"))]
-          (recur (subs s (+ e 2)) (conj acc {:type :strong :content (parse-inline (subs s 2 e))})))
+          (recur (subs s (+ e 2)) \_ (conj acc {:type :strong :content (parse-inline (subs s 2 e))})))
         ;; emphasis  *x*  or  _x_
-        (and (str/starts-with? s "*") (find-close (subs s 1) "*"))
+        (and (str/starts-with? s "*") (find-close (subs s 1) "*")
+             (let [e (inc (find-close (subs s 1) "*"))]
+               (emph-ok? (subs s 1 e) false prev (char-at s (inc e)))))
         (let [e (inc (find-close (subs s 1) "*"))]
-          (recur (subs s (inc e)) (conj acc {:type :em :content (parse-inline (subs s 1 e))})))
-        (and (str/starts-with? s "_") (find-close (subs s 1) "_"))
+          (recur (subs s (inc e)) \* (conj acc {:type :em :content (parse-inline (subs s 1 e))})))
+        (and (str/starts-with? s "_") (find-close (subs s 1) "_")
+             (let [e (inc (find-close (subs s 1) "_"))]
+               (emph-ok? (subs s 1 e) true prev (char-at s (inc e)))))
         (let [e (inc (find-close (subs s 1) "_"))]
-          (recur (subs s (inc e)) (conj acc {:type :em :content (parse-inline (subs s 1 e))})))
+          (recur (subs s (inc e)) \_ (conj acc {:type :em :content (parse-inline (subs s 1 e))})))
         ;; link  [text](url)
         (re-find #"^\[([^\]]*)\]\(([^)\s]*)[^)]*\)" s)
         (let [[m txt url] (re-find #"^\[([^\]]*)\]\(([^)\s]*)[^)]*\)" s)]
-          (recur (subs s (count m)) (conj acc {:type :link :attrs {:href url} :content (parse-inline txt)})))
+          (recur (subs s (count m)) \) (conj acc {:type :link :attrs {:href url} :content (parse-inline txt)})))
         ;; plain run: up to the next marker (at least one char)
         :else
         (let [idxs (keep #(let [i (find-close (subs s 1) %)] (when i (inc i))) ["`" "*" "_" "["])
               cut  (if (seq idxs) (apply min idxs) (count s))]
-          (recur (subs s cut) (conj acc (text-node (subs s 0 cut)))))))))
+          (recur (subs s cut) (char-at s (dec cut)) (conj acc (text-node (subs s 0 cut)))))))))
 
 ;; ── blocks ────────────────────────────────────────────────────────────────
 (defn- blank? [l] (str/blank? l))
@@ -61,6 +97,11 @@
 
 (defn- list-item [text] {:type :list-item :content [{:type :plain :content (parse-inline text)}]})
 
+(defn- slug
+  "GitHub-style heading id: lowercase, drop punctuation, spaces → hyphens."
+  [text]
+  (-> text str/lower-case (str/replace #"[^a-z0-9\s-]" "") str/trim (str/replace #"\s+" "-")))
+
 (defn parse-blocks [lines]
   (loop [ls (seq lines) acc []]
     (if (nil? ls)
@@ -73,6 +114,7 @@
           (let [[_ hashes text] (heading? l)]
             (recur (next ls)
                    (conj acc {:type :heading :heading-level (count hashes)
+                              :attrs {:id (slug text)}
                               :content (parse-inline text)})))
 
           (fence? l)

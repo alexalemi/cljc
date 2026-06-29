@@ -87,7 +87,7 @@ at a time, loopback only.
 (fib 32)               ; 1.24 s interpreted → 6 ms native (faster than bb/JVM)
 ```
 
-`jit.clj` (~150 lines of cljc) compiles a numeric subset — `if`, `let`,
+`jit.clj` (~180 lines of cljc) compiles a numeric subset — `if`, `let`,
 `loop`/`recur`, self-recursion, integer arithmetic/comparisons — to unboxed
 `long long` C through the same generate→`cc`→`dlopen`→rebind pipeline as the
 FFI. Compiled modules are content-cached, so warm compiles are a `dlopen`.
@@ -161,7 +161,7 @@ multi-file libraries with internal cross-references load in isolation — `defty
 | `nextjournal.markdown` | markdown → hiccup (pure-Clojure CommonMark subset) |
 | `clj-yaml.core` | YAML ↔ Clojure data (pure-Clojure subset; block/flow, `\|`/`>` scalars) |
 | `babashka.fs` `babashka.process` `babashka.cli` `bencode.core` | scripting batteries |
-| medley, edamame | |
+| medley, camel-snake-kebab, edamame | |
 
 **Runs with the library's own source on `CLJC_PATH`** (clone it, point cljc at
 `src`) — these exercise deftype, multimethods, multi-file graphs, the lot:
@@ -263,8 +263,6 @@ embeddability matter; use bb/JVM where throughput does.
   use the auto-promoting `*'`/`+'`/`-'` or `…N` literals for bignums
 - Hash maps/sets iterate in hash order, not insertion order (use sorted
   collections for ordered traversal)
-- `str/replace` is literal even with a `#"…"` pattern; regex replace is spelled
-  `re-replace` (whose `$1` group refs are the substitution syntax)
 - Quasiquote auto-gensym (`x#`) works; nested quasiquote levels do not
 - `()` is the empty list (not `nil`), but seq fns treat an exhausted seq as
   `nil`, as in Clojure

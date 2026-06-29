@@ -1843,5 +1843,51 @@
          (yaml/parse-string "text: >\n  a\n  b\n"))
 (let [data {:name "config" :count 3 :tags ["x" "y"] :nested {:a 1 :b [2 3]}}]
   (assert= data (yaml/parse-string (yaml/generate-string data))))  ; round-trip
+;; bug-pass fixes (2026-06-28)
+(assert= {:desc "First.\n\nSecond.\n"}               ; block scalar interior blanks
+         (yaml/parse-string "desc: |\n  First.\n\n  Second.\n"))
+(assert= {:a 1} (yaml/parse-string "a: 1\n---\nb: 2\n"))   ; multi-doc → first
+(assert= {:a 1 :b 2} (yaml/parse-string "a: 1\n\nb: 2"))   ; blank lines between keys
+(assert= "123456789012345678901234567890"             ; out-of-range int kept as string
+         (:n (yaml/parse-string "n: 123456789012345678901234567890")))
+
+; ── regex: capturing groups inside +/{n}/{n,m} numbered correctly (last wins) ──
+(assert= ["abc" "c"] (re-find #"(.)+" "abc"))
+(assert= ["abc" "c"] (re-find #"(.){3}" "abc"))
+(assert= ["aa" "a" nil] (re-find #"(a)+(b)?" "aa"))        ; following group not leaked
+(assert= ["12-x" "2" "x"] (re-find #"(\d)+-(\w)" "12-x"))
+
+; ── str/replace / replace-first dispatch on a regex pattern (Clojure semantics) ──
+(assert= "a-b-c" (clojure.string/replace "a.b.c" #"\." "-"))
+(assert= "hello_world" (clojure.string/replace "hello world" #"\s+" "_"))
+(assert= "01/2024-02" (clojure.string/replace "2024-01-02" #"(\d+)-(\d+)" "$2/$1"))
+(assert= "X a a" (clojure.string/replace-first "a a a" #"a" "X"))
+(assert= "a-b-c" (clojure.string/replace "a.b.c" "." "-"))  ; plain string still literal
+
+; ── parse-long overflow → nil (was clamped to Long/MAX) ──
+(assert= nil (parse-long "123456789012345678901234567890"))
+(assert= 42 (parse-long "42"))
+
+; ── friendlier / consistent error messages ──
+(defn- emsg2 [f] (try (f) "no-error" (catch Exception e (ex-message e))))
+(assert= true (clojure.string/includes? (emsg2 #(inc :a)) "got a keyword"))
+(assert= true (clojure.string/includes? (emsg2 #(bit-and :a 1)) "bit-and"))      ; not bit_and
+(assert= true (clojure.string/includes? (emsg2 #(/ 1 0)) "Divide by zero"))
+(assert= true (clojure.string/includes? (emsg2 #(nth [1 2 3] 9)) "length 3"))
+(assert= true (clojure.string/includes? (emsg2 #(deref 5)) "derefable"))
+(assert= true (clojure.string/includes? (emsg2 #(compare 1 "a")) "not comparable"))
+(assert= true (clojure.string/includes? (emsg2 #(:a :b :c :d)) "1 or 2"))         ; arity
+
+; ── markdown: CommonMark flanking (no spurious emphasis), coalesced text ──
+(require '[nextjournal.markdown :as md])
+(assert= [:div [:p "snake_case_var"]] (md/->hiccup "snake_case_var"))
+(assert= [:div [:p "2 * 3 * 4"]] (md/->hiccup "2 * 3 * 4"))
+(assert= [:div [:p "x " [:em "y"] " z"]] (md/->hiccup "x *y* z"))
+(assert= [:div [:h1 {:id "hello-world"} "Hello World"]] (md/->hiccup "# Hello World"))
+
+; ── babashka.cli: negative-number values + collection coercion ──
+(require '[babashka.cli :as cli])
+(assert= {:threshold -5} (cli/parse-opts ["--threshold" "-5"] {:coerce {:threshold :int}}))
+(assert= {:id [1 2]} (cli/parse-opts ["--id" "1" "--id" "2"] {:coerce {:id [:int]}}))
 
 (println "tests complete")

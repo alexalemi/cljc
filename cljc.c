@@ -422,6 +422,7 @@ static const char *val_type_name(Cljc *v) {
         case CLJC_FN: case CLJC_NATIVE: return "a function";
         case CLJC_ATOM:    return "an atom";
         case CLJC_VAR:     return "a var";
+        case CLJC_CORO:    return "a coroutine";
         default:           return "a value";
     }
 }
@@ -700,15 +701,6 @@ static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
     for (Binding *b = root->bindings; b; b = b->next)
         if (b->name == name) { b->value = value; return; }
     env_define(root, name, value);
-}
-
-static Cljc *env_lookup(CljcEnv *env, const char *name) {
-    for (CljcEnv *e = env; e; e = e->parent) {
-        Cljc **p = env_local_find(e, name);
-        if (p) return *p;
-    }
-    cljc_error("unable to resolve symbol: %s", name);
-    return NIL;
 }
 
 static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
@@ -1583,7 +1575,7 @@ static size_t vec_tailoff(Cljc *v) {
 }
 
 static Cljc *vec_nth(Cljc *v, size_t i) {
-    if (i >= v->as.vec.count) cljc_error("vector index out of bounds: %zu", i);
+    if (i >= v->as.vec.count) cljc_error("index %zu out of bounds for length %u", i, v->as.vec.count);
     size_t off = vec_tailoff(v);
     if (i >= off) return v->as.vec.tail[i - off];
     Cljc *node = v->as.vec.root;
@@ -1685,7 +1677,7 @@ static Cljc *vec_doassoc(int level, Cljc *node, size_t i, Cljc *x) {
 static Cljc *vec_assoc_idx(Cljc *v, size_t i, Cljc *x) {
     uint32_t cnt = v->as.vec.count;
     if (i == cnt) return vec_conj1(v, x);  /* assoc at len appends */
-    if (i > cnt) cljc_error("assoc on vector: index out of bounds");
+    if (i > cnt) cljc_error("assoc: index %zu out of bounds for length %u", i, cnt);
     size_t off = vec_tailoff(v);
     if (i >= off) {
         Cljc *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt,
@@ -1818,7 +1810,7 @@ static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *x = argv[2];
     uint32_t cnt = t->as.vec.count;
     if (i == cnt) { Cljc *cargs[2] = {t, x}; return prim_conj_bang(env, cargs, 2); }
-    if (i > cnt) cljc_error("assoc!: index out of bounds");
+    if (i > cnt) cljc_error("assoc!: index %zu out of bounds for length %u", i, cnt);
     size_t off = vec_tailoff(t);
     if (i >= off) {                              /* in-place: zero alloc */
         t->as.vec.tail[i - off] = x;
@@ -1916,7 +1908,8 @@ static Cljc *peel_meta_sym(Cljc *v) {
 }
 
 static int64_t as_int(Cljc *v, const char *what) {
-    if (v == NULL || v->tag != CLJC_INT) cljc_error("%s: expected an integer", what);
+    if (v == NULL || v->tag != CLJC_INT)
+        cljc_error("%s: expected a number, got %s", what, val_type_name(v));
     return v->as.i;
 }
 
@@ -2433,16 +2426,6 @@ static Cljc *read_form(const char **p) {
 }
 
 /* ───── Evaluator ────────────────────────────────────────────────────── */
-
-static Cljc *eval_list(CljcEnv *env, Cljc *list) {
-    /* Evaluate each element, return a fresh list. */
-    Cljc *out = NIL, **tail = &out;
-    for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
-        *tail = mk_cons(eval(env, l->as.cons.head), NIL);
-        tail = &(*tail)->as.cons.tail;
-    }
-    return out;
-}
 
 /* Evaluate each form in sequence, return the last result (nil if empty).
  * The shape of fn bodies, do, let, when, and loop. */
@@ -3670,6 +3653,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     Cljc *a1 = nargs > 1 ? argv[1] : NIL;
     /* Keywords as functions: (:key m) and (:key m default). */
     if (fn->tag == CLJC_KEYWORD) {
+        if (nargs < 1 || nargs > 2) cljc_error("keyword lookup takes 1 or 2 args, got %d", nargs);
         Cljc *out;
         if (a0 != NIL && a0->tag == CLJC_MAP && map_find(a0, fn, &out)) return out;
         return a1;
@@ -3690,15 +3674,18 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
             for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
             return apply(env, inv, iargv, nargs + 1);
         }
+        if (nargs < 1 || nargs > 2) cljc_error("map lookup takes 1 or 2 args, got %d", nargs);
         if (map_find(fn, a0, &out)) return out;
         return a1;
     }
     if (fn->tag == CLJC_SET) {
+        if (nargs < 1 || nargs > 2) cljc_error("set lookup takes 1 or 2 args, got %d", nargs);
         Cljc *out;
         if (set_contains(fn, a0, &out)) return out;
         return a1;
     }
     if (fn->tag == CLJC_SORTED) {
+        if (nargs < 1 || nargs > 2) cljc_error("collection lookup takes 1 or 2 args, got %d", nargs);
         Cljc *out;
         if (sorted_get(env, fn, a0, &out)) return out;
         return a1;
@@ -3706,11 +3693,12 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     if (fn->tag == CLJC_VECTOR || fn->tag == CLJC_TVEC) {  /* transients too */
         if (a0->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
         if (a0->as.i < 0 || (size_t)a0->as.i >= vec_len(fn))
-            cljc_error("vector index out of bounds: %lld", (long long)a0->as.i);
+            cljc_error("index %lld out of bounds for length %zu", (long long)a0->as.i, vec_len(fn));
         return vec_nth(fn, (size_t)a0->as.i);
     }
     /* Symbols as functions: ('k m) and ('k m default), like keywords. */
     if (fn->tag == CLJC_SYMBOL) {
+        if (nargs < 1 || nargs > 2) cljc_error("symbol lookup takes 1 or 2 args, got %d", nargs);
         Cljc *out;
         if (a0 != NIL && a0->tag == CLJC_MAP && map_find(a0, fn, &out)) return out;
         return a1;
@@ -5147,7 +5135,7 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
                 return mk_int(-acc);
             }
             if (op == OP_DIV) {
-                if (acc == 0) cljc_error("division by zero");
+                if (acc == 0) cljc_error("Divide by zero");
                 return acc == 1 || acc == -1 ? mk_int(acc) : mk_double(1.0 / (double)acc);
             }
             return mk_int(acc);
@@ -5155,7 +5143,7 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         for (ai_ = 1; ai_ < nargs; ai_++) {
             int64_t x = argv[ai_]->as.i;
             if (op == OP_DIV) {
-                if (x == 0) cljc_error("division by zero");
+                if (x == 0) cljc_error("Divide by zero");
                 if (acc % x != 0) { is_float = true; goto float_path; }
                 acc /= x;
                 continue;
@@ -5546,6 +5534,7 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *coll = argv[0];
     int64_t n = as_int(argv[1], "nth");
+    int64_t orig_idx = n;            /* n is consumed by the seq loops below */
     Cljc *not_found = nargs > 2
         ? argv[2] : NULL;
     /* a deftype with Indexed/nth uses it; one that is only Sequential (a matrix
@@ -5557,14 +5546,18 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
             for (Cljc *l = to_seq(out); l != NIL; l = to_seq(l->as.cons.tail))
                 if (n-- == 0) return l->as.cons.head;
             if (not_found) return not_found;
-            cljc_error("nth: index out of bounds");
+            cljc_error("nth: index %lld out of bounds", (long long)orig_idx);
         }
     }
     if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
+        if (not_found) return not_found;
+        cljc_error("nth: index %lld out of bounds for length %zu", (long long)orig_idx, vec_len(coll));
     } else if (coll && coll->tag == CLJC_STRING) {
         if (n >= 0 && (size_t)n < strlen(coll->as.str))
             return mk_char((unsigned char)coll->as.str[n]);   /* (nth "abc" 1) => \b */
+        if (not_found) return not_found;
+        cljc_error("nth: index %lld out of bounds for length %zu", (long long)orig_idx, strlen(coll->as.str));
     } else if (coll && (coll->tag == CLJC_LIST || coll->tag == CLJC_LAZY)) {
         /* advance argv[0] so a deep index into a lazy seq stays O(1) live */
         for (Cljc *l = seq1_slot(&argv[0]); l && l->tag == CLJC_LIST;
@@ -5572,7 +5565,7 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
             if (n-- == 0) return l->as.cons.head;
     }
     if (not_found) return not_found;
-    cljc_error("nth: index out of bounds");
+    cljc_error("nth: index %lld out of bounds", (long long)orig_idx);
     return NIL;
 }
 
@@ -5716,7 +5709,7 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc **argv, int nargs) {
     if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
         return mk_bool(v->as.map.count == 0);
     if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
-    cljc_error("empty?: not a collection");
+    cljc_error("empty?: %s is not a collection", val_type_name(v));
     return NIL;
 }
 
@@ -5744,7 +5737,7 @@ static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
     }
     int64_t a = as_int(argv[0], "mod");
     int64_t b = as_int(argv[1], "mod");
-    if (b == 0) cljc_error("mod: division by zero");
+    if (b == 0) cljc_error("Divide by zero");
     int64_t m = a % b;
     if (m != 0 && ((m < 0) != (b < 0))) m += b;  /* Clojure mod follows divisor's sign */
     return mk_int(m);
@@ -5809,8 +5802,10 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
             r = sorted_put(env, r, k, v);
         }
         else if (r->tag == CLJC_VECTOR) {
-            if (k->tag != CLJC_INT || k->as.i < 0)
-                cljc_error("assoc on vector: index out of bounds");
+            if (k->tag != CLJC_INT)
+                cljc_error("assoc: vector index must be an integer, got %s", val_type_name(k));
+            if (k->as.i < 0)
+                cljc_error("assoc: index %lld out of bounds for length %zu", (long long)k->as.i, vec_len(r));
             r = vec_assoc_idx(r, (size_t)k->as.i, v);  /* assoc at len appends */
         } else cljc_error("assoc: %s is not associative", val_type_name(r));
     }
@@ -5881,7 +5876,7 @@ static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Cljc *m = argv[ai_];
         if (m == NIL) continue;
-        if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("merge: not a map");
+        if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("merge: %s is not a map", val_type_name(m));
         if (r == NIL) { r = m; continue; }
         /* preserve the first map's type (a sorted map merges into a sorted map) */
         if (m->tag == CLJC_SORTED) {
@@ -5907,7 +5902,7 @@ static Cljc *prim_rem(CljcEnv *env, Cljc **argv, int nargs) {
     }
     int64_t a = as_int(argv[0], "rem");
     int64_t b = as_int(argv[1], "rem");
-    if (b == 0) cljc_error("rem: division by zero");
+    if (b == 0) cljc_error("Divide by zero");
     return mk_int(a % b);
 }
 
@@ -6379,7 +6374,9 @@ static RxChain rx_parse_cat(RxC *c) {
     RxChain out = {NULL, NULL};
     while (*c->p && *c->p != '|' && *c->p != ')') {
         const char *atom_src = c->p;
+        int groups_before = c->ngroups;          /* group # at the atom's start */
         RxChain atom = rx_parse_atom(c);
+        int groups_after = c->ngroups;           /* ... and just after it */
         char q = *c->p;
         RxChain unit = atom;
         if (q == '{' && c->p[1] >= '0' && c->p[1] <= '9') {
@@ -6405,26 +6402,26 @@ static RxChain rx_parse_cat(RxC *c) {
             RxChain seq = lo > 0 ? atom : (RxChain){NULL, NULL};
             for (int k = 1; k < lo; k++) {       /* required copies 2..n */
                 c->p = atom_src;
-                int sg = c->ngroups;
+                c->ngroups = groups_before;      /* copies REUSE the atom's group #s */
                 RxChain copy = rx_parse_atom(c);
-                c->ngroups = sg;                 /* copies share group numbers */
+                c->ngroups = groups_after;       /* (last iteration wins, like Java) */
                 if (!seq.h) seq = copy;
                 else if (copy.h) { seq.t->next = copy.h; seq.t = copy.t; }
             }
             if (hi == -2) {                      /* {n,}: append X* */
                 c->p = atom_src;
-                int sg = c->ngroups;
+                c->ngroups = groups_before;
                 RxChain copy = rx_parse_atom(c);
-                c->ngroups = sg;
+                c->ngroups = groups_after;
                 RxChain star = rx_star(c, copy, false);
                 if (!seq.h) seq = star;
                 else { seq.t->next = star.h; seq.t = star.t; }
             } else {
                 for (int k = lo; k < hi; k++) {  /* optional copies */
                     c->p = atom_src;
-                    int sg = c->ngroups;
+                    c->ngroups = groups_before;
                     RxChain copy = rx_parse_atom(c);
-                    c->ngroups = sg;
+                    c->ngroups = groups_after;
                     Rx *a = rx_node(c, RX_ALT);
                     Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
                     Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
@@ -6449,10 +6446,10 @@ static RxChain rx_parse_cat(RxC *c) {
             } else if (q == '+') {
                 /* X+ => X X*: re-parse the atom for the star's copy. */
                 const char *save = c->p;
-                int save_groups = c->ngroups;
                 c->p = atom_src;
+                c->ngroups = groups_before;  /* copy REUSES the atom's group #s */
                 RxChain atom2 = rx_parse_atom(c);
-                c->ngroups = save_groups;  /* copies share group numbers */
+                c->ngroups = groups_after;
                 c->p = save;
                 RxChain star = rx_star(c, atom2, lazy);
                 atom.t->next = star.h;
@@ -7036,6 +7033,30 @@ static Cljc *prim_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(CLJC_SHAREDIR, strlen(CLJC_SHAREDIR));
 }
 
+/* The share dir relative to THIS executable (PREFIX/bin/cljc -> PREFIX/share/cljc),
+ * so a binary installed under any PREFIX finds its batteries regardless of the
+ * compile-time CLJC_SHAREDIR. nil if the exe path can't be determined. */
+static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+#ifdef __linux__
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return NIL;
+    buf[(size_t)n] = '\0';
+    char *slash = strrchr(buf, '/');     /* drop the exe name -> .../bin */
+    if (!slash) return NIL;
+    *slash = '\0';
+    slash = strrchr(buf, '/');           /* drop "bin" -> PREFIX */
+    if (!slash) return NIL;
+    *slash = '\0';
+    char path[sizeof(buf) + 32];
+    snprintf(path, sizeof(path), "%s/share/cljc", buf);
+    return mk_str(path, strlen(path));
+#else
+    return NIL;
+#endif
+}
+
 static Cljc *prim_hash(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     return mk_int((int64_t)cljc_hash(argv[0]));
@@ -7226,6 +7247,17 @@ static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
     /* a deftype implementing deref/IDeref (e.g. SCI's Var) */
     Cljc *out;
     if (dispatch_deftype_method(env, v, "deref", NULL, 0, &out)) return out;
+    /* a scalar is clearly not derefable: surface the mistake rather than
+     * silently returning it (which becomes a cryptic error downstream). */
+    if (v != NIL) switch (v->tag) {
+        case CLJC_INT: case CLJC_BIGINT: case CLJC_DOUBLE: case CLJC_RATIO:
+        case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_SYMBOL:
+        case CLJC_BOOL:
+            cljc_error("deref: %s is not derefable (expected an atom, var, or delay)",
+                       val_type_name(v));
+            break;
+        default: break;
+    }
     return v;   /* otherwise identity: @#'fn (var -> value) derefs to itself */
 }
 
@@ -7283,7 +7315,7 @@ static int cmp_values(Cljc *a, Cljc *b) {
     bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE || a->tag == CLJC_BIGINT || a->tag == CLJC_RATIO;
     bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE || b->tag == CLJC_BIGINT || b->tag == CLJC_RATIO;
     if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
-    if (a->tag != b->tag) cljc_error("compare: incomparable types");
+    if (a->tag != b->tag) cljc_error("compare: %s and %s are not comparable", val_type_name(a), val_type_name(b));
     switch (a->tag) {
         case CLJC_STRING:  return strcmp(a->as.str, b->as.str);
         case CLJC_CHAR:    return a->as.chr - b->as.chr;
@@ -7299,7 +7331,7 @@ static int cmp_values(Cljc *a, Cljc *b) {
             }
             return sa != NIL ? 1 : sb != NIL ? -1 : 0;  /* shorter sorts first */
         }
-        default: cljc_error("compare: incomparable type");
+        default: cljc_error("compare: %s is not comparable", val_type_name(a));
     }
     return 0;
 }
@@ -7641,7 +7673,7 @@ static Cljc *prim_quot(CljcEnv *env, Cljc **argv, int nargs) {
     }
     int64_t a = as_int(argv[0], "quot");
     int64_t b = as_int(argv[1], "quot");
-    if (b == 0) cljc_error("quot: division by zero");
+    if (b == 0) cljc_error("Divide by zero");
     return mk_int(a / b);
 }
 
@@ -7660,7 +7692,8 @@ static Cljc *prim_subs(CljcEnv *env, Cljc **argv, int nargs) {
     int64_t end = nargs > 2
         ? as_int(argv[2], "subs") : (int64_t)len;
     if (start < 0 || end < start || (size_t)end > len)
-        cljc_error("subs: index out of bounds");
+        cljc_error("subs: start %lld, end %lld out of bounds for length %zu",
+                   (long long)start, (long long)end, len);
     return mk_str(s + start, (size_t)(end - start));
 }
 
@@ -8157,59 +8190,6 @@ static Cljc *prim_tcp_connect(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_int(fd);
 }
 
-/* ── with-out-str ──
- * (cljc/with-out-str* thunk) → everything the thunk printed, as a string.
- * Swaps the interpreter output stream for a memstream around the call; an
- * ErrFrame restores the stream before re-raising if the thunk throws. */
-static Cljc *prim_with_out_str(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *f = argv[0];
-    /* volatile: the memstream machinery updates buf on every write, and we
-     * read it back after a longjmp into this frame. */
-    char *volatile buf = NULL;
-    size_t blen = 0;
-#ifdef _WIN32
-    /* no open_memstream on Windows: spool to a temp file, read back on close */
-    FILE *ms = tmpfile();
-#else
-    FILE *ms = open_memstream((char **)&buf, &blen);
-#endif
-    if (!ms) cljc_error("with-out-str: out of memory");
-    FILE *saved = cljc_out;
-    cljc_out = ms;
-    ErrFrame frame;
-    frame.prev = err_top;
-    frame.vsp_save = vsp;
-    frame.esp_save = eval_sp;
-    err_top = &frame;
-    if (setjmp(frame.jb) == 0) {
-        apply(env, f, vstack + vsp, 0);
-        err_top = frame.prev;
-    } else {                       /* thunk threw: restore stream, re-raise */
-        err_top = frame.prev;
-        vsp = frame.vsp_save;
-        eval_sp = frame.esp_save;
-        cljc_out = saved;
-        fclose(ms);
-        free((char *)buf);
-        cljc_raise();
-    }
-    cljc_out = saved;
-#ifdef _WIN32
-    fflush(ms);
-    long sz = ftell(ms);
-    if (sz < 0) sz = 0;
-    rewind(ms);
-    buf = malloc((size_t)sz + 1);
-    if (buf) { blen = fread(buf, 1, (size_t)sz, ms); buf[blen] = 0; }
-    fclose(ms);
-#else
-    fclose(ms);                    /* flush: buf/blen now final */
-#endif
-    Cljc *r = mk_str(buf ? (char *)buf : "", blen);
-    free((char *)buf);
-    return r;
-}
-
 /* ── printing variants ── */
 
 static Cljc *print_args(CljcEnv *env, Cljc **argv, int nargs, bool readably, bool newline) {
@@ -8302,9 +8282,15 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
     return r;
 }
 
+static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs);
+
 static Cljc *prim_str_replace(CljcEnv *env, Cljc **argv, int nargs) {
-    /* (str/replace s match replacement) — match is a LITERAL substring.
-     * For regex replacement with $1 refs, use re-replace. */
+    /* (str/replace s match replacement). A #"..." / re-pattern match (a
+     * meta-tagged string) does regex replacement with $1..$9 group refs in the
+     * replacement; a plain string matches literally. Mirrors Clojure's dispatch
+     * and matches how str/split already treats its separator. */
+    if (argv[1] != NIL && argv[1]->tag == CLJC_STRING && argv[1]->meta)
+        return prim_re_replace(env, argv, nargs);
     (void)env;
     char *s = as_str(argv[0], "replace");
     char *m = as_str(argv[1], "replace");
@@ -8499,17 +8485,17 @@ static Cljc *prim_rand_int(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── bit operations (int64) ── */
 
-#define BIT_FOLD(NAME, OP) \
+#define BIT_FOLD(NAME, LABEL, OP) \
     static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
         (void)env; \
-        int64_t v = as_int(argv[0], #NAME); \
-        for (int bi_ = 1; bi_ < nargs; bi_++) v = v OP as_int(argv[bi_], #NAME); \
+        int64_t v = as_int(argv[0], LABEL); \
+        for (int bi_ = 1; bi_ < nargs; bi_++) v = v OP as_int(argv[bi_], LABEL); \
         return mk_int(v); \
     }
 
-BIT_FOLD(bit_and, &)
-BIT_FOLD(bit_or,  |)
-BIT_FOLD(bit_xor, ^)
+BIT_FOLD(bit_and, "bit-and", &)
+BIT_FOLD(bit_or,  "bit-or",  |)
+BIT_FOLD(bit_xor, "bit-xor", ^)
 
 static Cljc *prim_bit_not(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -8572,9 +8558,38 @@ static Cljc *prim_char(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_char((int32_t)as_int(v, "char"));
 }
 
-/* (str/replace-first s match repl) — first occurrence only, literal match. */
+/* (str/replace-first s match repl) — first occurrence only. A #"..."/re-pattern
+ * match does a single regex replacement ($1..$9 in repl); a string is literal. */
 static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
+    (void)env; (void)nargs;
+    if (argv[1] != NIL && argv[1]->tag == CLJC_STRING && argv[1]->meta) {
+        char *s = as_str(argv[0], "str/replace-first");
+        char *pat = as_str(argv[1], "str/replace-first");
+        char *repl = as_str(argv[2], "str/replace-first");
+        Rx *pool; int ngroups;
+        Rx *prog = rx_compile(pat, &pool, &ngroups);
+        rx_str_begin = s;
+        SBuf out = {0};
+        sb_grow(&out, 1); out.data[0] = '\0';
+        const char *p = s;
+        bool done = false;
+        while (*p && !done) {
+            rx_reset_caps();
+            rx_cap_s[0] = p;
+            if (rx_m(prog, p)) {
+                rx_cap_e[0] = rx_match_end;
+                rx_subst(&out, repl);
+                if (rx_match_end > p) p = rx_match_end;
+                else { sb_putc(&out, *p); p++; }   /* empty match: advance one */
+                done = true;
+            } else { sb_putc(&out, *p); p++; }
+        }
+        sb_puts(&out, p);                          /* tail after the match */
+        free(pool);
+        Cljc *res = mk_str(out.data, out.len);
+        free(out.data);
+        return res;
+    }
     char *s = as_str(argv[0], "str/replace-first");
     char *m = as_str(argv[1], "str/replace-first");
     char *r = as_str(argv[2], "str/replace-first");
@@ -8599,8 +8614,10 @@ static Cljc *prim_parse_long(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     char *s = as_str(argv[0], "parse-long");
     char *end;
+    errno = 0;
     long long v = strtoll(s, &end, 10);
     if (end == s || *end != '\0') return NIL;  /* whole string or nil */
+    if (errno == ERANGE) return NIL;           /* overflow: nil, like Clojure */
     return mk_int((int64_t)v);
 }
 
@@ -8641,7 +8658,7 @@ static Cljc *prim_peek(CljcEnv *env, Cljc **argv, int nargs) {
     if (v->tag == CLJC_LIST) return v->as.cons.head;          /* list: first */
     if (v->tag == CLJC_VECTOR)                                 /* vector: last */
         return vec_len(v) ? vec_nth(v, vec_len(v) - 1) : NIL;
-    cljc_error("peek: not a list or vector");
+    cljc_error("peek: %s is not a list or vector", val_type_name(v));
     return NIL;
 }
 
@@ -8660,7 +8677,7 @@ static Cljc *prim_pop(CljcEnv *env, Cljc **argv, int nargs) {
         for (size_t i = 0; i + 1 < cnt; i++) nv = vec_conj1(nv, vec_nth(v, i));
         return nv;
     }
-    cljc_error("pop: not a list or vector");
+    cljc_error("pop: %s is not a list or vector", val_type_name(v));
     return NIL;
 }
 
@@ -9212,7 +9229,6 @@ static const char *PRELUDE =
     "(def volatile! atom)\n"
     "(def vreset! reset!)\n"
     "(defmacro vswap! [v f & args] `(reset! ~v (~f @~v ~@args)))\n"
-    "(defmacro with-out-str [& body] `(cljc/with-out-str* (fn [] ~@body)))\n"
     /* a deftype (no longer map?) is sequential? when it derives Sequential —
        check the type tag directly, not map?. */
     "(defn sequential? [x] (boolean (or (list? x) (vector? x) (seq? x)\n"
@@ -9987,6 +10003,9 @@ static const char *PRELUDE =
     "                         [\"vendor\"]\n"
     "                         (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
     "                           (str/split p \":\"))\n"
+    /* exe-relative share dir first (works under any install PREFIX), then the
+       compile-time one as a fallback */
+    "                         (when-let [d (cljc/exe-sharedir*)] [d (str d \"/vendor\")])\n"
     "                         [(cljc/sharedir*) (str (cljc/sharedir*) \"/vendor\")]))))\n"
     "(def cljc/loaded-namespaces (atom #{}))\n"
     "(defn cljc/spec-opt [spec k]\n"
@@ -10043,11 +10062,18 @@ static const char *PRELUDE =
     "                          *load-path*)\n"
     "            hit (some (fn [p] (try (do (slurp p) p) (catch Exception e nil)))\n"
     "                      paths)]\n"
-    "        (when hit\n"
-    "          (swap! cljc/loaded-namespaces conj nsname)\n"
-    "          (let [old (cljc/in-ns* (str nsname))]\n"
-    "            (try (load-file hit)\n"
-    "                 (finally (cljc/in-ns* old)))))))\n"
+    "        (if hit\n"
+    "          (do (swap! cljc/loaded-namespaces conj nsname)\n"
+    "              (let [old (cljc/in-ns* (str nsname))]\n"
+    "                (try (load-file hit)\n"
+    "                     (finally (cljc/in-ns* old)))))\n"
+    /* no file found: warn (not throw) — clojure.core & already-interned
+       namespaces are native, so only flag genuinely-unknown names */
+    "          (when (and (not= (str nsname) \"clojure.core\")\n"
+    "                     (empty? (cljc/ns-publics* (str nsname))))\n"
+    "            (binding [*out* *err*]\n"
+    "              (println (str \"WARNING: could not locate namespace \" nsname\n"
+    "                            \" on the load path\")))))))\n"
     "    (when-let [refers (and (vector? spec) (cljc/spec-opt spec :refer))]\n"
     "      (let [cur (cljc/current-ns*)]\n"
     "        (doseq [r (if (= refers :all) (map symbol (cljc/ns-publics* (str nsname))) refers)]\n"
@@ -10300,6 +10326,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "hash",      prim_hash);
     cljc_define_native(e, "cljc/env*",      prim_getenv_raw);
     cljc_define_native(e, "cljc/sharedir*", prim_sharedir);
+    cljc_define_native(e, "cljc/exe-sharedir*", prim_exe_sharedir);
     cljc_define_native(e, "int",       prim_int);
     cljc_define_native(e, "identical?", prim_identical);
     cljc_define_native(e, "with-meta",  prim_with_meta);
@@ -10451,7 +10478,6 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "tcp/close",  prim_tcp_close);
     cljc_define_native(e, "tcp/connect", prim_tcp_connect);
     cljc_define_native(e, "tcp/send-some*", prim_tcp_send_some);
-    cljc_define_native(e, "cljc/with-out-str*", prim_with_out_str);
     cljc_define_native(e, "pr",      prim_pr);
     cljc_define_native(e, "prn",     prim_prn);
     cljc_define_native(e, "print",   prim_print);

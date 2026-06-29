@@ -6215,6 +6215,37 @@ static Cljc *prim_range(CljcEnv *env, Cljc **argv, int nargs) {
     return out;
 }
 
+/* (cljc/range-chunk* start end step n) => [strict-list-of-up-to-n next-start].
+ * end == nil means an unbounded range. Backs the lazy, chunked `range` so that
+ * streaming consumers keep only ~32 elements live (the eager builder above held
+ * the whole range, inflating GC and peak memory). */
+static Cljc *prim_range_chunk(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *sv = argv[0], *ev = argv[1], *stv = argv[2];
+    int64_t cnt = as_int(argv[3], "range");
+    bool inf = (ev == NIL);
+    bool flt = sv->tag == CLJC_DOUBLE || stv->tag == CLJC_DOUBLE ||
+               (!inf && ev->tag == CLJC_DOUBLE);
+    Cljc *out = NIL, **t = &out, *next;
+    if (flt) {
+        double i = as_num(sv), end = inf ? 0 : as_num(ev), step = as_num(stv);
+        if (step == 0) cljc_error("range: step must be nonzero");
+        for (; cnt > 0 && (inf || (step > 0 ? i < end : i > end)); cnt--, i += step) {
+            *t = mk_cons(mk_double(i), NIL); t = &(*t)->as.cons.tail;
+        }
+        next = mk_double(i);
+    } else {
+        int64_t i = as_int(sv, "range"), end = inf ? 0 : as_int(ev, "range"), step = as_int(stv, "range");
+        if (step == 0) cljc_error("range: step must be nonzero");
+        for (; cnt > 0 && (inf || (step > 0 ? i < end : i > end)); cnt--, i += step) {
+            *t = mk_cons(mk_int(i), NIL); t = &(*t)->as.cons.tail;
+        }
+        next = mk_int(i);
+    }
+    Cljc *pair[2] = {out, next};
+    return mk_vector(pair, 2);
+}
+
 static Cljc *prim_take(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     int64_t n = as_int(argv[0], "take");
@@ -10464,7 +10495,11 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "map",     prim_map);
     cljc_define_native(e, "filter",  prim_filter);
     cljc_define_native(e, "reduce",  prim_reduce);
-    cljc_define_native(e, "range",   prim_range);
+    cljc_define_native(e, "range",   prim_range);  /* eager; used during prelude
+                                                    * load before the lazy prelude
+                                                    * `range` defn shadows it */
+    cljc_define_native(e, "cljc/range-eager",  prim_range);       /* small ranges */
+    cljc_define_native(e, "cljc/range-chunk*", prim_range_chunk); /* lazy chunks */
     cljc_define_native(e, "take",    prim_take);
     cljc_define_native(e, "drop",    prim_drop);
     cljc_define_native(e, "reverse", prim_reverse);
@@ -10795,6 +10830,26 @@ CljcEnv *cljc_new_env(void) {
         "  ([f c] (cljc/chunked cljc/chunk-map* f c))\n"
         "  ([f c1 c2] (cljc/map2 f c1 c2)))\n"
         "(defn filter [pred c] (cljc/chunked cljc/chunk-filter* pred c))\n"
+        /* range: lazy + chunked (4096/chunk) so streaming consumers keep only a
+           chunk live instead of the whole range; small bounded INTEGER ranges
+           stay eager (no lazy-seq overhead in hot loops). (range) is infinite. */
+        "(defn cljc/range* [start end step]\n"
+        "  (lazy-seq\n"
+        "    (let [pair (cljc/range-chunk* start end step 4096)\n"
+        "          chunk (nth pair 0)]\n"
+        "      (when (seq chunk)\n"
+        "        (cljc/onto chunk (cljc/range* (nth pair 1) end step))))))\n"
+        "(defn cljc/range-small? [start end step]\n"
+        "  (and (integer? start) (integer? end) (integer? step) (not (zero? step))\n"
+        "       (let [n (quot (- end start) step)] (and (> n 0) (<= n 4096)))))\n"
+        "(defn range\n"
+        "  ([] (cljc/range* 0 nil 1))\n"
+        "  ([end] (range 0 end 1))\n"
+        "  ([start end] (range start end 1))\n"
+        "  ([start end step]\n"
+        "   (if (cljc/range-small? start end step)\n"
+        "     (cljc/range-eager start end step)\n"
+        "     (cljc/range* start end step))))\n"
         "(defn interleave [c1 c2]\n"
         "  (lazy-seq (let [s1 (seq c1) s2 (seq c2)]\n"
         "              (when (and s1 s2)\n"

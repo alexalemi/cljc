@@ -1930,4 +1930,17 @@
 (assert= [1 2] (swap-vals! (atom 1) inc))
 (assert= [1 9] (reset-vals! (atom 1) 9))
 
+; ── lazy + chunked range (perf pass) ──
+(assert= '(0 1 2 3 4) (take 5 (range)))                 ; (range) is infinite
+(assert= '(1000000 1000001 1000002) (take 3 (drop 1000000 (range)))) ; deep lazy
+(assert= '() (range 5 5))                               ; empty range → ()
+(assert= '(0 1 2) (range 3))                            ; small bounded (eager path)
+(assert= 5000 (count (range 5000)))                     ; crosses chunk boundary
+(assert= 4999 (last (range 5000)))
+(assert= 50 (nth (range 100) 50))
+(assert= 8390656 (apply + (range 4097)))                ; crosses eager threshold
+                                                        ; (reduce is core.async's here)
+(assert= [1 2 3 4 5] (into [] (map inc (range 5))))
+(assert= 10 (count (filter even? (range 20))))          ; lazy range through filter
+
 (println "tests complete")

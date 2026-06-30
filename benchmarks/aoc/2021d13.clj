@@ -1,0 +1,5 @@
+(def pts #{[6 10] [0 14] [9 10] [0 3] [10 4] [4 11] [6 0] [6 12] [4 1] [0 13] [10 12] [3 4] [3 0] [8 4] [1 10] [2 14] [8 10] [9 0]})
+(defn fold-y [pts line] (set (map (fn [[x y]] [x (if (> y line) (- (* 2 line) y) y)]) pts)))
+(println "after-fold" (count (fold-y pts 7)))
+(assert (= 17 (count (fold-y pts 7))))
+(println "2021d13 OK")

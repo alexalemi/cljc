@@ -1,0 +1,6 @@
+(def raw "COM)B\nB)C\nC)D\nD)E\nE)F\nB)G\nG)H\nD)I\nE)J\nJ)K\nK)L")
+(def parent (into {} (map (fn [l] (let [[a b] (clojure.string/split l #"\)")] [b a])) (clojure.string/split-lines raw))))
+(defn chain [x] (take-while some? (iterate parent x)))
+(println "orbits" (apply + (map (fn [x] (dec (count (chain x)))) (keys parent))))
+(assert (= 42 (apply + (map (fn [x] (dec (count (chain x)))) (keys parent)))))
+(println "2019d06 OK")

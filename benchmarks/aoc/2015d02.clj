@@ -1,0 +1,5 @@
+(def boxes (map (fn [l] (mapv parse-long (clojure.string/split l #"x"))) (clojure.string/split-lines "2x3x4\n1x1x10")))
+(defn paper [[l w h]] (+ (* 2 (+ (* l w) (* w h) (* h l))) (apply min [(* l w) (* w h) (* h l)])))
+(println "paper" (apply + (map paper boxes)))
+(assert (= 101 (apply + (map paper boxes))))
+(println "2015d02 OK")

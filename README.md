@@ -3,7 +3,7 @@
 A small Clojure in a single C file. Inspired by [Janet](https://janet-lang.org/)'s
 embeddability, aimed at [babashka](https://babashka.org/)-flavored scripting and
 beyond: persistent collections, macros, destructuring, protocols, ratios,
-namespaces, coroutines, regex — in ~12,000 lines of C99 with no dependencies.
+namespaces, coroutines, regex — in ~12,500 lines of C99 with no dependencies.
 
 ```clojure
 (defn top-words [text n]
@@ -112,7 +112,7 @@ shelf builds on it: `libc.clj` (the libc surface — `getpid`, `cwd`, `env`…),
 ## Standalone binaries
 
 ```sh
-./cljc bundle.clj myscript.clj mybinary       # one ~180 KB executable, no deps
+./cljc bundle.clj myscript.clj mybinary       # one ~300 KB executable, no deps
 ./cljc bundle.clj --static myscript.clj out   # static: no glibc dep, best to share
 ./cljc bundle.clj --windows myscript.clj out.exe   # cross-compile a Windows .exe
 ```
@@ -252,7 +252,7 @@ AOT-compiled native code — SCI only interprets your glue, while cljc interpret
 *everything*. That cljc stays within ~1.5–4× of bb (and beats it on sort and
 startup) is the trade we wanted. JVM Clojure pays ~440 ms of startup, which
 dominates at script scale; for long-running compute the JIT inverts everything.
-Use cljc where its 2 ms startup, ~300 KB binary, zero dependencies, and
+Use cljc where its 2 ms startup, ~325 KB binary, zero dependencies, and
 embeddability matter; use bb/JVM where throughput does.
 
 ## Deliberate divergences from Clojure

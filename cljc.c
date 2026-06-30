@@ -6356,6 +6356,31 @@ static Cljc *prim_range_chunk(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_vector(pair, 2);
 }
 
+/* (cljc/repeat-chunk* x n) => a strict list of n copies of x. Backs the lazy,
+ * chunked repeat so (vec (repeat n x)) doesn't pay per-element lazy overhead. */
+static Cljc *prim_repeat_chunk(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *x = argv[0];
+    int64_t n = as_int(argv[1], "repeat");
+    Cljc *out = NIL, **t = &out;
+    for (; n > 0; n--) { *t = mk_cons(x, NIL); t = &(*t)->as.cons.tail; }
+    return out;
+}
+
+/* (cljc/repeatedly-chunk* f n) => a strict list of n calls to (f) — skips the
+ * map+wrapper layer of the old (map (fn [_] (f)) (range n)). */
+static Cljc *prim_repeatedly_chunk(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    Cljc *f = argv[0];
+    int64_t n = as_int(argv[1], "repeatedly");
+    Cljc *out = NIL, **t = &out;
+    for (; n > 0; n--) {
+        Cljc *v = apply(env, f, NULL, 0);
+        *t = mk_cons(v, NIL); t = &(*t)->as.cons.tail;
+    }
+    return out;
+}
+
 static Cljc *prim_take(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     int64_t n = as_int(argv[0], "take");
@@ -10553,8 +10578,12 @@ static const char *PRELUDE =
     "(defmacro as-> [expr name & forms]\n"
     "  `(let [~name ~expr ~@(mapcat (fn [f] (list name f)) forms)] ~name))\n"
     "(defn not-empty [coll] (if (empty? coll) nil coll))\n"
-    "(defn doall [x] x)\n"
-    "(defn dorun [x] nil)\n"
+    /* fully realize a lazy seq (for side effects): walk the spine, forcing
+       each element. doall returns the (now realized) seq; dorun returns nil. */
+    "(defn dorun [coll] (loop [s (seq coll)] (when s (recur (next s)))))\n"
+    "(defn doall\n"
+    "  ([coll] (dorun coll) coll)\n"
+    "  ([n coll] (loop [k n s (seq coll)] (when (and s (pos? k)) (recur (dec k) (next s)))) coll))\n"
     "(defn flatten [coll]\n"  /* sequential?: lazy sub-seqs flatten too */
     "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
@@ -10658,6 +10687,8 @@ CljcEnv *cljc_new_env(void) {
                                                     * `range` defn shadows it */
     cljc_define_native(e, "cljc/range-eager",  prim_range);       /* small ranges */
     cljc_define_native(e, "cljc/range-chunk*", prim_range_chunk); /* lazy chunks */
+    cljc_define_native(e, "cljc/repeat-chunk*", prim_repeat_chunk);
+    cljc_define_native(e, "cljc/repeatedly-chunk*", prim_repeatedly_chunk);
     cljc_define_native(e, "take",    prim_take);
     cljc_define_native(e, "drop",    prim_drop);
     cljc_define_native(e, "reverse", prim_reverse);
@@ -10884,9 +10915,16 @@ CljcEnv *cljc_new_env(void) {
         "  (lazy-seq (when-let [s (seq c)]\n"
         "              (when (pred (first s))\n"
         "                (cons (first s) (take-while pred (rest s)))))))\n"
+        /* lazy + chunked (256/chunk), spliced in place via cljc/onto, so
+           (vec (repeat n x)) builds a vector without per-element lazy overhead */
+        "(defn cljc/repeat* [x n]\n"
+        "  (lazy-seq\n"
+        "    (when (or (nil? n) (pos? n))\n"
+        "      (let [k (if n (min n 256) 256)]\n"
+        "        (cljc/onto (cljc/repeat-chunk* x k) (cljc/repeat* x (when n (- n k))))))))\n"
         "(defn repeat\n"
-        "  ([x] (lazy-seq (cons x (repeat x))))\n"
-        "  ([n x] (take n (repeat x))))\n"
+        "  ([x] (cljc/repeat* x nil))\n"
+        "  ([n x] (if (pos? n) (cljc/repeat* x n) ())))\n"
         "(defn concat\n"
         "  ([] (list))\n"
         "  ([a] (lazy-seq (seq a)))\n"
@@ -10969,9 +11007,14 @@ CljcEnv *cljc_new_env(void) {
         "(defn not-every? [pred coll] (not (every? pred coll)))\n"
         "(defn edn/read-string [s] (read-string s))\n"
         "(defn pprint [x] (prn x))\n"
+        "(defn cljc/repeatedly* [f n]\n"   /* lazy + chunked, like repeat */
+        "  (lazy-seq\n"
+        "    (when (or (nil? n) (pos? n))\n"
+        "      (let [k (if n (min n 256) 256)]\n"
+        "        (cljc/onto (cljc/repeatedly-chunk* f k) (cljc/repeatedly* f (when n (- n k))))))))\n"
         "(defn repeatedly\n"
-        "  ([f] (lazy-seq (cons (f) (repeatedly f))))\n"
-        "  ([n f] (take n (repeatedly f))))\n"
+        "  ([f] (cljc/repeatedly* f nil))\n"
+        "  ([n f] (if (pos? n) (cljc/repeatedly* f n) ())))\n"
         "(defn drop [n c]\n"
         "  (lazy-seq (loop [n n s (seq c)]\n"
         "              (if (and (pos? n) s) (recur (dec n) (seq (rest s))) s))))\n"

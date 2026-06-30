@@ -1993,4 +1993,16 @@
     (prefer-method pmf ::hx ::hy)
     (assert= :x (pmf ::ha)))
 
+; ── doall/dorun force side effects (were no-op stubs); chunked repeat/repeatedly ──
+(assert= 3 (let [a (atom 0)] (doall (map (fn [_] (swap! a inc)) [1 2 3])) @a))
+(assert= 5 (let [a (atom 0)] (dorun (map (fn [_] (swap! a inc)) (range 5))) @a))
+(assert= '(2 3 4) (doall (map inc [1 2 3])))
+(assert= nil (dorun (range 3)))
+(assert= [:x :x :x] (vec (repeat 3 :x)))
+(assert= 1000 (count (vec (repeat 1000 0))))             ; (vec (repeat ...)) grid-init idiom
+(assert= '(0 0 0 0 0) (take 5 (repeat 0)))
+(assert= '(:y :y :y) (take 3 (repeat :y)))
+(assert= 7 (let [a (atom 0)] (last (repeatedly 7 #(swap! a inc)))))
+(assert= [] (vec (repeat 0 :x)))
+
 (println "tests complete")

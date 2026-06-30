@@ -1,0 +1,6 @@
+(def nums [1721 979 366 299 675 1456])
+(defn part1 [ns] (let [s (set ns)] (some (fn [x] (when (and (not= x (- 2020 x)) (s (- 2020 x))) (* x (- 2020 x)))) ns)))
+(defn part2 [ns] (first (for [a ns b ns c ns :when (= 2020 (+ a b c))] (* a b c))))
+(println "p1" (part1 nums) "p2" (part2 nums))
+(assert (= 514579 (part1 nums))) (assert (= 241861950 (part2 nums)))
+(println "2020d01 OK")

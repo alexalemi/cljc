@@ -1,0 +1,6 @@
+(def s "()())")
+(defn floor [s] (reduce (fn [a c] (if (= c \() (inc a) (dec a))) 0 s))
+(defn basement [s] (->> (reductions (fn [a c] (if (= c \() (inc a) (dec a))) 0 s) (map-indexed vector) (some (fn [[i v]] (when (neg? v) i)))))
+(println "floor" (floor s) "basement" (basement s))
+(assert (= -1 (floor s))) (assert (= 5 (basement s)))
+(println "2015d01 OK")

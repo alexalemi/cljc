@@ -1,0 +1,7 @@
+(def lines (clojure.string/split-lines "two1nine\neightwothree\nabcone2threexyz\nxtwone3four\n4nineeightseven2\nzoneight234\n7pqrstsixteen"))
+(def words {"one" 1 "two" 2 "three" 3 "four" 4 "five" 5 "six" 6 "seven" 7 "eight" 8 "nine" 9})
+(defn digits [line] (keep (fn [i] (let [c (nth line i)] (cond (Character/isDigit c) (- (int c) 48) :else (some (fn [[w v]] (when (clojure.string/starts-with? (subs line i) w) v)) words)))) (range (count line))))
+(defn calib [line] (let [d (digits line)] (+ (* 10 (first d)) (last d))))
+(println "p2" (apply + (map calib lines)))
+(assert (= 281 (apply + (map calib lines))))
+(println "2023d01 OK")

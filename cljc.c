@@ -9501,6 +9501,9 @@ static const char *PRELUDE =
     "      (cond\n"
     "        (= k :when) `(if ~v (for ~more ~body) (list))\n"
     "        (= k :let)  `(let ~v (for ~more ~body))\n"
+    /* innermost simple binding: (mapcat (fn [k] (list body)) v) == (map ..) but
+       without the per-element concat lazy-thunk churn */
+    "        (empty? more) `(map (fn [~k] ~body) ~v)\n"
     "        :else       `(mapcat (fn [~k] (for ~more ~body)) ~v)))))\n"
     /* batch 5-lite */
     "(defmacro comment [& _] nil)\n"

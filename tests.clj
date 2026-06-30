@@ -2003,6 +2003,13 @@
 (assert= '(0 0 0 0 0) (take 5 (repeat 0)))
 (assert= '(:y :y :y) (take 3 (repeat :y)))
 (assert= 7 (let [a (atom 0)] (last (repeatedly 7 #(swap! a inc)))))
+; for: innermost simple binding compiles to map (no mapcat+concat); all forms intact
+(assert= '(1 4 9) (for [x [1 2 3]] (* x x)))
+(assert= '([1 3] [1 4] [2 3] [2 4]) (for [x [1 2] y [3 4]] [x y]))
+(assert= '(0 2 4) (for [x (range 5) :when (even? x)] x))
+(assert= '(0 10 20) (for [x (range 3) :let [y (* x 10)]] y))
+(assert= '(nil nil) (for [x [1 2]] nil))   ; for keeps nil bodies (uses map, not keep)
+(assert= '(0 1 4 9 16) (take 5 (for [x (range)] (* x x))))  ; still lazy/infinite
 (assert= [] (vec (repeat 0 :x)))
 
 (println "tests complete")

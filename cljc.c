@@ -2610,7 +2610,17 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
              * symbol ?n, not the literal form (quote ?n)). */
             Cljc *key = eval(scope, spec);
             Cljc *v = NIL;
-            bool found = value != NIL && value->tag == CLJC_MAP && map_find(value, key, &v);
+            /* Clojure semantics: the lookup is (get value key) — maps by key,
+             * vectors by integer index, sorted maps through their comparator. */
+            bool found = false;
+            if (value != NIL) {
+                if (value->tag == CLJC_MAP) found = map_find(value, key, &v);
+                else if (value->tag == CLJC_VECTOR && key != NIL && key->tag == CLJC_INT &&
+                         key->as.i >= 0 && (size_t)key->as.i < vec_len(value)) {
+                    v = vec_nth(value, (size_t)key->as.i); found = true;
+                } else if (value->tag == CLJC_SORTED && value->as.sorted.is_map)
+                    found = sorted_get(scope, value, key, &v);
+            }
             if (!found && defaults && defaults->tag == CLJC_MAP && k->tag == CLJC_SYMBOL) {
                 Cljc *d;
                 if (map_find(defaults, k, &d)) v = eval(scope, d);
@@ -9475,14 +9485,21 @@ static const char *PRELUDE =
     "       ~@body\n"
     "       (recur (inc ~(nth bindings 0))))))\n"
     /* multi-binding doseq nests: (doseq [a as b bs] ...) iterates b per a */
+    /* doseq supports the same binding modifiers as for (:let/:when/:while) */
     "(defmacro doseq [bindings & body]\n"
-    "  (let [inner (if (> (count bindings) 2)\n"
-    "                (list (cons 'doseq (cons (vec (drop 2 bindings)) body)))\n"
-    "                body)]\n"
-    "    `(loop [s# (seq ~(nth bindings 1))]\n"
-    "       (when s#\n"
-    "         (let [~(nth bindings 0) (first s#)] ~@inner)\n"
-    "         (recur (next s#))))))\n"
+    "  (if (empty? bindings)\n"
+    "    `(do ~@body nil)\n"
+    "    (let [k (nth bindings 0) v (nth bindings 1) more (vec (drop 2 bindings))\n"
+    "          [v more] (if (= (first more) :while)\n"
+    "                     [`(take-while (fn [~k] ~(second more)) ~v) (vec (drop 2 more))]\n"
+    "                     [v more])]\n"
+    "      (cond\n"
+    "        (= k :when) `(if ~v (doseq ~more ~@body) nil)\n"
+    "        (= k :let)  `(let ~v (doseq ~more ~@body))\n"
+    "        :else `(loop [s# (seq ~v)]\n"
+    "                 (when s#\n"
+    "                   (let [~k (first s#)] (doseq ~more ~@body))\n"
+    "                   (recur (next s#))))))))\n"
     "(defmacro while [test & body]\n"
     "  `(loop [] (when ~test ~@body (recur))))\n"
     /* case: a (v1 v2 ...) test matches any member (Clojure semantics);

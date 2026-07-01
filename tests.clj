@@ -2025,5 +2025,11 @@
 (assert= '(0 1 2) (for [a (range 5) :while (< a 3)] a))  ; :while in for
 (assert= '([1 0] [2 0] [2 1] [3 0] [3 1] [3 2]) (for [x [1 2 3] y (range 9) :while (< y x)] [x y]))
 (assert= 7 (nth (long-array 5 7) 3))                     ; 2-arity int/long-array
+; doseq modifiers (:let/:when/:while) + get-semantics map destructuring
+(assert= "1 2\n" (with-out-str (doseq [x [[1 2]] :let [[a b] x]] (println a b))))
+(assert= "1\n3\n" (with-out-str (doseq [x [1 2 3] :when (odd? x)] (println x))))
+(assert= "0\n1\n2\n" (with-out-str (doseq [x (range 9) :while (< x 3)] (println x))))
+(assert= [5 6] (let [{c 0 d 1} [5 6]] [c d]))            ; int-key destructure on vector
+(assert= '(1) (for [x [[1 2]] :let [{a 0} x]] a))
 
 (println "tests complete")

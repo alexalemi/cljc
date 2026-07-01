@@ -2012,4 +2012,18 @@
 (assert= '(0 1 4 9 16) (take 5 (for [x (range)] (* x x))))  ; still lazy/infinite
 (assert= [] (vec (repeat 0 :x)))
 
+; ── bugs found by the AoC fleet (2026-07-01) ──
+; sort re-entrancy: a nested sort inside the comparator/keyfn clobbered the
+; global sort state → NULL-fn apply segfault (AoC 2023 d7 camel cards)
+(assert= 1000 (count (sort-by (fn [x] (vec (sort > (vals (frequencies (str "x" (mod x 13))))))) (range 1000))))
+(assert= '(7 11 3 14) (sort-by (fn [x] (vec (sort > [(mod x 3) (mod x 5)]))) [14 3 7 11]))
+(assert= true (empty? (sorted-set)))                     ; was: "not a collection" error
+(assert= false (empty? (sorted-set 1)))
+(assert= true (empty? (sorted-map)))
+(assert= 5 (first (keep-indexed (fn [i n] (when (= n 5) i)) (iterate inc 0))))  ; lazy now
+(assert= '([0 :a] [1 :b]) (map-indexed vector [:a :b]))
+(assert= '(0 1 2) (for [a (range 5) :while (< a 3)] a))  ; :while in for
+(assert= '([1 0] [2 0] [2 1] [3 0] [3 1] [3 2]) (for [x [1 2 3] y (range 9) :while (< y x)] [x y]))
+(assert= 7 (nth (long-array 5 7) 3))                     ; 2-arity int/long-array
+
 (println "tests complete")

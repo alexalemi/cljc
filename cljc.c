@@ -5894,6 +5894,7 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc **argv, int nargs) {
     if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
         return mk_bool(v->as.map.count == 0);
     if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
+    if (v->tag == CLJC_SORTED) return mk_bool(sorted_count(v) == 0);
     cljc_error("empty?: %s is not a collection", val_type_name(v));
     return NIL;
 }
@@ -7824,20 +7825,29 @@ static Cljc *prim_rsubseq(CljcEnv *env, Cljc **argv, int nargs) {
     return sorted_subseq(env, argv, nargs, true);
 }
 
-/* qsort has no context parameter; the interpreter is single-threaded. */
+/* qsort has no context parameter; the interpreter is single-threaded — but a
+ * comparator (or the key fn it calls) can itself call sort, so the globals
+ * MUST be handled re-entrantly: the adapter snapshots them at entry (a nested
+ * sort inside the first apply would otherwise clobber them before the
+ * tie-break apply — that was a NULL-fn segfault), and prim_sort saves and
+ * restores the outer sort's values around its own qsort. */
 static CljcEnv *g_sort_env;
 static Cljc *g_sort_fn;
 
 static int sort_adapter(const void *pa, const void *pb) {
     Cljc *a = *(Cljc *const *)pa, *b = *(Cljc *const *)pb;
-    if (!g_sort_fn) return cmp_values(a, b);
+    CljcEnv *env = g_sort_env;           /* snapshot: survive nested sorts */
+    Cljc *fn = g_sort_fn;
+    if (!fn) return cmp_values(a, b);
     Cljc *two[2] = {a, b};
-    Cljc *r = apply(g_sort_env, g_sort_fn, two, 2);
+    Cljc *r = apply(env, fn, two, 2);
+    g_sort_env = env; g_sort_fn = fn;    /* restore after a possible nested sort */
     if (r != NIL && r->tag == CLJC_INT) return (int)r->as.i;
     /* Boolean comparator: (f a b) true => a first; tie-break with (f b a). */
     if (is_truthy(r)) return -1;
     Cljc *two2[2] = {b, a};
-    Cljc *r2 = apply(g_sort_env, g_sort_fn, two2, 2);
+    Cljc *r2 = apply(env, fn, two2, 2);
+    g_sort_env = env; g_sort_fn = fn;
     return is_truthy(r2) ? 1 : 0;
 }
 
@@ -7853,9 +7863,11 @@ static Cljc *prim_sort(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc **arr = xmalloc(sizeof(Cljc *) * (n ? n : 1));
     size_t i = 0;
     for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail) arr[i++] = l->as.cons.head;
+    CljcEnv *saved_env = g_sort_env;     /* re-entrancy: we may BE the nested sort */
+    Cljc *saved_fn = g_sort_fn;
     g_sort_env = env; g_sort_fn = fn;
     qsort(arr, n, sizeof(Cljc *), sort_adapter);  /* elements stay rooted via coll */
-    g_sort_fn = NULL;
+    g_sort_env = saved_env; g_sort_fn = saved_fn;
     Cljc *out = n == 0 ? EMPTY : NIL;   /* (sort []) => () */
     for (size_t j = n; j > 0; j--) out = mk_cons(arr[j - 1], out);
     free(arr);
@@ -9497,7 +9509,11 @@ static const char *PRELUDE =
     "(defmacro for [bindings body]\n"
     "  (if (empty? bindings)\n"
     "    `(list ~body)\n"
-    "    (let [k (nth bindings 0) v (nth bindings 1) more (vec (drop 2 bindings))]\n"
+    "    (let [k (nth bindings 0) v (nth bindings 1) more (vec (drop 2 bindings))\n"
+    /* [x xs :while p ...] — truncate THIS binding's seq: p sees x (+ outers) */
+    "          [v more] (if (= (first more) :while)\n"
+    "                     [`(take-while (fn [~k] ~(second more)) ~v) (vec (drop 2 more))]\n"
+    "                     [v more])]\n"
     "      (cond\n"
     "        (= k :when) `(if ~v (for ~more ~body) (list))\n"
     "        (= k :let)  `(let ~v (for ~more ~body))\n"
@@ -10135,7 +10151,9 @@ static const char *PRELUDE =
     "(defn IllegalStateException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
     "(defn UnsupportedOperationException. [msg] (ex-info (str msg) {}))\n"
     /* mutable arrays, as transient vectors (assoc! mutates in place) */
-    "(defn int-array [x] (transient (vec (if (int? x) (repeat x 0) x))))\n"
+    "(defn int-array\n"
+    "  ([x] (transient (vec (if (int? x) (repeat x 0) x))))\n"
+    "  ([n v] (transient (vec (repeat n v)))))\n"
     "(def byte-array int-array)\n"
     "(def long-array int-array)\n"
     /* Object arrays default to nil (not 0 like int arrays) — DataScript relies on
@@ -10463,11 +10481,11 @@ static const char *PRELUDE =
     "(defn boolean [x] (if x true false))\n"
     "(defn true? [x] (= x true))\n"
     "(defn false? [x] (= x false))\n"
-    "(defn map-indexed [f coll]\n"
-    "  (loop [s (seq coll) i 0 acc (list)]\n"
-    "    (if s\n"
-    "      (recur (next s) (inc i) (cons (f i (first s)) acc))\n"
-    "      (reverse acc))))\n"
+    /* lazy, so (first (map-indexed f (iterate ...))) terminates */
+    "(defn cljc/map-indexed-step [f i coll]\n"
+    "  (lazy-seq (when-let [s (seq coll)]\n"
+    "              (cons (f i (first s)) (cljc/map-indexed-step f (inc i) (rest s))))))\n"
+    "(defn map-indexed [f coll] (cljc/map-indexed-step f 0 coll))\n"
     "(defn keep-indexed [f coll] (filter some? (map-indexed f coll)))\n"
     "(defn partition-all [n coll]\n"
     "  (loop [s (seq coll) acc (list)]\n"

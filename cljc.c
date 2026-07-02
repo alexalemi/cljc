@@ -365,6 +365,41 @@ static void mark_private_def(const char *qual, bool priv) {
         private_defs[n_private_defs++] = qual;
 }
 
+/* ── Documentation registry ──
+ * Docstrings keyed by the stored (interned) binding name — the same key
+ * root_find returns, so lookup follows exactly the resolution the symbol
+ * itself gets. Interactive feature: a growable linear array is plenty.
+ * Strings are copied (a docstring cell's buffer dies with the cell). */
+typedef struct { const char *name; char *doc; } DocEntry;
+static DocEntry *doc_entries;
+static int n_docs, cap_docs;
+static void *xmalloc(size_t n);
+static void doc_put(const char *name, const char *doc) {
+    size_t len = strlen(doc);
+    char *copy = xmalloc(len + 1);
+    memcpy(copy, doc, len + 1);
+    for (int i = 0; i < n_docs; i++)
+        if (doc_entries[i].name == name) {
+            free(doc_entries[i].doc);
+            doc_entries[i].doc = copy;
+            return;
+        }
+    if (n_docs == cap_docs) {
+        cap_docs = cap_docs ? cap_docs * 2 : 256;
+        DocEntry *grown = realloc(doc_entries, sizeof(DocEntry) * cap_docs);
+        if (!grown) { free(copy); return; }   /* docs are best-effort */
+        doc_entries = grown;
+    }
+    doc_entries[n_docs].name = name;
+    doc_entries[n_docs].doc = copy;
+    n_docs++;
+}
+static const char *doc_get(const char *name) {
+    for (int i = 0; i < n_docs; i++)
+        if (doc_entries[i].name == name) return doc_entries[i].doc;
+    return NULL;
+}
+
 static Cljc *cell_alloc(bool zero);
 static CljcEnv *env_alloc(void);
 static Cljc **chunk32_alloc(void);
@@ -2013,27 +2048,34 @@ static const char *sym_name(Cljc *v, const char *what) {
 }
 
 /* Peel reader metadata off a def/defmacro name: (def ^:private x ..) reads the
- * name as (with-meta x m) — possibly stacked. Only :private is retained (via
- * the priv out-param; def/defmacro record it in the private-defs table). */
-static Cljc *peel_meta_sym_priv(Cljc *v, bool *priv) {
+ * name as (with-meta x m) — possibly stacked. :private is retained (via the
+ * priv out-param; def/defmacro record it in the private-defs table), and a
+ * ^{:doc "…"} string surfaces through doc_out for the doc registry. */
+static Cljc *peel_meta_sym_doc(Cljc *v, bool *priv, Cljc **doc_out) {
     while (v != NIL && v->tag == CLJC_LIST &&
            v->as.cons.head->tag == CLJC_SYMBOL &&
            !strcmp(v->as.cons.head->as.sym, "with-meta") &&
            v->as.cons.tail != NIL) {
-        if (priv) {
+        if (priv || doc_out) {
             Cljc *mt = v->as.cons.tail->as.cons.tail;
             Cljc *mf = (mt != NIL && mt->tag == CLJC_LIST) ? mt->as.cons.head : NIL;
             if (mf != NIL && mf->tag == CLJC_MAP) {
                 Cljc *pv;
-                if (map_find(mf, mk_kw(intern("private", 7)), &pv) && is_truthy(pv))
+                if (priv && map_find(mf, mk_kw(intern("private", 7)), &pv) && is_truthy(pv))
                     *priv = true;
+                if (doc_out && map_find(mf, mk_kw(intern("doc", 3)), &pv) &&
+                    pv != NIL && pv->tag == CLJC_STRING)
+                    *doc_out = pv;
             }
         }
         v = v->as.cons.tail->as.cons.head;
     }
     return v;
 }
-static Cljc *peel_meta_sym(Cljc *v) { return peel_meta_sym_priv(v, NULL); }
+static Cljc *peel_meta_sym_priv(Cljc *v, bool *priv) {
+    return peel_meta_sym_doc(v, priv, NULL);
+}
+static Cljc *peel_meta_sym(Cljc *v) { return peel_meta_sym_doc(v, NULL, NULL); }
 
 static int64_t as_int(Cljc *v, const char *what) {
     if (v == NULL || v->tag != CLJC_INT)
@@ -2074,6 +2116,21 @@ static void sb_printf(SBuf *sb, const char *fmt, ...) {
 static int rd_line;                 /* 1-based; 0 = no tracking */
 static const char *rd_line_start;   /* for column computation */
 
+/* Reader syntax error with the source line when tracking is on —
+ * "unterminated list" with no location sent users paren-hunting. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn, format(printf, 1, 2)))
+#endif
+static void rd_error(const char *fmt, ...) {
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    if (rd_line > 0) cljc_error("%s (line %d)", msg, rd_line);
+    cljc_error("%s", msg);
+}
+
 static void skip_ws(const char **p) {
     while (**p) {
         if (**p == '\n') { if (rd_line) { rd_line++; rd_line_start = *p + 1; } (*p)++; }
@@ -2092,7 +2149,7 @@ static Cljc *read_atom(const char **p) {
     const char *start = *p;
     while (is_sym_char((unsigned char)**p)) (*p)++;
     size_t n = *p - start;
-    if (n == 0) cljc_error("unexpected character: %c", **p);
+    if (n == 0) rd_error("unexpected character: %c", **p);
 
     /* Number? Accept [+-]?(digits)(.digits)? */
     bool is_num = (isdigit((unsigned char)start[0]) ||
@@ -2165,10 +2222,10 @@ static Cljc *read_atom(const char **p) {
 
     /* Keyword? */
     if (start[0] == ':') {
-        if (n == 1) cljc_error("invalid token: :");
+        if (n == 1) rd_error("invalid token: :");
         if (start[1] == ':') {
             /* ::name -> :current-ns/name ; ::alias/name -> :full-ns/name */
-            if (n == 2) cljc_error("invalid token: ::");
+            if (n == 2) rd_error("invalid token: ::");
             const char *body = start + 2;
             size_t blen = n - 2;
             const char *slash = memchr(body, '/', blen);
@@ -2236,8 +2293,8 @@ static Cljc *read_string(const char **p) {
                     *p += k;  /* past hex digits; outer (*p)++ eats the last */
                     break;
                 }
-                case '\0': cljc_error("unterminated string");
-                default:   cljc_error("unsupported escape: \\%c", **p);
+                case '\0': rd_error("unterminated string");
+                default:   rd_error("unsupported escape: \\%c", **p);
             }
         } else {
             if (c == '\n' && rd_line) { rd_line++; rd_line_start = *p + 1; }
@@ -2245,7 +2302,7 @@ static Cljc *read_string(const char **p) {
         }
         (*p)++;
     }
-    if (**p != '"') cljc_error("unterminated string");
+    if (**p != '"') rd_error("unterminated string");
     (*p)++; /* consume closing " */
     Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
     free(sb.data);
@@ -2260,7 +2317,7 @@ static Cljc *read_list(const char **p, char close) {
     Cljc *head = NIL, **tail = &head;
     for (;;) {
         skip_ws(p);
-        if (**p == '\0') cljc_error("unterminated list");
+        if (**p == '\0') rd_error("unterminated list");
         if (**p == close) {
             (*p)++;
             if (line0 && head != NIL) {   /* location for error traces */
@@ -2358,7 +2415,7 @@ static Cljc *read_form(const char **p) {
                 return mk_char(cp);
             }
         }
-        cljc_error("unsupported char literal");
+        rd_error("unsupported char literal");
     }
     if (c == '#' && (*p)[1] == '_') {
         *p += 2;
@@ -2517,7 +2574,7 @@ static Cljc *read_form(const char **p) {
         if (**p != '{') cljc_error("namespaced map literal expects {");
         const char *ns = nl ? nsbuf : (cur_reader_ns ? cur_reader_ns : "user");
         Cljc *list = read_list(p, '}');
-        if (list_len(list) % 2 != 0) cljc_error("map literal must contain an even number of forms");
+        if (list_len(list) % 2 != 0) rd_error("map literal must contain an even number of forms");
         Cljc *m = mk_map();
         for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail->as.cons.tail) {
             Cljc *k = l->as.cons.head, *val = l->as.cons.tail->as.cons.head;
@@ -2548,7 +2605,7 @@ static Cljc *read_form(const char **p) {
         Cljc *s = mk_set();
         for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
             if (set_contains(s, l->as.cons.head, NULL))
-                cljc_error("duplicate element in set literal");
+                rd_error("duplicate element in set literal");
             s = set_conj(s, l->as.cons.head);
         }
         return s;
@@ -2556,13 +2613,13 @@ static Cljc *read_form(const char **p) {
     if (c == '{') {
         Cljc *list = read_list(p, '}');
         if (list_len(list) % 2 != 0)
-            cljc_error("map literal must contain an even number of forms");
+            rd_error("map literal must contain an even number of forms");
         /* Keys here are unevaluated FORMS — eval() builds the live map.
          * Duplicate literal keys are a reader error, as in Clojure. */
         Cljc *m = mk_map();
         for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail->as.cons.tail) {
             if (map_find(m, l->as.cons.head, NULL))
-                cljc_error("duplicate key in map literal");
+                rd_error("duplicate key in map literal");
             m = map_assoc(m, l->as.cons.head, l->as.cons.tail->as.cons.head);
         }
         return m;
@@ -4588,36 +4645,60 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                      * eval calls it on unevaluated forms and re-evals the result. */
                     need_args(rest, 2, "defmacro");
                     bool mac_private = false;
+                    Cljc *mac_doc = NIL;
                     const char *name = sym_name(
-                        peel_meta_sym_priv(rest->as.cons.head, &mac_private), "defmacro");
+                        peel_meta_sym_doc(rest->as.cons.head, &mac_private, &mac_doc),
+                        "defmacro");
                     Cljc *mbody = rest->as.cons.tail;
                     if (mbody->as.cons.head->tag == CLJC_STRING &&
-                        mbody->as.cons.tail != NIL)
-                        mbody = mbody->as.cons.tail;  /* skip docstring */
+                        mbody->as.cons.tail != NIL) {
+                        mac_doc = mbody->as.cons.head;   /* docstring → doc registry */
+                        mbody = mbody->as.cons.tail;
+                    }
                     if (mbody->as.cons.head->tag == CLJC_MAP &&
-                        mbody->as.cons.tail != NIL)
-                        mbody = mbody->as.cons.tail;  /* skip attr-map */
+                        mbody->as.cons.tail != NIL) {
+                        Cljc *dv;                        /* attr-map may carry :doc */
+                        if (mac_doc == NIL &&
+                            map_find(mbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
+                            dv != NIL && dv->tag == CLJC_STRING)
+                            mac_doc = dv;
+                        mbody = mbody->as.cons.tail;
+                    }
                     Cljc *m = make_fn(env, mbody, true);
                     {
                         const char *st = env_define_root(env_root(env), name, m);
                         if (strchr(st, '/')) mark_private_def(st, mac_private);
+                        if (mac_doc != NIL) doc_put(st, mac_doc->as.str);
                     }
                     return m;
                 }
                 if (s == SYM_DEFN) {
-                    /* (defn name [params] body...) ≡ (def name (fn [params] body...)) */
+                    /* (defn name [params] body...) ≡ (def name (fn [params] body...));
+                     * a docstring rides along in the def rewrite so the DEF
+                     * branch records it in the doc registry. */
                     need_args(rest, 2, "defn");
                     Cljc *name = rest->as.cons.head;
                     Cljc *fbody = rest->as.cons.tail;
+                    Cljc *fdoc = NIL;
                     if (fbody->as.cons.head->tag == CLJC_STRING &&
-                        fbody->as.cons.tail != NIL)
-                        fbody = fbody->as.cons.tail;  /* skip docstring */
+                        fbody->as.cons.tail != NIL) {
+                        fdoc = fbody->as.cons.head;
+                        fbody = fbody->as.cons.tail;
+                    }
                     if (fbody->as.cons.head->tag == CLJC_MAP &&
-                        fbody->as.cons.tail != NIL)
-                        fbody = fbody->as.cons.tail;  /* skip attr-map */
+                        fbody->as.cons.tail != NIL) {
+                        Cljc *dv;                     /* attr-map may carry :doc */
+                        if (fdoc == NIL &&
+                            map_find(fbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
+                            dv != NIL && dv->tag == CLJC_STRING)
+                            fdoc = dv;
+                        fbody = fbody->as.cons.tail;
+                    }
                     Cljc *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
+                    Cljc *fn_tail = mk_cons(fn_form, NIL);
                     Cljc *def_form = mk_cons(mk_sym(SYM_DEF),
-                                       mk_cons(name, mk_cons(fn_form, NIL)));
+                                       mk_cons(name, fdoc == NIL ? fn_tail
+                                                     : mk_cons(fdoc, fn_tail)));
                     return eval(env, def_form);
                 }
                 if (s == SYM_QUOTE) return rest->as.cons.head;
@@ -4639,7 +4720,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                      * Stacked metadata (^:dynamic ^:no-doc x) nests several
                      * with-meta forms, so peel all of them. */
                     bool def_private = false;
-                    namef = peel_meta_sym_priv(namef, &def_private);
+                    Cljc *def_doc = NIL;
+                    namef = peel_meta_sym_doc(namef, &def_private, &def_doc);
                     /* a #?(:cljs ..)-only def name elides to nil here — skip it */
                     if (namef == NIL) return NIL;
                     const char *name = sym_name(namef, "def");
@@ -4650,18 +4732,21 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         if (strchr(st, '/')) mark_private_def(st, def_private);
                         return NIL;
                     }
-                    /* (def name "docstring" value): skip the docstring */
+                    /* (def name "docstring" value): docstring → doc registry */
                     if (valf->as.cons.tail != NIL &&
                         valf->as.cons.tail->tag == CLJC_LIST &&
                         valf->as.cons.head != NIL &&
-                        valf->as.cons.head->tag == CLJC_STRING)
+                        valf->as.cons.head->tag == CLJC_STRING) {
+                        def_doc = valf->as.cons.head;
                         valf = valf->as.cons.tail;
+                    }
                     Cljc *val = eval(env, valf->as.cons.head);
                     /* def is always global; a redef without ^:private clears
                      * the mark (Clojure resets var meta on redef) */
                     {
                         const char *st = env_define_root(env_root(env), name, val);
                         if (strchr(st, '/')) mark_private_def(st, def_private);
+                        if (def_doc != NIL) doc_put(st, def_doc->as.str);
                     }
                     /* Attach :name metadata to a def'd function (fresh per defn, so
                      * no shared-cell hazard) the first time it's named, so
@@ -7502,6 +7587,101 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
      * a qualified name like edn/read-char* resolves to its real binding. */
     Binding *b = root_find(env_root(env), name, home_ns, false);
     return b ? b->value : NIL;
+}
+
+/* ── documentation natives (the `doc` / `apropos` substrate) ── */
+
+/* (cljc/doc-put* "name" "text") — register a docstring under a root-binding
+ * name. The docs.clj battery bulk-loads native/prelude docs through this. */
+static Cljc *prim_doc_put(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    char *name = as_str(argv[0], "cljc/doc-put*");
+    char *text = as_str(argv[1], "cljc/doc-put*");
+    doc_put(intern(name, strlen(name)), text);
+    return NIL;
+}
+
+/* (cljc/fn-source* f) — the fn's arity clauses as FORMS: (([params] body...)
+ * ...) — the stored source, so `source` can reconstruct a defn. nil for
+ * natives/non-fns (no source retained). */
+static Cljc *prim_fn_source(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *f = argv[0];
+    if (f == NIL || f->tag != CLJC_FN) return NIL;
+    return f->as.fn.arities;
+}
+
+/* (cljc/doc-info* sym) — {:name "stored" :doc text|nil :arglists (…)|nil
+ * :macro? bool :native? bool}, or nil when the symbol neither resolves nor
+ * has a doc entry. Resolution mirrors symbol lookup (root_find), so the
+ * answer matches what evaluating the symbol would find. */
+static Cljc *prim_doc_info(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    Cljc *arg = argv[0];
+    if (arg == NIL) return NIL;
+    const char *raw, *home_ns = NULL;
+    if (arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
+    else raw = as_str(arg, "cljc/doc-info*");
+    const char *name = intern(raw, strlen(raw));
+    Binding *b = root_find(env_root(env), name, home_ns, false);
+    const char *doc = doc_get(b ? b->name : name);
+    if (!b && !doc) return NIL;
+    Cljc *v = b ? b->value : NIL;
+    Cljc *arglists = NIL;   /* consed back-to-front → prints in source order */
+    if (v != NIL && v->tag == CLJC_FN) {
+        Cljc *ars[32];      /* C locals/stack arrays are conservatively scanned */
+        size_t na = 0;
+        for (Cljc *ar = v->as.fn.arities; ar != NIL && ar->tag == CLJC_LIST && na < 32;
+             ar = ar->as.cons.tail)
+            ars[na++] = ar->as.cons.head;
+        for (size_t k = na; k > 0; k--) {
+            Cljc *params = ars[k - 1]->as.cons.head;
+            size_t n = 0;
+            for (Cljc *p = params; p != NIL && p->tag == CLJC_LIST; p = p->as.cons.tail) n++;
+            /* items cells stay reachable via the fn itself during allocation */
+            Cljc **items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+            size_t i = 0;
+            for (Cljc *p = params; p != NIL && p->tag == CLJC_LIST; p = p->as.cons.tail)
+                items[i++] = p->as.cons.head;
+            Cljc *pv = mk_vector(items, n);
+            free(items);
+            arglists = mk_cons(pv, arglists);
+        }
+    }
+    const char *stored = b ? b->name : name;
+    Cljc *m = mk_map();
+    m = map_assoc(m, mk_kw(intern("name", 4)), mk_str(stored, strlen(stored)));
+    m = map_assoc(m, mk_kw(intern("doc", 3)),
+                  doc ? mk_str(doc, strlen(doc)) : NIL);
+    m = map_assoc(m, mk_kw(intern("macro?", 6)),
+                  mk_bool(v != NIL && v->tag == CLJC_FN && v->as.fn.is_macro));
+    m = map_assoc(m, mk_kw(intern("native?", 7)),
+                  mk_bool(v != NIL && v->tag == CLJC_NATIVE));
+    m = map_assoc(m, mk_kw(intern("arglists", 8)), arglists);
+    return m;
+}
+
+/* (cljc/root-names*) — every root binding's name as a vector of strings
+ * (apropos / discovery from cljc code). */
+static Cljc *prim_root_names(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)argv; (void)nargs;
+    CljcEnv *root = env_root(env);
+    size_t n = 0;
+    for (Binding *b = root->bindings; b; b = b->next) n++;
+    Cljc **items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    size_t i = 0;
+    /* the heap items array is NOT GC-scanned: root each built string on the
+     * value stack until the vector owns them */
+    size_t base = vsp;
+    for (Binding *b = root->bindings; b && i < n; b = b->next) {
+        Cljc *s = mk_str(b->name, strlen(b->name));
+        items[i++] = s;
+        vpush(s);
+    }
+    Cljc *v = mk_vector(items, i);
+    free(items);
+    vsp = base;
+    return v;
 }
 
 /* (cljc/resolve-var name) -> a Var (named reference to the binding) or nil. The
@@ -11134,6 +11314,62 @@ static const char *PRELUDE =
     "          (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"
     "  ([x msg] `(when-not ~x\n"
     "              (throw (ex-info (str \"Assert failed: \" ~msg \"\\n\" (pr-str '~x)) {})))))\n"
+    /* ── doc / apropos: interactive documentation ──
+     * Built-in/native docstrings live in the docs.clj battery (generated,
+     * shipped in the share dir), lazily loaded on first use so scripts that
+     * never call doc pay nothing. User defn/def docstrings are registered
+     * eagerly by eval, so (doc my-fn) works even without the battery. */
+    "(def cljc/docs-loaded* (atom false))\n"
+    "(defn cljc/ensure-docs! []\n"
+    "  (when-not @cljc/docs-loaded*\n"
+    "    (reset! cljc/docs-loaded* true)\n"
+    "    (try (load-file \"docs.clj\") (catch Exception e nil))))\n"
+    "(defn cljc/print-doc* [sym]\n"
+    "  (cljc/ensure-docs!)\n"
+    "  (let [i (cljc/doc-info* sym)]\n"
+    "    (if (nil? i)\n"
+    "      (println (str \"No doc or binding found for \" sym))\n"
+    "      (do (println \"-------------------------\")\n"
+    "          (println (:name i))\n"
+    "          (when (seq (:arglists i)) (println (apply str (interpose \" \" (map pr-str (:arglists i))))))\n"
+    "          (cond (:macro? i) (println \"macro\")\n"
+    "                (:native? i) (println \"built-in (native)\"))\n"
+    "          (println (if (:doc i) (str \"  \" (:doc i)) \"  (no docstring)\"))))\n"
+    "    nil))\n"
+    "(defmacro doc\n"
+    "  \"Prints documentation for the var/binding named by symbol.\"\n"
+    "  [n] (list 'cljc/print-doc* (list 'quote n)))\n"
+    "(defn cljc/print-source* [sym]\n"
+    "  (let [v (cljc/resolve-maybe (str sym))\n"
+    "        ars (and v (cljc/fn-source* v))]\n"
+    "    (if (nil? ars)\n"
+    "      (println (str \"Source not available for \" sym\n"
+    "                    (if v \" (built-in)\" \" (not found)\")))\n"
+    "      (do (println (str \"(defn \" sym))\n"
+    "          (run! (fn [a]\n"
+    "                  (println (str \"  (\" (pr-str (vec (first a)))\n"
+    "                                (apply str (map (fn [f] (str \" \" (pr-str f))) (rest a)))\n"
+    "                                \")\")))\n"
+    "                ars)\n"
+    "          (println \")\")))\n"
+    "    nil))\n"
+    "(defmacro source\n"
+    "  \"Prints the (re-read) source of a fn defined in this session/load.\"\n"
+    "  [n] (list 'cljc/print-source* (list 'quote n)))\n"
+    "(defn apropos\n"
+    "  \"All definitions whose name contains str-or-pattern, as sorted symbols.\"\n"
+    "  [str-or-pattern]\n"
+    "  (let [q (str str-or-pattern)]\n"
+    "    (sort (map symbol (filter (fn [n] (str/includes? n q)) (cljc/root-names*))))))\n"
+    "(defn find-doc\n"
+    "  \"Prints documentation for every definition whose name or docstring\\n  contains the string.\"\n"
+    "  [s]\n"
+    "  (cljc/ensure-docs!)\n"
+    "  (run! (fn [n] (cljc/print-doc* (symbol n)))\n"
+    "        (filter (fn [n] (let [i (cljc/doc-info* (symbol n))]\n"
+    "                          (or (str/includes? n s)\n"
+    "                              (and (:doc i) (str/includes? (:doc i) s)))))\n"
+    "                (sort (map str (cljc/root-names*))))))\n"
     ;
 
 CljcEnv *cljc_new_env(void) {
@@ -11196,6 +11432,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cons",    prim_cons);
     cljc_define_native(e, "conj",    prim_conj);
     cljc_define_native(e, "count",   prim_count);
+    cljc_define_native(e, "cljc/fn-source*", prim_fn_source);
     cljc_define_native(e, "int-array",  prim_int_array);
     cljc_define_native(e, "long-array", prim_int_array);
     cljc_define_native(e, "byte-array", prim_int_array);
@@ -11253,6 +11490,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/ns-aliases*", prim_ns_aliases);
     cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
     cljc_define_native(e, "cljc/resolve-var", prim_resolve_var);
+    cljc_define_native(e, "cljc/doc-put*",   prim_doc_put);
+    cljc_define_native(e, "cljc/doc-info*",  prim_doc_info);
+    cljc_define_native(e, "cljc/root-names*", prim_root_names);
     cljc_define_native(e, "cljc/set-var!", prim_set_var);
     cljc_define_native(e, "cljc/fn-arities", prim_fn_arities);
     cljc_define_native(e, "macroexpand-1", prim_macroexpand_1);
@@ -12703,7 +12943,7 @@ static void repl_record(CljcEnv *env, Cljc *result) {
 
 static int run_repl(CljcEnv *env) {
     hist_load();
-    printf("cljc %s — tab completes, ↑ history, *1 *2 *3 / (*results* n) hold results, !cmd shells out\n",
+    printf("cljc %s — tab completes, (doc x) (source x) (apropos s), ↑ history, *1 *2 *3 / (*results* n) hold results, !cmd shells out\n",
            CLJC_VERSION);
     char form[RL_MAX * 4];
     char line[RL_MAX];

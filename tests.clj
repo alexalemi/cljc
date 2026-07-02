@@ -2189,4 +2189,16 @@
 (assert= 10000                        ; closure-free loops still rebind in place
          (loop [i 0] (if (< i 10000) (recur (inc i)) i)))
 
+; ── docs / source / reader-error QoL ──
+(defn- doc-str [sym] (with-out-str (cljc/print-doc* sym)))
+(assert= true (clojure.string/includes? (doc-str 'map) "lazy sequence"))       ; core docstring
+(assert= true (clojure.string/includes? (doc-str 'str/join) "separated"))     ; flat str/ alias doc
+(defn docqol-f "My test doc." [x] (* x 2))
+(assert= true (clojure.string/includes? (doc-str 'docqol-f) "My test doc."))  ; user docstring
+(assert= true (clojure.string/includes?                                        ; source reconstructs
+               (with-out-str (cljc/print-source* 'docqol-f)) "(* x 2)"))
+(assert= true (clojure.string/includes?                                        ; reader errors carry a line
+               (ex-message (try (read-string "(def a\n  (let [x 1\n") (catch Exception e e)))
+               "(line 3)"))
+
 (println "tests complete")

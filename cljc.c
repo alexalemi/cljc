@@ -21,6 +21,9 @@
 #endif
 #ifdef _WIN32
 #define __USE_MINGW_ANSI_STDIO 1   /* C99 printf (%zu et al.) on the mingw runtime */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602        /* Windows 8+: GetCurrentThreadStackLimits */
+#endif
 #endif
 
 #include <stdarg.h>

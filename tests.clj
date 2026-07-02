@@ -6,6 +6,16 @@
     (println "PASS")
     (println "FAIL: expected" (pr-str expected) "got" (pr-str actual))))
 
+; Platform capability probes — sections that need a POSIX shell + cc (FFI,
+; JIT, subprocess e2e) or coroutines (csp, futures, core.async) self-skip
+; where those are absent (Windows; coro-less builds). Skipped sections print
+; a SKIP marker so a sweep can tell "passed" from "not attempted".
+(def cljc-test-unix? (not= :windows (cljc/os*)))
+(def cljc-test-coro? (try (coro/alive? (coro/new (fn [] nil)))
+                          (catch Exception e false)))
+(when-not cljc-test-unix? (println "SKIP: unix-only sections (FFI/JIT/shell)"))
+(when-not cljc-test-coro? (println "SKIP: coroutine sections (coro/csp/futures/core.async)"))
+
 ; arithmetic & numbers
 (assert= 6 (+ 1 2 3))
 (assert= 2432902008176640000 (reduce * (range 1 21)))
@@ -428,8 +438,10 @@
 ; (checked manually: {:a 1 :a 2} => error: duplicate key in map literal)
 
 ; ── file IO round trip ──
+(when cljc-test-unix?
 (spit "/tmp/cljc-test.txt" "hello file")
 (assert= "hello file" (slurp "/tmp/cljc-test.txt"))
+) ; end when-unix
 
 
 ; ── persistent vectors ──
@@ -779,6 +791,7 @@
 (assert= (list 1 1 2 2) (mapcat (fn [x] [x x]) [1 2]))
 
 ; ── FFI (s7 cload model: generate glue, compile, dlopen) ──
+(when cljc-test-unix?  ; FFI/sh sections need cc + dlopen + a POSIX shell
 (assert= 0 (:exit (sh "true")))
 (assert= 1 (:exit (sh "false")))
 (assert= "ping\n" (:out (sh "echo ping")))
@@ -840,6 +853,7 @@
              :structs {"TColor" [[:int "r"] [:int "g"] [:int "b"] [:int "a"]]}})
 (assert= 100 (tc_luma [90 100 110 255]))
 (assert= [42 42 42 255] (tc_gray 42))
+) ; end when-unix
 
 (load-file "json.clj")
 (assert= {"a" [1 2.5 true nil]} (json/parse "{\"a\": [1, 2.5, true, null]}"))
@@ -883,6 +897,7 @@
 (assert= "abc" (str/join "" (map (fn [c] c) (seq "abc"))))
 
 ; ── JIT: numeric functions compiled to native C ──
+(when cljc-test-unix?  ; jit/compile! shells out to cc
 (load-file "jit.clj")
 (jit/defn jit-fib [n] (if (< n 2) n (+ (jit-fib (- n 1)) (jit-fib (- n 2)))))
 (def jit-interp-answer (jit-fib 20))
@@ -903,6 +918,7 @@
 (jit/defn jit-no [s] (str s "!"))                   ; outside the subset
 (assert= :unsupported (try (jit/compile! 'jit-no) (catch Exception e :unsupported)))
 (assert= "still works!" (jit-no "still works"))     ; interpreted version intact
+) ; end when-unix
 
 ; ── library survey: upstream clojure.set via loading require ──
 (require '[clojure.set :refer [union intersection difference rename-keys map-invert project join select subset?]])
@@ -1020,6 +1036,7 @@
 (assert= {:a [1 2]} (edn/read-string "{:a [1 2]}"))
 
 ; ── fs.clj / process.clj batteries ──
+(when cljc-test-unix?  ; fs.clj is FFI-built; process tests use POSIX tools
 (load-file "fs.clj")
 (load-file "process.clj")
 (assert= true (fs/exists? "cljc.c"))
@@ -1036,6 +1053,7 @@
 (assert= "hello world's" (process/out "echo" "hello world's"))
 (assert= 0 (:exit (process/sh "true")))
 (assert= :threw (try (process/shell "false") (catch Exception e :threw)))
+) ; end when-unix
 
 ; str/index-of
 (assert= 6 (str/index-of "hello world" "world"))
@@ -1089,6 +1107,7 @@
 (assert= true (str/includes? (clerk/render-value [{:a 1} {:a 2}]) "<th>"))
 (assert= "<div class=\"raw\"><b>x</b></div>" (clerk/render-value "<b>x</b>"))
 (assert= true (str/includes? (clerk/render-value [1 2 3]) "class=\"value\""))
+(when cljc-test-unix?  ; notebook render tests write under /tmp
 ; incremental render cache: re-render evaluates only changed cells + dependents
 (def clerk-log (atom []))
 (spit "/tmp/cljc-nb.clj"
@@ -1116,6 +1135,7 @@
 (clerk/render-file "/tmp/cljc-nb.clj" false)
 (assert= 5 rres)                                      ; remove B's redef: falls back to A
 (sh "rm -f /tmp/cljc-nb.clj")
+) ; end when-unix
 
 ; defonce
 (defonce cljc-defonce-probe (atom 0))
@@ -1129,6 +1149,7 @@
 (assert= false (cljc/dir?* "/no/such/dir"))
 (assert= true (vector? (cljc/list-dir* "vendor")))
 (assert= nil (cljc/list-dir* "/no/such/dir"))
+(when cljc-test-unix?  ; clerk dir walking builds a /tmp tree via fs.clj
 (fs/create-dir "/tmp/cljc-clerk-walk")
 (fs/create-dir "/tmp/cljc-clerk-walk/sub")
 (fs/create-dir "/tmp/cljc-clerk-walk/.git")
@@ -1144,6 +1165,7 @@
                              (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")))
 (assert= nil (let [s (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")] (cljc/clerk-changed s s)))
 (sh "rm -rf /tmp/cljc-clerk-walk")
+) ; end when-unix
 
 ; transducer arities — (map f) etc. are transducers
 (assert= [1 3 5 7 9] (into [] (comp (map inc) (filter odd?)) (range 10)))
@@ -1382,6 +1404,7 @@
 (assert= "\"s\"" (judge/judge-pr "s"))
 (assert= 1 (judge/judge-line-of "abc" 2))            ; line counting (char-aware)
 (assert= 2 (judge/judge-line-of "a\nb\nc" 2))
+(when cljc-test-unix?  ; judge e2e + deps.edn walk-up run ./cljc as a subprocess
 ; end-to-end: fill, apply, recheck green; normal run is a no-op
 (spit "/tmp/cljc-judge-e2e.clj"
       "(require '[judge :refer [test trust]])\n(defn dbl [x] (* 2 x))\n(test (dbl 21))\n(test (dbl 2) 5)\n")
@@ -1408,6 +1431,7 @@
 (spit "/tmp/cljc-wu/p/lib/wu.clj" "(ns wu)\n(defn ping [] :pong)\n")
 (assert= ":pong" (:out (sh "C=\"$PWD/cljc\"; cd /tmp/cljc-wu/p/a/b && \"$C\" -e \"(require '[wu]) (print (wu/ping))\"")))
 (sh "rm -rf /tmp/cljc-wu")
+) ; end when-unix
 
 ; def docstrings, get-on-string, FIFO queue, lazy n-coll mapcat
 (def cljc-doc-probe "the docstring" 42)
@@ -1495,6 +1519,7 @@
 (assert= :threw (try (do ((fn [] (cond :x)))) (catch Exception e :threw)))  ; odd cond errors
 
 ; ── coroutines (the C primitive) + csp.clj (core.async) ──
+(when cljc-test-coro?  ; coro through futures: all need the ucontext engine
 (def cljc-coro-g (coro/new (fn [] (coro/yield 1) (coro/yield 2) :done)))
 (assert= :new (coro/status cljc-coro-g))
 (assert= 1 (coro/resume cljc-coro-g))
@@ -1672,6 +1697,7 @@
                      (recur (str b m))))))))]
   (assert= true (str/includes? resp "5:value1:5"))         ; value 5 came back
   (assert= true (str/includes? resp "4:done")))            ; status done
+) ; end when-coro
 
 ; ── AoC regressions ──
 ; get on a transient vector (was returning nil for every index) — AoC 2017 d5
@@ -1784,6 +1810,7 @@
     (assert= (range 1 n 2) (seq (reduce disj s (range 0 n 2))))))
 
 ; ── clojure.core.async (vendored, coroutine-backed) ──
+(when cljc-test-coro?
 (require '[clojure.core.async :as async])
 (assert= 3 (async/<!! (async/go (+ 1 2))))                  ; go + blocking take
 (let [c (async/chan)]                                       ; unbuffered rendezvous
@@ -1817,6 +1844,7 @@
 (assert= 24 (clojure.core/reduce * [1 2 3 4]))         ; and other core fns (frequencies etc.)
 (assert= {:a 2 :b 1} (frequencies [:a :a :b]))         ; frequencies uses reduce internally
 (assert= 10 (async/<!! (reduce + 0 (async/to-chan! [1 2 3 4]))))  ; referred reduce = async/reduce
+) ; end when-coro
 
 ; ── namespaced :keys destructuring binds the BARE local (Clojure semantics) ──
 (assert= [1 2] (let [{:keys [a/b c]} {:a/b 1 :c 2}] [b c]))

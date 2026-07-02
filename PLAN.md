@@ -856,6 +856,35 @@ required by conservative stack scanning, same as Boehm GC).
     bigness). Tier 2 (if ever wanted): isolated worker OS threads with
     per-thread heaps + copying channels, Janet ev/thread-style.
 
+47. ~~Windows + macOS portability & CI~~ ✅ done 2026-07-02 — cljc now
+    builds warning-free for Linux (gcc), Windows (mingw-w64), and macOS
+    x86_64 + arm64 (verified via zig cc cross-compile; real-runner
+    verification in CI). macOS fixes: _XOPEN_SOURCE 600 + _DARWIN_C_SOURCE
+    before all includes (Darwin's ucontext.h #errors without it; pragma
+    push/pop silences the deprecation warnings around the coro engine —
+    Darwin still ships and supports the family); st_mtim → st_mtimespec;
+    MSG_NOSIGNAL absent → cljc_no_sigpipe() marks every socket/accepted fd
+    SO_NOSIGPIPE (peer hangup = EPIPE, not SIGPIPE); _NSGetExecutablePath
+    branch in exe-sharedir (declared by hand — mach-o/dyld.h's DYLD_BOOL
+    enum collides with the TRUE/FALSE globals); libc.clj drops GNU-only
+    get_current_dir_name for a getcwd shim header (macOS lacks it).
+    Windows fixes (new code since the June port): nfds_t typedef for the
+    WSAPoll shim; __USE_MINGW_ANSI_STDIO 1 + format(__MINGW_PRINTF_FORMAT)
+    on cljc_error so %zu works AND warns correctly; stack-floor pointer
+    arithmetic moved to uintptr_t (was UB, flagged by mingw -Warray-bounds).
+    NEW: (cljc/os*) native → :linux/:macos/:windows/:unknown. tests.clj
+    grew capability probes (cljc-test-unix?, cljc-test-coro? — a RUNTIME
+    coro/new probe, so a broken-ucontext platform self-skips) gating the
+    FFI/JIT/shell/notebook//tmp sections (unix-only) and coro/csp/futures/
+    core.async sections; a coro-less Linux build passes 1199/1199 with
+    SKIP markers, full build passes all 1263. .github/workflows/ci.yml:
+    linux + linux-asan + macos-14 arm64 + x86_64-under-Rosetta + windows
+    (MSYS2 mingw64), all -Werror, suite normal + GC stress. .gitattributes
+    pins LF. Windows remains degraded by design (no coro/csp/nREPL, plain
+    REPL); macOS is expected full-featured — ucontext-on-arm64 is the one
+    watch item, and the capability probes keep the suite honest if it
+    misbehaves.
+
 ## Known divergences from Clojure (deliberate)
 - `catch` is untyped; hash maps/sets iterate in hash order; plain int64
   arithmetic wraps (see README's list — it supersedes this one)

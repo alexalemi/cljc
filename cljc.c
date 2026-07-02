@@ -12,6 +12,17 @@
  * Assumes a downward-growing stack (x86/ARM/RISC-V).
  */
 
+#ifdef __APPLE__
+/* Must precede every system include: Darwin's ucontext.h #errors without
+ * _XOPEN_SOURCE, and _DARWIN_C_SOURCE keeps the BSD surface (SO_NOSIGPIPE,
+ * realpath under strict POSIX) visible alongside it. */
+#define _XOPEN_SOURCE 600
+#define _DARWIN_C_SOURCE
+#endif
+#ifdef _WIN32
+#define __USE_MINGW_ANSI_STDIO 1   /* C99 printf (%zu et al.) on the mingw runtime */
+#endif
+
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -44,6 +55,7 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0   /* no SIGPIPE on Windows; nothing to suppress */
 #endif
+typedef unsigned long nfds_t;    /* WSAPoll's nfds parameter is a ULONG */
 #define poll       WSAPoll
 #define sock_close closesocket
 #define popen      _popen
@@ -75,7 +87,28 @@ static int cljc_wsa_init(void) {   /* idempotent winsock startup */
 #define CLJC_HAVE_CORO 1
 #define sock_close close
 #define cljc_wsa_init() 0
+#ifdef __APPLE__
+/* mach-o/dyld.h can't be included: its enum DYLD_BOOL { FALSE, TRUE } collides
+ * with cljc's boolean singleton globals. Declare the one stable function. */
+extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
+#define st_mtim st_mtimespec  /* Darwin spells the POSIX-2008 stat field its own way */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0      /* absent on macOS; cljc_no_sigpipe covers the sockets */
+#endif
+#endif
 #endif  /* _WIN32 */
+
+/* macOS lacks MSG_NOSIGNAL, so sockets are marked SO_NOSIGPIPE at creation:
+ * a peer hangup then surfaces as EPIPE instead of a process-killing signal.
+ * No-op on Linux/Windows (MSG_NOSIGNAL / no SIGPIPE respectively). */
+static void cljc_no_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)fd;
+#endif
+}
 
 #define CLJC_VERSION "0.1.0"
 #ifndef CLJC_SHAREDIR
@@ -429,7 +462,13 @@ static void cljc_raise(void) {
 static void trace_snapshot(void);
 
 #if defined(__GNUC__) || defined(__clang__)
+#ifdef __MINGW_PRINTF_FORMAT
+/* mingw: the plain `printf` archetype checks against msvcrt's formats (no %zu);
+ * this macro names the C99 one that matches __USE_MINGW_ANSI_STDIO. */
+__attribute__((noreturn, format(__MINGW_PRINTF_FORMAT, 1, 2)))
+#else
 __attribute__((noreturn, format(printf, 1, 2)))
+#endif
 #endif
 static void cljc_error(const char *fmt, ...) {
     cur_exc = NULL;  /* message-style error */
@@ -502,7 +541,10 @@ static void stack_floor_init(const char *base) {
         && rl.rlim_cur > STACK_SAFETY_MARGIN)
         budget = (size_t)rl.rlim_cur;
 #endif
-    main_stack_floor = base - budget + STACK_SAFETY_MARGIN;
+    /* Integer math, not pointer math: base - budget points far outside the
+     * anchor object, which is UB as a char* expression (and -Warray-bounds
+     * flags it under mingw's inliner). Addresses as uintptr_t are fine. */
+    main_stack_floor = (const char *)((uintptr_t)base - budget + STACK_SAFETY_MARGIN);
 }
 
 static void cljc_check_stack(void) {
@@ -7663,11 +7705,21 @@ static Cljc *prim_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
  * compile-time CLJC_SHAREDIR. nil if the exe path can't be determined. */
 static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
-#ifdef __linux__
     char buf[4096];
+#if defined(__linux__)
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) return NIL;
     buf[(size_t)n] = '\0';
+#elif defined(__APPLE__)
+    char raw[4096];
+    uint32_t sz = sizeof(raw);
+    if (_NSGetExecutablePath(raw, &sz) != 0) return NIL;
+    if (!realpath(raw, buf)) return NIL;  /* resolve symlinks, like /proc/self/exe */
+#else
+    (void)buf;
+    return NIL;
+#endif
+#if defined(__linux__) || defined(__APPLE__)
     char *slash = strrchr(buf, '/');     /* drop the exe name -> .../bin */
     if (!slash) return NIL;
     *slash = '\0';
@@ -7677,9 +7729,23 @@ static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
     char path[sizeof(buf) + 32];
     snprintf(path, sizeof(path), "%s/share/cljc", buf);
     return mk_str(path, strlen(path));
-#else
-    return NIL;
 #endif
+}
+
+/* (cljc/os*) → :linux | :macos | :windows | :unknown — lets scripts and the
+ * test suite skip sections that need a POSIX shell, cc, or coroutines. */
+static Cljc *prim_os(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+#if defined(_WIN32)
+    const char *n = "windows";
+#elif defined(__APPLE__)
+    const char *n = "macos";
+#elif defined(__linux__)
+    const char *n = "linux";
+#else
+    const char *n = "unknown";
+#endif
+    return mk_kw(intern(n, strlen(n)));
 }
 
 static Cljc *prim_hash(CljcEnv *env, Cljc **argv, int nargs) {
@@ -8726,6 +8792,7 @@ static Cljc *prim_tcp_listen(CljcEnv *env, Cljc **argv, int nargs) {
     const char *host = nargs > 1 ? as_str(argv[1], "tcp/listen") : NULL;
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) cljc_error("tcp/listen: cannot create socket");
+    cljc_no_sigpipe(srv);
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
     struct sockaddr_in addr;
@@ -8760,6 +8827,7 @@ static Cljc *prim_tcp_accept(CljcEnv *env, Cljc **argv, int nargs) {
     struct pollfd p = { .fd = srv, .events = POLLIN };
     if (poll(&p, 1, timeout) <= 0) return NIL;
     int fd = accept(srv, NULL, NULL);
+    if (fd >= 0) cljc_no_sigpipe(fd);
     return fd < 0 ? NIL : mk_int(fd);
 }
 
@@ -8829,6 +8897,7 @@ static Cljc *prim_tcp_connect(CljcEnv *env, Cljc **argv, int nargs) {
     int port = (int)as_int(argv[1], "tcp/connect");
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) cljc_error("tcp/connect: cannot create socket");
+    cljc_no_sigpipe(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -9405,6 +9474,12 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
  * the leaving coro's segment, installs the resumer's state, then swapcontexts.
  * So each direction restores exactly the context it jumps to. */
 #ifdef CLJC_HAVE_CORO
+#if defined(__APPLE__) && defined(__clang__)
+/* Darwin marks the ucontext family deprecated (since 10.6) yet still ships
+ * and supports it; it is this engine's substrate, used deliberately. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
 #define CORO_STACK_SIZE (1u << 20)   /* 1 MiB C stack per coro (eval recurses) */
 #define CORO_VSTACK_CAP (1u << 14)   /* 16K operand slots per coro (128 KiB) */
 
@@ -9541,6 +9616,9 @@ static Cljc *prim_coro_alive(CljcEnv *env, Cljc **argv, int nargs) {
     if (nargs < 1 || argv[0]->tag != CLJC_CORO) cljc_error("coro/alive?: not a coroutine");
     return argv[0]->as.coro->status == CORO_DEAD ? FALSE : TRUE;
 }
+#if defined(__APPLE__) && defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 #else  /* no coroutine support (e.g. Windows) */
 static Cljc *prim_coro_new(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs; cljc_error("coroutines unavailable on this platform");
@@ -11121,6 +11199,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "coro/alive?", prim_coro_alive);
     cljc_define_native(e, "hash",      prim_hash);
     cljc_define_native(e, "cljc/env*",      prim_getenv_raw);
+    cljc_define_native(e, "cljc/os*",       prim_os);
     cljc_define_native(e, "cljc/sharedir*", prim_sharedir);
     cljc_define_native(e, "cljc/exe-sharedir*", prim_exe_sharedir);
     cljc_define_native(e, "int",       prim_int);
@@ -12841,6 +12920,7 @@ static int nrepl_server(CljcEnv *env, int port) {
 #else
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
+    cljc_no_sigpipe(srv);
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in addr;
@@ -12856,6 +12936,7 @@ static int nrepl_server(CljcEnv *env, int port) {
     for (;;) {
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;
+        cljc_no_sigpipe(fd);
         nrepl_serve_client(fd, env);   /* one client at a time */
     }
 #endif  /* _WIN32 */

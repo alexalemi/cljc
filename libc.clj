@@ -6,8 +6,13 @@
 ;; first load compiles once and later loads just dlopen.
 
 (declare getpid getppid getenv setenv unsetenv system
-         mkdir rmdir unlink rename chdir access get_current_dir_name
+         mkdir rmdir unlink rename chdir access cljc_libc_cwd
          sleep usleep)
+
+;; getcwd wants a caller-owned buffer, and the buffer-free GNU alternative
+;; (get_current_dir_name) doesn't exist on macOS — a tiny shim owns the buffer.
+(spit "/tmp/cljc_libc_shim.h"
+      "#include <unistd.h>\nstatic inline char *cljc_libc_cwd(void){ static char b[4096]; return getcwd(b, sizeof b); }\n")
 
 (ffi/define
   [;; process & environment
@@ -24,11 +29,12 @@
    [:int rename [:string :string]]
    [:int chdir [:string]]
    [:int access [:string :int]]
-   [:string get_current_dir_name []]
+   [:string cljc_libc_cwd []]
    ;; sleep — NOTE: no `time` binding: it would shadow the core time macro
    [:int sleep [:int]]
    [:int usleep [:int]]]
-  {:headers ["unistd.h" "stdlib.h" "sys/stat.h" "stdio.h"]})
+  {:headers ["unistd.h" "stdlib.h" "sys/stat.h" "stdio.h" "cljc_libc_shim.h"]
+   :libs "-I/tmp"})
 
 ;; ── friendly wrappers ──
 
@@ -38,7 +44,7 @@
 (def X_OK 1)
 
 (defn file-exists? [path] (zero? (access path F_OK)))
-(defn cwd [] (get_current_dir_name))
+(defn cwd [] (cljc_libc_cwd))
 (defn now-epoch [] (cljc/epoch*))
 (defn mkdir-p [path] (mkdir path 493))   ; 0755
 (defn env

@@ -1,0 +1,97 @@
+# CI: build + full regression suite on every platform cljc claims to support.
+# The suite self-skips platform-dependent sections (see the capability probes
+# at the top of tests.clj), so one tests.clj runs everywhere.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (zero warnings enforced)
+        run: make CFLAGS='-O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function'
+      - name: Test (normal + GC stress)
+        run: make test
+
+  linux-asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with ASan/UBSan
+        run: cc -g -fsanitize=address,undefined -o cljc-asan cljc.c -lm -ldl
+      - name: Test under sanitizers
+        env:
+          # conservative stack scanning reads the whole stack range and never
+          # frees pool blocks — leak/UAR checkers must be off (same as Boehm)
+          ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=0
+        run: |
+          ./cljc-asan tests.clj > out.txt 2>&1
+          ! grep -E 'FAIL|error|ERROR|runtime error' out.txt
+          grep -q PASS out.txt
+
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (zero warnings enforced)
+        run: make CFLAGS='-O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function'
+      - name: Test (normal + GC stress)
+        run: make test
+
+  # Intel coverage without an Intel runner: build the x86_64 slice on the
+  # arm64 runner and run the suite under Rosetta 2.
+  macos-x86_64-rosetta:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rosetta 2 (usually preinstalled)
+        run: softwareupdate --install-rosetta --agree-to-license || true
+      - name: Build x86_64 slice
+        run: |
+          cc -arch x86_64 -O2 -Wall -Wextra -Werror \
+             -Wno-unused-parameter -Wno-unused-function \
+             -DCLJC_SHAREDIR='"/usr/local/share/cljc"' \
+             -o cljc cljc.c -lm -ldl
+          file cljc
+      - name: Test under Rosetta
+        run: |
+          ./cljc tests.clj > out.txt 2>&1
+          ! grep -E 'FAIL|error' out.txt
+          grep -q PASS out.txt
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+      - name: Build (zero warnings enforced)
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function \
+              -o cljc.exe cljc.c -lm -lws2_32
+      - name: Test (platform-dependent sections self-skip)
+        run: |
+          ./cljc.exe tests.clj > out.txt 2>&1
+          ! grep -E 'FAIL|error' out.txt
+          grep -q PASS out.txt
+          grep SKIP out.txt
+      - name: Test (GC stress)
+        run: |
+          CLJC_GC_STRESS=1 ./cljc.exe tests.clj > out2.txt 2>&1
+          ! grep -E 'FAIL|error' out2.txt
+          grep -q PASS out2.txt

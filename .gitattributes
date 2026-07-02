@@ -1,0 +1,3 @@
+# Never CRLF-convert on checkout: the suite asserts on exact strings, and
+# repo sources are LF everywhere (the reader tolerates \r, but why risk it).
+* -text

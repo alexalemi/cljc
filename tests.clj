@@ -1602,16 +1602,21 @@
                               (try @f (catch Exception e :cancelled))]))
 (assert= false (let [f (future 1)] @f (future-cancel f)))  ; too late to cancel
 (assert= [2 4 6] (pvalues (+ 1 1) (+ 2 2) (+ 3 3)))
-; fiber-aware Thread/sleep: two 200ms futures overlap instead of serializing
-; (wall-clock bound → skipped under GC stress, per file convention; 200ms
-; sleeps with a <350 bound leave ~150ms of jitter budget on loaded CI
-; runners while still cleanly separating overlap from the 400ms serial case)
+; fiber-aware Thread/sleep: two 200ms futures overlap instead of serializing.
+; SELF-CALIBRATING: fixed wall-clock bounds flake on loaded/emulated CI
+; runners (75ms and 350ms both did), so measure a single-future baseline and
+; require the dual run to stay well under the 2x a serializing scheduler
+; would take. (Skipped under GC stress, per file convention.)
 (when-not (cljc/env* "CLJC_GC_STRESS")
-  (assert= true (let [t0 (cljc/now-ms*)
+  (assert= true (let [b0 (cljc/now-ms*)
+                      _ @(future (Thread/sleep 200) :warm)
+                      base (max 1 (- (cljc/now-ms*) b0))
+                      t0 (cljc/now-ms*)
                       f1 (future (Thread/sleep 200) :one)
-                      f2 (future (Thread/sleep 200) :two)]
-                  (and (= :one @f1) (= :two @f2)
-                       (< (- (cljc/now-ms*) t0) 350)))))
+                      f2 (future (Thread/sleep 200) :two)
+                      ok (and (= :one @f1) (= :two @f2))
+                      dual (- (cljc/now-ms*) t0)]
+                  (and ok (< dual (* 1.7 base))))))
 ; one shared scheduler: csp go blocks and futures pump each other
 (assert= :from-future (let [ch (cljc-a/chan 1)]
                         (future (cljc-a/go (cljc-a/>! ch :from-future)))
@@ -1623,11 +1628,15 @@
 ; fiber (doesn't stall the loop), and @future inside a go block parks too
 (require '[clojure.core.async :as cljc-ca])
 (when-not (cljc/env* "CLJC_GC_STRESS")
-  (assert= true (let [t0 (cljc/now-ms*)
+  (assert= true (let [b0 (cljc/now-ms*)
+                      _ (cljc-ca/<!! (cljc-ca/go (Thread/sleep 200) :warm))
+                      base (max 1 (- (cljc/now-ms*) b0))
+                      t0 (cljc/now-ms*)
                       c1 (cljc-ca/go (Thread/sleep 200) :a)
-                      c2 (cljc-ca/go (Thread/sleep 200) :b)]
-                  (and (= :a (cljc-ca/<!! c1)) (= :b (cljc-ca/<!! c2))
-                       (< (- (cljc/now-ms*) t0) 350)))))
+                      c2 (cljc-ca/go (Thread/sleep 200) :b)
+                      ok (and (= :a (cljc-ca/<!! c1)) (= :b (cljc-ca/<!! c2)))
+                      dual (- (cljc/now-ms*) t0)]
+                  (and ok (< dual (* 1.7 base))))))
 (assert= 43 (let [f (future (Thread/sleep 10) 42)]
               (cljc-ca/<!! (cljc-ca/go (+ 1 @f)))))
 (assert= :threaded (cljc-ca/<!! (cljc-ca/thread (Thread/sleep 10) :threaded)))

@@ -7340,7 +7340,55 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
         if (!*src) break;
         Cljc *form = read_form(&src);
         if (!form) break;
-        last = eval(root, form);
+        /* Top-level forms get VM-compiled as zero-arg chunks (hot loops in
+         * (def x (loop ...)) shapes were tree-walked: 2017-AoC-d15's 45M
+         * iterations spent 40% in eval_inner + 16% resolve_symbol). Fallback
+         * to the tree-walker when the compiler bails. The form is rooted on
+         * the vstack across compile+run (macro splice mutates it in place). */
+        vpush(form);
+        /* (def name <compound-expr>) bails the compiler (def isn't an op);
+         * compile just the EXPR and def the quoted result via the tree-walker
+         * — (def ans (loop ...)) shapes carry the hot loops in script files. */
+        Cljc *compile_body = form;
+        Cljc *def_name = NULL;
+        if (form->tag == CLJC_LIST && form->as.cons.head->tag == CLJC_SYMBOL &&
+            form->as.cons.head->as.sym == intern("def", 3)) {
+            Cljc *t1 = form->as.cons.tail;
+            if (t1 != NIL && t1->tag == CLJC_LIST && t1->as.cons.head->tag == CLJC_SYMBOL &&
+                t1->as.cons.tail != NIL && t1->as.cons.tail->tag == CLJC_LIST &&
+                t1->as.cons.tail->as.cons.tail == NIL &&
+                t1->as.cons.tail->as.cons.head != NIL &&
+                t1->as.cons.tail->as.cons.head->tag == CLJC_LIST) {
+                def_name = t1->as.cons.head;
+                compile_body = t1->as.cons.tail->as.cons.head;
+            }
+        }
+        Cljc *chunk = vm_compile(root, NIL, mk_cons(compile_body, NIL));
+        if (!chunk && def_name) {           /* expr uncompilable: whole-form fallback */
+            def_name = NULL;
+        }
+        last = chunk ? vm_run(root, chunk) : eval(root, form);
+        /* the whole form is the chunk's tail position, so a call form
+         * compiles to a TAILCALL sentinel meant for apply's trampoline —
+         * dispatch it here (volatile keep: the sentinel owns the argv). */
+        Cljc *volatile sentinel_keep = NIL;
+        while (last && last->tag == CLJC_RECUR && last->meta) {
+            sentinel_keep = last;
+            Cljc **av = last->as.recur.spill
+                ? (Cljc **)last->as.recur.iv[0] : last->as.recur.iv;
+            last = apply(root, last->meta, av, (int)last->as.recur.n);
+            (void)sentinel_keep;
+        }
+        if (chunk && def_name) {            /* now perform the def itself */
+            vpush(last);
+            Cljc *q = mk_cons(mk_sym(intern("quote", 5)), mk_cons(last, NIL));
+            Cljc *d = mk_cons(mk_sym(intern("def", 3)),
+                              mk_cons(def_name, mk_cons(q, NIL)));
+            vpush(d);
+            last = eval(root, d);
+            vsp -= 2;
+        }
+        vsp--;
     }
     cur_reader_ns = saved_ns;
     return last;

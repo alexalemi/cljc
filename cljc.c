@@ -534,6 +534,16 @@ static void cljc_throw_value(Cljc *v) {
 static const char *main_stack_floor;       /* lowest safe SP on the main stack */
 
 static void stack_floor_init(const char *base) {
+#ifdef _WIN32
+    /* The PE default stack reserve is 2 MiB — far under the 8 MiB fallback
+     * guess, which made the guard useless (SEGV before it tripped). Windows
+     * can report the exact reserved range of this thread's stack. */
+    ULONG_PTR slo, shi;
+    GetCurrentThreadStackLimits(&slo, &shi);
+    (void)base;
+    main_stack_floor = (const char *)slo + STACK_SAFETY_MARGIN;
+    return;
+#endif
     size_t budget = 8u * 1024 * 1024;       /* assume 8 MiB if rlimit unknown */
 #ifndef _WIN32
     struct rlimit rl;
@@ -6437,14 +6447,37 @@ static Cljc *prim_cons(CljcEnv *env, Cljc **argv, int nargs) {
  * own force (chunk-map* walking the tail) still sees this cell as unrealized
  * and stops there instead of looping forever. */
 static Cljc *lazy_force(Cljc *l) {
-    if (!l->as.lazy.done) {
-        Cljc *r = apply(gc_root_envs[0], l->as.lazy.thunk, NULL, 0);
-        while (r != NIL && r != NULL && r->tag == CLJC_LAZY) r = lazy_force(r);
-        l->as.lazy.cached = r;
-        l->as.lazy.done = true;
-        l->as.lazy.thunk = NIL;
+    if (l->as.lazy.done) return l->as.lazy.cached;
+    /* ITERATIVE chain walk — one C frame total, not one per cell. A filter
+     * whose predicate rejects a long stretch yields lazy-of-lazy chains
+     * 100K+ deep ((first (filter #(= % 3000000) (iterate inc 0)))); the old
+     * per-cell recursion needed ~90 bytes of C stack per link and died on
+     * the 8 MB default stacks of macOS/Windows (Linux's raised rlimit hid it).
+     * Phase 1: run thunks down the chain, linking each cell's `cached` to
+     * the next unforced cell — gc_mark follows `cached` unconditionally, so
+     * the provisional link keeps the whole chain reachable from l across the
+     * GCs a thunk call can trigger. `done` stays false throughout (the
+     * self-reference contract in the comment above). */
+    Cljc *cur = l, *r;
+    for (;;) {
+        r = apply(gc_root_envs[0], cur->as.lazy.thunk, NULL, 0);
+        if (r == NULL || r == NIL || r->tag != CLJC_LAZY) break;
+        if (r->as.lazy.done) { r = r->as.lazy.cached; break; }
+        cur->as.lazy.cached = r;   /* provisional next-link, not a result */
+        cur = r;
     }
-    return l->as.lazy.cached;
+    /* Phase 2: back-patch every visited cell with the realized result —
+     * exactly what the recursive unwind used to do. */
+    Cljc *p = l;
+    for (;;) {
+        Cljc *next = (p == cur) ? NULL : p->as.lazy.cached;
+        p->as.lazy.cached = r;
+        p->as.lazy.done = true;
+        p->as.lazy.thunk = NIL;
+        if (!next) break;
+        p = next;
+    }
+    return r;
 }
 
 /* Single-step seq: force AT MOST the head cell. Returns NIL or a cons whose

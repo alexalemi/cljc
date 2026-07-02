@@ -84,6 +84,7 @@ jobs:
         run: |
           rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
           echo "suite rc=$rc, PASS count: $(grep -c PASS out.txt)"
+          [ $rc -ne 0 ] && tail -40 out.txt
           if grep -inE 'fail|error' out.txt; then tail -30 out.txt; exit 1; fi
           grep -q PASS out.txt
           exit $rc

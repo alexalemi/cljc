@@ -1602,14 +1602,16 @@
                               (try @f (catch Exception e :cancelled))]))
 (assert= false (let [f (future 1)] @f (future-cancel f)))  ; too late to cancel
 (assert= [2 4 6] (pvalues (+ 1 1) (+ 2 2) (+ 3 3)))
-; fiber-aware Thread/sleep: two 40ms futures overlap instead of serializing
-; (wall-clock bound → skipped under GC stress, per file convention)
+; fiber-aware Thread/sleep: two 200ms futures overlap instead of serializing
+; (wall-clock bound → skipped under GC stress, per file convention; 200ms
+; sleeps with a <350 bound leave ~150ms of jitter budget on loaded CI
+; runners while still cleanly separating overlap from the 400ms serial case)
 (when-not (cljc/env* "CLJC_GC_STRESS")
   (assert= true (let [t0 (cljc/now-ms*)
-                      f1 (future (Thread/sleep 40) :one)
-                      f2 (future (Thread/sleep 40) :two)]
+                      f1 (future (Thread/sleep 200) :one)
+                      f2 (future (Thread/sleep 200) :two)]
                   (and (= :one @f1) (= :two @f2)
-                       (< (- (cljc/now-ms*) t0) 75)))))
+                       (< (- (cljc/now-ms*) t0) 350)))))
 ; one shared scheduler: csp go blocks and futures pump each other
 (assert= :from-future (let [ch (cljc-a/chan 1)]
                         (future (cljc-a/go (cljc-a/>! ch :from-future)))
@@ -1622,10 +1624,10 @@
 (require '[clojure.core.async :as cljc-ca])
 (when-not (cljc/env* "CLJC_GC_STRESS")
   (assert= true (let [t0 (cljc/now-ms*)
-                      c1 (cljc-ca/go (Thread/sleep 40) :a)
-                      c2 (cljc-ca/go (Thread/sleep 40) :b)]
+                      c1 (cljc-ca/go (Thread/sleep 200) :a)
+                      c2 (cljc-ca/go (Thread/sleep 200) :b)]
                   (and (= :a (cljc-ca/<!! c1)) (= :b (cljc-ca/<!! c2))
-                       (< (- (cljc/now-ms*) t0) 75)))))
+                       (< (- (cljc/now-ms*) t0) 350)))))
 (assert= 43 (let [f (future (Thread/sleep 10) 42)]
               (cljc-ca/<!! (cljc-ca/go (+ 1 @f)))))
 (assert= :threaded (cljc-ca/<!! (cljc-ca/thread (Thread/sleep 10) :threaded)))

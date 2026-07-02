@@ -881,9 +881,33 @@ required by conservative stack scanning, same as Boehm GC).
     linux + linux-asan + macos-14 arm64 + x86_64-under-Rosetta + windows
     (MSYS2 mingw64), all -Werror, suite normal + GC stress. .gitattributes
     pins LF. Windows remains degraded by design (no coro/csp/nREPL, plain
-    REPL); macOS is expected full-featured — ucontext-on-arm64 is the one
-    watch item, and the capability probes keep the suite honest if it
-    misbehaves.
+    REPL); macOS is FULL-featured — ucontext coroutines verified working on
+    arm64 (timing probes: two 50ms futures overlap correctly).
+    THE BIG CATCH (found by this CI, reproduced locally with `ulimit -s
+    8192`): lazy_force recursed one C frame per lazy-of-lazy chain link —
+    (first (filter #(= % 3000000) (iterate inc 0))) (tests.clj's item-43
+    head-retention test) builds a ~3M-link chain of thunks that yield
+    another lazy, and the walk needed ~90B × chain C stack. Linux's 1 GiB
+    rlimit masked it completely; macOS's fixed 8 MiB tripped the guard
+    ("stack overflow" abort — which grep -E 'FAIL|error' MISSED, no
+    lowercase match); Windows' 2 MiB PE default SEGV'd outright because
+    stack_floor_init assumed 8 MiB when rlimit is absent. One bug, three
+    disguises. Fixes: (a) lazy_force is now an ITERATIVE two-phase chain
+    walk (thunks run down the chain with provisional cached links keeping
+    it GC-reachable — gc_mark follows cached unconditionally — then every
+    cell back-patched with the realized result; suite passes under a 2 MiB
+    hard ulimit now); (b) Windows stack guard uses
+    GetCurrentThreadStackLimits for the exact floor (clean catchable
+    "stack overflow" instead of SEGV); (c) the two 40ms-sleep overlap
+    asserts loosened to 200ms/<350ms (75ms bound flaked on loaded CI
+    runners); (d) ffi-build honors CLJC_CC and hashes it into the module
+    cache key (Rosetta needs cc -arch x86_64 or dlopen gets an arm64
+    dylib); (e) CLJC_UNBUFFERED=1 env var disables stdio buffering (crash
+    diagnostics; Windows CRT can't line-buffer). Also: the item-43 note
+    "conservative scan finds a stale head pointer" now has a sibling —
+    a deep C stack also made every GC collection O(depth) via the
+    conservative scan (the arm64 suite burned 10 CPU-minutes before the
+    fix; expect normal times after).
 
 ## Known divergences from Clojure (deliberate)
 - `catch` is untyped; hash maps/sets iterate in hash order; plain int64

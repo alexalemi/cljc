@@ -109,6 +109,13 @@ jobs:
         run: |
           ls -la cljc.exe
           ./cljc.exe -e '(println :hello-windows)' || { echo "launch rc=$?"; exit 1; }
+      - name: TCO crash probe (suite dies at tests.clj:1742 on Windows)
+        run: |
+          gcc -O0 -static -o cljc-O0.exe cljc.c -lm -lws2_32
+          for exe in ./cljc.exe ./cljc-O0.exe; do
+            echo "== $exe =="
+            $exe -e '(do (defn od? [n] (if (zero? n) false (ev? (dec n)))) (defn ev? [n] (if (zero? n) true (od? (dec n)))) (println :even (ev? 3000000)) (println :odd (ev? 3000001)))' || echo "rc=$?"
+          done
       - name: Test (platform-dependent sections self-skip)
         env:
           CLJC_UNBUFFERED: "1"

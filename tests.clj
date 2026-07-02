@@ -2035,10 +2035,10 @@
 ; ── load-file evaluates top-level forms in the ROOT env ──
 ; A required file defining (defn paths ...) used to resolve its own call sites
 ; to require-one's `paths` let-local (the candidate-file lazy seq) instead.
-(spit "cljc-shadowtest.clj"
+(spit "cljc_shadowtest.clj"   ; require munges - to _ when resolving files
       "(ns cljc-shadowtest)\n(defn paths [a b] [(str a b)])\n(def result (first (paths \"x\" \"y\")))\n")
 (require 'cljc-shadowtest)
 (assert= "xy" cljc-shadowtest/result)
-(sh "rm -f cljc-shadowtest.clj")
+(sh "rm -f cljc_shadowtest.clj")
 
 (println "tests complete")

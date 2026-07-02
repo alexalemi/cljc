@@ -1551,6 +1551,7 @@
 ; alts! picks a ready channel
 (assert= :hit (let [r (cljc-a/chan 1)]
                 (cljc-a/<!! (cljc-a/go (cljc-a/>! r :hit) (first (cljc-a/alts! [r]))))))
+
 ; async I/O event loop: a loopback echo server + client, both go blocks, served
 ; through poll() — no blocking, one thread
 (def cljc-csp-srv (tcp/listen 8094 "127.0.0.1"))
@@ -2040,5 +2041,60 @@
 (require 'cljc-shadowtest)
 (assert= "xy" cljc-shadowtest/result)
 (sh "rm -f cljc_shadowtest.clj")
+
+; ── namespace-object layer: *ns*/find-ns/all-ns/ns-publics + private vars ──
+(spit "cljc_nstest_a.clj"
+      (str "(ns cljc-nstest-a)\n"
+           "(def pub 1)\n"
+           "(def ^:private hidden 2)\n"
+           "(defn- phelper [] :ph)\n"
+           "(defn caller [] (phelper))\n"))   ; same-ns private use
+(spit "cljc_nstest_b.clj"
+      (str "(ns cljc-nstest-b (:require [cljc-nstest-a :as na :refer [pub]]))\n"
+           "(def saw-ns (str *ns*))\n"        ; *ns* tracks the ns form
+           "(def refer-val pub)\n"            ; :refer from a ns form
+           "(def alias-val na/pub)\n"
+           "(def own-aliases (ns-aliases 'cljc-nstest-b))\n"
+           "(def denied (try (na/phelper) (catch Exception e :denied)))\n"
+           "(def via-var @#'cljc-nstest-a/hidden)\n"  ; var access bypasses privacy
+           "(def same-ns-priv (na/caller))\n"))
+(require 'cljc-nstest-b)
+(assert= "cljc-nstest-b" cljc-nstest-b/saw-ns)
+(assert= 1 cljc-nstest-b/refer-val)
+(assert= 1 cljc-nstest-b/alias-val)
+(assert= '{na cljc-nstest-a} cljc-nstest-b/own-aliases)
+(assert= :denied cljc-nstest-b/denied)
+(assert= 2 cljc-nstest-b/via-var)
+(assert= :ph cljc-nstest-b/same-ns-priv)
+(assert= 'cljc-nstest-a (find-ns 'cljc-nstest-a))
+(assert= nil (find-ns 'no.such.ns))
+(assert= true (contains? (set (all-ns)) 'cljc-nstest-b))
+(assert= ["caller" "pub"] (vec (sort (map str (keys (ns-publics 'cljc-nstest-a))))))
+(assert= ["caller" "hidden" "phelper" "pub"]
+         (vec (sort (map str (keys (ns-interns 'cljc-nstest-a))))))
+(assert= "user" (str *ns*))                   ; require didn't leak its ns
+(assert= 'x.y (create-ns 'x.y))
+(assert= 'x.y (find-ns 'x.y))
+(sh "rm -f cljc_nstest_a.clj cljc_nstest_b.clj")
+
+; ── closures created in a loop capture THAT iteration's bindings ──
+; VOP_REBIND used to mutate the loop frame's slots in place, so a closure
+; (incl. a lazy seq) made in iteration k saw iteration k+1's values.
+(defn loop-closure-lazy []
+  (loop [xs (vec (range 100)) i 0 acc []]
+    (if (= i 3) acc
+        (recur (filter #(< % (* 10 (inc i))) xs) (inc i) (conj acc (count xs))))))
+(assert= [100 10 10] (loop-closure-lazy))
+(defn loop-closure-fns []
+  (loop [i 0 fs []]
+    (if (= i 3) (mapv (fn [h] (h)) fs)
+        (recur (inc i) (conj fs (fn [] i))))))
+(assert= [0 1 2] (loop-closure-fns))
+(assert= [0 1 2]                      ; top-level loops VM-compile too
+         (loop [i 0 fs []]
+           (if (= i 3) (mapv (fn [h] (h)) fs)
+               (recur (inc i) (conj fs (fn [] i))))))
+(assert= 10000                        ; closure-free loops still rebind in place
+         (loop [i 0] (if (< i 10000) (recur (inc i)) i)))
 
 (println "tests complete")

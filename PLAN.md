@@ -4,9 +4,9 @@ Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
 (`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test` (runs the
 suite twice — normal and `CLJC_GC_STRESS=1`).
 
-## Status (as of 2026-06-10)
+## Status (as of 2026-07-02)
 
-~4,300 lines, zero warnings, 408 assertions in `tests.clj`, ASan/UBSan clean
+~13,000 lines, zero warnings, 1244 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC).
 
@@ -781,12 +781,53 @@ required by conservative stack scanning, same as Boehm GC).
     live data, not ballooned garbage). Still not enough to cross 15s on the
     gap files — raw throughput remains the real lever.
 
-## Known divergences from Clojure (deliberate, v0)
-- `()` ≡ `nil` (so `(= () [])` is false)
-- No Ratio type: `(/ 7 2)` ⇒ `3.5`
-- No namespaces, no vars (def installs directly into root env)
-- No lazy seqs (everything eager; `range` is bounded-only)
-- Quasiquote: no nesting levels, no auto-gensym `x#`, no ns-resolution
+44. ~~Loop-closure capture fix (VM)~~ ✅ done 2026-07-02 — closures created
+    inside a VM-compiled loop saw POST-recur values of the loop vars:
+    VOP_REBIND mutated the loop frame's slots in place while the closure
+    held the frame by reference (the tree-walker loop already fresh-framed
+    per iteration; apply's fn-recur loop already env_new'd per call — the
+    VM was the one remaining mutator). Repro: filter-chain narrowing
+    `[100 20 20]` vs Clojure's `[100 10 10]`. Fix: a `captured` flag on
+    CljcEnv (fits struct padding, cleared in env_new) — make_fn marks the
+    whole parent chain (early-exit at an already-marked frame: ancestors
+    are guaranteed marked, parents never change); VOP_REBIND rebinds into
+    a FRESH frame when the flag is set, mutates in place otherwise. A
+    plain loop's frame holds exactly the loop names, all rewritten from
+    the vstack, so the copy reads nothing from the old frame (GC-safe).
+    Closure-free loops pay one branch (5M-loop benchmark unchanged);
+    closure-per-iteration loops pay the env alloc correctness requires.
+    Suite + GC-stress + ASan/UBSan (both modes) clean.
+45. ~~Namespace-object layer + ^:private enforcement~~ ✅ done 2026-07-02 —
+    the flat-global model gets its missing introspection/identity surface.
+    A namespace IS its symbol (no Namespace type): *ns* (a var, tracked by
+    set_cur_ns — the single choke point behind the ns special form,
+    cljc/in-ns*, and eval-forms*'s save/restore), in-ns, find-ns, the-ns,
+    create-ns, all-ns (C-side ns_registry; require/ns/in-ns register),
+    ns-publics/ns-interns (maps of symbol→Var), ns-map, ns-aliases,
+    ns-resolve, alias. ^:private (incl. defn-, which previously LOST the
+    meta, and defmacro) records the qualified name in a side table;
+    root_find(public_only) refuses a private reached from a foreign ns at
+    the two qualified-match points — plain symbol resolution errors "not
+    public" while #'a/x, resolve, and same-ns (home_ns) access stay open,
+    matching Clojure's @#'a/x escape. ns-publics* now filters privates, so
+    `use`/:refer :all stop leaking them. BONUS pre-existing bug fixed: the
+    ns special form processed :require clauses BEFORE entering the ns, so
+    a top-level script's own (ns x (:require [y :as a :refer [f]])) hung
+    its alias/refer registrations on the PREVIOUS ns (invisible via
+    require-one, which enters the ns around load-file; fatal for scripts —
+    the refer was simply unresolvable). Clauses now run after set_cur_ns.
+    Divergences kept: user-level defs stay bare (visible cross-ns);
+    remove-ns/ns-unmap unimplemented (root Binding pointers must stay
+    stable for the root_cache). Suite + vendored-namespace smoke (26/26) +
+    AoC 16-file sample clean.
+
+## Known divergences from Clojure (deliberate)
+- `catch` is untyped; hash maps/sets iterate in hash order; plain int64
+  arithmetic wraps (see README's list — it supersedes this one)
+- Namespaces: flat global + per-ns aliases behind a symbol-based namespace
+  layer; top-level `user` defs are bare, hence visible from other
+  namespaces; no remove-ns/ns-unmap (root Bindings are append-only)
+- Quasiquote: auto-gensym `x#` works; nested quasiquote levels do not
 - Conservative GC may retain garbage pointed at by stale stack slots
 
 ## Testing conventions

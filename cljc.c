@@ -223,6 +223,8 @@ struct CljcEnv {
     uint8_t gcmark;
     uint8_t gcfree;
     uint8_t nslots;
+    uint8_t captured;   /* a closure holds (a descendant of) this frame:
+                         * VOP_REBIND must not mutate its slots in place */
     const char *sname[ENV_SLOTS];
     Cljc *sval[ENV_SLOTS];
 };
@@ -291,6 +293,41 @@ static const char *alias_lookup(const char *prefix, const char *home_ns) {
 static const char *refer_from[MAX_REFERS];     /* "<referring-ns>/name" */
 static const char *refer_to[MAX_REFERS];       /* "<source-ns>/name"    */
 static int n_refers;
+
+/* The namespace-object layer over the flat-global model: every ns entered
+ * via (ns ..)/in-ns/require/create-ns is recorded here — find-ns/all-ns
+ * consult it, and *ns* tracks the current one (as a SYMBOL: cljc has no
+ * Namespace type, and (str *ns*)/(ns-name *ns*) are what code relies on). */
+#define MAX_NAMESPACES 1024
+static const char *ns_registry[MAX_NAMESPACES];  /* interned ns names */
+static int n_namespaces;
+static void register_ns(const char *ns) {
+    if (!ns) return;
+    for (int i = 0; i < n_namespaces; i++)
+        if (ns_registry[i] == ns) return;
+    if (n_namespaces < MAX_NAMESPACES) ns_registry[n_namespaces++] = ns;
+}
+
+/* Private defs: (def ^:private x ..) / defn- record their QUALIFIED name;
+ * resolving one from a foreign namespace is refused (root_find public_only).
+ * Var access (#'a/x, resolve) stays open, like Clojure's @#'a/x escape. */
+#define MAX_PRIVATE_DEFS 8192
+static const char *private_defs[MAX_PRIVATE_DEFS];  /* interned "ns/name" */
+static int n_private_defs;
+static bool is_private_def(const char *qual) {
+    for (int i = 0; i < n_private_defs; i++)
+        if (private_defs[i] == qual) return true;
+    return false;
+}
+static void mark_private_def(const char *qual, bool priv) {
+    for (int i = 0; i < n_private_defs; i++)
+        if (private_defs[i] == qual) {
+            if (!priv) private_defs[i] = private_defs[--n_private_defs];
+            return;
+        }
+    if (priv && n_private_defs < MAX_PRIVATE_DEFS)
+        private_defs[n_private_defs++] = qual;
+}
 
 static Cljc *cell_alloc(bool zero);
 static CljcEnv *env_alloc(void);
@@ -630,6 +667,7 @@ static CljcEnv *env_new(CljcEnv *parent) {
     e->bindings = NULL;
     e->parent = parent;
     e->nslots = 0;
+    e->captured = 0;
     return e;
 }
 
@@ -686,7 +724,7 @@ static void env_define(CljcEnv *env, const char *name, Cljc *value) {
  * the lifetime of the interpreter, which is what makes the per-symbol
  * root_cache sound — a cached binding sees redefinitions through the
  * mutation instead of going stale. */
-static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
+static const char *env_define_root(CljcEnv *root, const char *name, Cljc *value) {
     /* While a library loads, its BARE defs land under "ns/name" — isolation
      * from the flat globals (and from each other). An ALREADY-qualified name
      * (e.g. (defn cljc/foo ...) inside an (ns bar) file) keeps its explicit
@@ -697,7 +735,8 @@ static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
     /* `/` (the division symbol) is itself a slash but is NOT namespace-qualified
      * — without this a library that redefines / (e.g. a generic-arithmetic ns
      * with :refer-clojure :exclude [/]) would clobber the global core / for
-     * everyone instead of isolating it under its own ns. */
+     * everyone instead of isolating it under its own ns. Returns the name the
+     * binding was stored under, so def can key :private tracking on it. */
     if (cur_reader_ns && strcmp(cur_reader_ns, "user") &&
         (!strchr(name, '/') || !strcmp(name, "/"))) {
         char buf[256];
@@ -705,8 +744,9 @@ static void env_define_root(CljcEnv *root, const char *name, Cljc *value) {
         name = intern(buf, strlen(buf));
     }
     for (Binding *b = root->bindings; b; b = b->next)
-        if (b->name == name) { b->value = value; return; }
+        if (b->name == name) { b->value = value; return name; }
     env_define(root, name, value);
+    return name;
 }
 
 static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
@@ -1918,15 +1958,27 @@ static const char *sym_name(Cljc *v, const char *what) {
 }
 
 /* Peel reader metadata off a def/defmacro name: (def ^:private x ..) reads the
- * name as (with-meta x m) — possibly stacked. Metadata is not retained. */
-static Cljc *peel_meta_sym(Cljc *v) {
+ * name as (with-meta x m) — possibly stacked. Only :private is retained (via
+ * the priv out-param; def/defmacro record it in the private-defs table). */
+static Cljc *peel_meta_sym_priv(Cljc *v, bool *priv) {
     while (v != NIL && v->tag == CLJC_LIST &&
            v->as.cons.head->tag == CLJC_SYMBOL &&
            !strcmp(v->as.cons.head->as.sym, "with-meta") &&
-           v->as.cons.tail != NIL)
+           v->as.cons.tail != NIL) {
+        if (priv) {
+            Cljc *mt = v->as.cons.tail->as.cons.tail;
+            Cljc *mf = (mt != NIL && mt->tag == CLJC_LIST) ? mt->as.cons.head : NIL;
+            if (mf != NIL && mf->tag == CLJC_MAP) {
+                Cljc *pv;
+                if (map_find(mf, mk_kw(intern("private", 7)), &pv) && is_truthy(pv))
+                    *priv = true;
+            }
+        }
         v = v->as.cons.tail->as.cons.head;
+    }
     return v;
 }
+static Cljc *peel_meta_sym(Cljc *v) { return peel_meta_sym_priv(v, NULL); }
 
 static int64_t as_int(Cljc *v, const char *what) {
     if (v == NULL || v->tag != CLJC_INT)
@@ -2707,8 +2759,19 @@ static void arity_info(Cljc *params, size_t *fixed, bool *variadic) {
 /* Root binding lookup: home-ns qualification first (library isolation),
  * then bare, then the (require :as) alias fallback. Shared by the
  * tree-walker's resolve_symbol and the compiler's vm_resolve_maybe —
- * copy-drift between those two paths already shipped one bug. */
-static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) {
+ * copy-drift between those two paths already shipped one bug.
+ * public_only: refuse a ^:private def reached from a FOREIGN namespace
+ * (plain symbol evaluation). Var access (#'a/x, resolve) passes false —
+ * Clojure's @#'a/x escape hatch. The home-ns path needs no check: home_ns
+ * equals the def's own ns by construction. */
+static bool private_denied(const char *qual, const char *home_ns) {
+    const char *slash = strchr(qual, '/');
+    if (!slash || !is_private_def(qual)) return false;
+    size_t plen = (size_t)(slash - qual);
+    return !(home_ns && strlen(home_ns) == plen && !memcmp(home_ns, qual, plen));
+}
+static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
+                          bool public_only) {
     if (home_ns) {
         char buf[256];
         snprintf(buf, sizeof buf, "%s/%s", home_ns, name);
@@ -2722,7 +2785,11 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
                     if (b->name == refer_to[i]) return b;
     }
     for (Binding *b = root->bindings; b; b = b->next)
-        if (b->name == name) return b;
+        if (b->name == name) {
+            if (public_only && n_private_defs && private_denied(name, home_ns))
+                cljc_error("var: %s is not public", name);
+            return b;
+        }
     /* refer alias on an already-qualified name */
     for (int i = 0; i < n_refers; i++)
         if (refer_from[i] == name)
@@ -2757,7 +2824,12 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
                 const char *qual = intern(buf, strlen(buf));
                 const char *bare = intern(slash + 1, strlen(slash + 1));
                 for (Binding *b = root->bindings; b; b = b->next)
-                    if (b->name == qual) return b;
+                    if (b->name == qual) {
+                        if (public_only && n_private_defs &&
+                            private_denied(qual, home_ns))
+                            cljc_error("var: %s is not public", qual);
+                        return b;
+                    }
                 for (Binding *b = root->bindings; b; b = b->next)
                     if (b->name == bare) return b;
             }
@@ -2814,6 +2886,19 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns) 
     return NULL;
 }
 
+/* Enter a namespace: the reader stamps subsequent symbols/defs with it, the
+ * registry learns it (find-ns/all-ns), and the *ns* var tracks it as a
+ * symbol. Shared by the ns special form, cljc/in-ns*, and the load path's
+ * save/restore. NULL only occurs while the preamble boots (*ns* not yet
+ * def'd), so the var update is conditional on both. */
+static void set_cur_ns(CljcEnv *root, const char *ns) {
+    cur_reader_ns = ns;
+    if (!ns) return;
+    register_ns(ns);
+    Binding *b = root_find(root, intern("*ns*", 4), NULL, false);
+    if (b) b->value = mk_sym(ns);
+}
+
 /* True if `name` is a LOCAL binding in env — a let/loop/fn/letfn local shadowing
  * a special form (Clojure lets (letfn [(loop [..] ..)] (loop ..)) call the local).
  * Only consulted for the function-like special forms loop/let/fn, never the hot
@@ -2833,7 +2918,7 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
     }
     Binding *cb = form->as.symc.root_cache;
     if (cb) return cb->value;
-    Binding *b = root_find(e, name, form->as.symc.home_ns);
+    Binding *b = root_find(e, name, form->as.symc.home_ns, true);
     if (b) { form->as.symc.root_cache = b; return b->value; }
     err_token = name;
     cljc_error("I don't know what `%s` refers to.", name);
@@ -3024,7 +3109,7 @@ static Cljc *vm_resolve_maybe(CljcEnv *env, Cljc *sym) {
         if (env_local_find(e, name)) return NULL;     /* local shadows */
     Binding *cb = sym->as.symc.root_cache;
     if (cb) return cb->value;
-    Binding *b = root_find(e, name, sym->as.symc.home_ns);
+    Binding *b = root_find(e, name, sym->as.symc.home_ns, true);
     return b ? b->value : NULL;
 }
 
@@ -3148,7 +3233,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
          * tree-walker, which resolves it as a deftype field read */
         if ((s[0] == '.' && s[1] == '-' && s[2]) ||
             (s[0] == '.' && s[1] && s[1] != '-' &&
-             !root_find(env_root(cenv), s, NULL))) {
+             !root_find(env_root(cenv), s, NULL, false))) {
             vmc_emit(c, VOP_EVAL, vmc_const(c, form));
             return;
         }
@@ -3529,15 +3614,27 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                  * unwind (recur from inside nested lets) */
                 uint32_t k = a & 0xffff, depth = a >> 16;
                 for (uint32_t d = 0; d < depth; d++) env = env->parent;
-                env_keep = env;
                 uint32_t n = 0;
                 for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail) n++;
                 Cljc **vals = &vstack[vsp - n];
-                uint32_t i = 0;
-                for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail, i++) {
-                    Cljc **p = env_local_find(env, nm->as.cons.head->as.sym);
-                    if (p) *p = vals[i];
+                if (env->captured) {
+                    /* a closure captured this frame — rebind into a FRESH one
+                     * so the closure keeps THIS iteration's values (the
+                     * tree-walker loop does the same). A plain loop's frame
+                     * holds exactly the loop names, all rewritten here from
+                     * the vstack, so nothing is read from the old frame. */
+                    env = env_new(env->parent);  /* vals stay vstack-rooted */
+                    uint32_t i = 0;
+                    for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail, i++)
+                        env_define(env, nm->as.cons.head->as.sym, vals[i]);
+                } else {
+                    uint32_t i = 0;
+                    for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail, i++) {
+                        Cljc **p = env_local_find(env, nm->as.cons.head->as.sym);
+                        if (p) *p = vals[i];
+                    }
                 }
+                env_keep = env;
                 vsp -= n;
                 VM_NEXT();
             }
@@ -3632,7 +3729,7 @@ static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
     if (!KW_CLJC_TYPE) KW_CLJC_TYPE = mk_kw(intern("cljc/type", 9));
     Cljc *tykw;
     if (!map_find(inst, KW_CLJC_TYPE, &tykw)) return false;
-    Binding *mtb = root_find(env_root(env), intern("cljc/deftype-methods", 20), NULL);
+    Binding *mtb = root_find(env_root(env), intern("cljc/deftype-methods", 20), NULL, false);
     if (!mtb || mtb->value == NIL || mtb->value->tag != CLJC_ATOM) return false;
     Cljc *tables = mtb->value->as.atom.value, *tab, *method;
     if (tables == NIL || tables->tag != CLJC_MAP) return false;
@@ -3653,7 +3750,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
      * the hot path (every +, <, fn call) doesn't pay an extra branch. */
     if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
     if (fn->tag == CLJC_VAR) {     /* a Var is IFn: call its current value */
-        Binding *b = root_find(env_root(env), fn->as.var.name, NULL);
+        Binding *b = root_find(env_root(env), fn->as.var.name, NULL, false);
         if (b && b->value != fn) return apply(env, b->value, argv, nargs);
         cljc_error("var is unbound or not callable");
     }
@@ -3885,6 +3982,11 @@ static bool is_arities_meta(Cljc *m) {
 }
 
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
+    /* The closure holds env — every frame up the chain may now outlive its
+     * scope, so loop frames among them must stop rebinding in place
+     * (VOP_REBIND). Parents never change, so an already-marked frame means
+     * its whole ancestry is marked: stop there. */
+    for (CljcEnv *e = env; e && !e->captured; e = e->parent) e->captured = 1;
     /* Arities (and the chunks cached on them) are pure structure: share
      * them across every closure built from the same source forms. A hot
      * loop creating a closure per iteration otherwise RECOMPILES its
@@ -4118,7 +4220,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                  * field access (Java's field-access syntax === method syntax) */
                 if (s[0] == '.' && s[1] && s[1] != '-' &&
                     rest != NIL && rest->tag == CLJC_LIST &&
-                    !root_find(env_root(env), s, NULL)) {
+                    !root_find(env_root(env), s, NULL, false)) {
                     Cljc *obj = eval(env, rest->as.cons.head);
                     Cljc *out;
                     /* (.method obj args..): route to the deftype's method (sans
@@ -4283,6 +4385,21 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         if (!KW_REQ) { KW_REQ = intern("require", 7);
                                        KW_IMPORT = intern("import", 6);
                                        KW_USE = intern("use", 3); }
+                        /* Enter the namespace FIRST: the clauses' :as/:refer
+                         * registrations key their owner off cur_reader_ns, so
+                         * processing them before entering attributed them to
+                         * the PREVIOUS ns (invisible when require-one had
+                         * already entered it around load-file; wrong for a
+                         * top-level script's own ns form). Subsequent reads
+                         * stamp home_ns and defs land under name/ as before
+                         * (run_stream alternates read/eval, so the rest of
+                         * the file is read with the ns active). */
+                        {
+                            Cljc *nsn = rest != NIL && rest->tag == CLJC_LIST
+                                        ? peel_meta_sym(rest->as.cons.head) : NIL;
+                            if (nsn != NIL && nsn->tag == CLJC_SYMBOL)
+                                set_cur_ns(env_root(env), nsn->as.symc.name);
+                        }
                         for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
                             Cljc *cl = c->as.cons.head;
                             /* clause head keyword -> which per-spec handler */
@@ -4312,17 +4429,6 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                     apply(env, callee, one, 1);
                                 }
                             }
-                        }
-                        /* Enter the namespace: subsequent reads stamp
-                         * home_ns and defs land under name/ — the same
-                         * model require-loaded libraries already use.
-                         * (run_stream alternates read/eval, so the rest
-                         * of the file is read with the ns active.) */
-                        {
-                            Cljc *nsn = rest != NIL && rest->tag == CLJC_LIST
-                                        ? rest->as.cons.head : NIL;
-                            if (nsn != NIL && nsn->tag == CLJC_SYMBOL)
-                                cur_reader_ns = nsn->as.symc.name;
                         }
                         return NIL;
                     }
@@ -4426,7 +4532,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     /* (defmacro name [params] body...) — a fn flagged so that
                      * eval calls it on unevaluated forms and re-evals the result. */
                     need_args(rest, 2, "defmacro");
-                    const char *name = sym_name(peel_meta_sym(rest->as.cons.head), "defmacro");
+                    bool mac_private = false;
+                    const char *name = sym_name(
+                        peel_meta_sym_priv(rest->as.cons.head, &mac_private), "defmacro");
                     Cljc *mbody = rest->as.cons.tail;
                     if (mbody->as.cons.head->tag == CLJC_STRING &&
                         mbody->as.cons.tail != NIL)
@@ -4435,7 +4543,10 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         mbody->as.cons.tail != NIL)
                         mbody = mbody->as.cons.tail;  /* skip attr-map */
                     Cljc *m = make_fn(env, mbody, true);
-                    env_define_root(env_root(env), name, m);
+                    {
+                        const char *st = env_define_root(env_root(env), name, m);
+                        if (strchr(st, '/')) mark_private_def(st, mac_private);
+                    }
                     return m;
                 }
                 if (s == SYM_DEFN) {
@@ -4468,20 +4579,22 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     need_args(rest, 1, "def");
                     Cljc *namef = rest->as.cons.head;
                     /* (def ^:dynamic x v): the reader wrapped the name as
-                     * (with-meta x m) — unwrap; def meta is not retained.
+                     * (with-meta x m) — unwrap; only :private is retained
+                     * (side table keyed by the stored qualified name).
                      * Stacked metadata (^:dynamic ^:no-doc x) nests several
                      * with-meta forms, so peel all of them. */
-                    while (namef != NIL && namef->tag == CLJC_LIST &&
-                           namef->as.cons.head->tag == CLJC_SYMBOL &&
-                           !strcmp(namef->as.cons.head->as.sym, "with-meta") &&
-                           namef->as.cons.tail != NIL)
-                        namef = namef->as.cons.tail->as.cons.head;
+                    bool def_private = false;
+                    namef = peel_meta_sym_priv(namef, &def_private);
                     /* a #?(:cljs ..)-only def name elides to nil here — skip it */
                     if (namef == NIL) return NIL;
                     const char *name = sym_name(namef, "def");
                     Cljc *valf = rest->as.cons.tail;
                     /* (def name): no value — an unbound-var declaration => nil */
-                    if (valf == NIL) { env_define_root(env_root(env), name, NIL); return NIL; }
+                    if (valf == NIL) {
+                        const char *st = env_define_root(env_root(env), name, NIL);
+                        if (strchr(st, '/')) mark_private_def(st, def_private);
+                        return NIL;
+                    }
                     /* (def name "docstring" value): skip the docstring */
                     if (valf->as.cons.tail != NIL &&
                         valf->as.cons.tail->tag == CLJC_LIST &&
@@ -4489,7 +4602,12 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         valf->as.cons.head->tag == CLJC_STRING)
                         valf = valf->as.cons.tail;
                     Cljc *val = eval(env, valf->as.cons.head);
-                    env_define_root(env_root(env), name, val);  /* def is always global */
+                    /* def is always global; a redef without ^:private clears
+                     * the mark (Clojure resets var meta on redef) */
+                    {
+                        const char *st = env_define_root(env_root(env), name, val);
+                        if (strchr(st, '/')) mark_private_def(st, def_private);
+                    }
                     /* Attach :name metadata to a def'd function (fresh per defn, so
                      * no shared-cell hazard) the first time it's named, so
                      * (:name (meta (resolve sym))) works for potemkin-style
@@ -4766,7 +4884,7 @@ static int g_print_depth;
 static Binding *g_plen_b, *g_plevel_b;
 static int print_var_int(Binding **cache, const char *nm, size_t n) {
     if (!*cache && gc_root_envs[0])
-        *cache = root_find(env_root(gc_root_envs[0]), intern(nm, n), NULL);
+        *cache = root_find(env_root(gc_root_envs[0]), intern(nm, n), NULL, false);
     Cljc *v = *cache ? (*cache)->value : NIL;
     return (v != NIL && v->tag == CLJC_INT) ? (int)v->as.i : -1;
 }
@@ -5650,7 +5768,7 @@ COMPARISON(num_eq, ==)   /* == : numeric value-equality across the tower (1 == 1
 static Binding *g_out_binding;
 static const char *g_kw_stderr;
 static void emit_out(CljcEnv *env, const char *data, size_t len) {
-    if (!g_out_binding) g_out_binding = root_find(env_root(env), intern("*out*", 5), NULL);
+    if (!g_out_binding) g_out_binding = root_find(env_root(env), intern("*out*", 5), NULL, false);
     Cljc *w = g_out_binding ? g_out_binding->value : NIL;
     if (w == NIL) { fwrite(data, 1, len, COUT); return; }
     if (w->tag == CLJC_KEYWORD) {
@@ -7221,19 +7339,19 @@ static Cljc *prim_current_ns(CljcEnv *env, Cljc **argv, int nargs) {
  * nil means "back to the top level", which is the `user` namespace (so a later
  * top-level (:refer [reduce ..]) aliases under user/ instead of clobbering core). */
 static Cljc *prim_in_ns(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; (void)nargs;
+    (void)nargs;
     const char *old = cur_reader_ns;
     Cljc *v = argv[0];
-    cur_reader_ns = (v == NIL) ? intern("user", 4)
-        : intern(v->as.str, strlen(v->as.str));
+    set_cur_ns(env_root(env), (v == NIL) ? intern("user", 4)
+                                         : intern(v->as.str, strlen(v->as.str)));
     return old ? mk_str(old, strlen(old)) : NIL;
 }
 
 /* (cljc/ns-publics* "ns") — vector of the bare names (strings) of every root
- * binding defined under the "ns/" prefix. Backs `use`, which refers them all. */
-static Cljc *prim_ns_publics(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)nargs;
-    const char *ns = as_str(argv[0], "ns-publics*");
+ * binding defined under the "ns/" prefix, skipping ^:private defs. Backs
+ * `use` and :refer :all, so privates no longer leak through either.
+ * (cljc/ns-interns* "ns") — the same INCLUDING privates (Clojure ns-interns). */
+static Cljc *ns_names_vec(CljcEnv *env, const char *ns, bool include_private) {
     size_t nlen = strlen(ns);
     Cljc *out = mk_empty_vec();
     for (Binding *b = env_root(env)->bindings; b; b = b->next) {
@@ -7241,11 +7359,53 @@ static Cljc *prim_ns_publics(CljcEnv *env, Cljc **argv, int nargs) {
         /* match "ns/<bare>" but not a deeper "ns/sub/..." qualified name */
         if (strncmp(nm, ns, nlen) == 0 && nm[nlen] == '/') {
             const char *bare = nm + nlen + 1;
-            if (*bare && !strchr(bare, '/'))
+            if (*bare && !strchr(bare, '/') &&
+                (include_private || !is_private_def(nm)))
                 out = vec_conj1(out, mk_str(bare, strlen(bare)));
         }
     }
     return out;
+}
+static Cljc *prim_ns_publics(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    return ns_names_vec(env, as_str(argv[0], "ns-publics*"), false);
+}
+static Cljc *prim_ns_interns(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    return ns_names_vec(env, as_str(argv[0], "ns-interns*"), true);
+}
+
+/* (cljc/namespaces*) — vector of every registered namespace name (strings).
+ * Backs all-ns/find-ns/the-ns. */
+static Cljc *prim_namespaces(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    Cljc *out = mk_empty_vec();
+    for (int i = 0; i < n_namespaces; i++)
+        out = vec_conj1(out, mk_str(ns_registry[i], strlen(ns_registry[i])));
+    return out;
+}
+
+/* (cljc/create-ns* "ns") — register without entering (backs create-ns). */
+static Cljc *prim_create_ns(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    const char *s = as_str(argv[0], "create-ns*");
+    register_ns(intern(s, strlen(s)));
+    return NIL;
+}
+
+/* (cljc/ns-aliases* "ns") — map of alias string -> target-ns string for the
+ * aliases registered by that namespace ("user" also sees REPL/global ones). */
+static Cljc *prim_ns_aliases(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    const char *ns = as_str(argv[0], "ns-aliases*");
+    const char *owner = intern(ns, strlen(ns));
+    bool user = !strcmp(ns, "user");
+    Cljc *m = mk_map();
+    for (int i = 0; i < n_aliases; i++)
+        if (alias_owner[i] == owner || (user && alias_owner[i] == NULL))
+            m = map_assoc(m, mk_str(alias_table[i], strlen(alias_table[i])),
+                          mk_str(alias_ns[i], strlen(alias_ns[i])));
+    return m;
 }
 
 /* (cljc/resolve-maybe "name") — the value bound to that (string) name, or nil
@@ -7262,7 +7422,7 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
     const char *name = intern(raw, strlen(raw));
     /* root_find handles the (require :as) alias + clojure.core fallbacks, so
      * a qualified name like edn/read-char* resolves to its real binding. */
-    Binding *b = root_find(env_root(env), name, home_ns);
+    Binding *b = root_find(env_root(env), name, home_ns, false);
     return b ? b->value : NIL;
 }
 
@@ -7280,7 +7440,7 @@ static Cljc *prim_resolve_var(CljcEnv *env, Cljc **argv, int nargs) {
     if (arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
     else raw = as_str(arg, "resolve");
     const char *name = intern(raw, strlen(raw));
-    Binding *b = root_find(env_root(env), name, home_ns);
+    Binding *b = root_find(env_root(env), name, home_ns, false);
     if (!b) return NIL;
     Cljc *v = alloc(CLJC_VAR);
     v->as.var.name = b->name;
@@ -7314,7 +7474,7 @@ static Cljc *prim_set_var(CljcEnv *env, Cljc **argv, int nargs) {
     (void)nargs;
     Cljc *var = argv[0];
     if (var == NIL || var->tag != CLJC_VAR) cljc_error("set-var!: not a var");
-    Binding *b = root_find(env_root(env), var->as.var.name, NULL);
+    Binding *b = root_find(env_root(env), var->as.var.name, NULL, false);
     if (b) b->value = argv[1];
     return argv[1];
 }
@@ -7390,7 +7550,7 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
         }
         vsp--;
     }
-    cur_reader_ns = saved_ns;
+    set_cur_ns(env_root(env), saved_ns);   /* restore ns + *ns* (NULL pre-boot: ok) */
     return last;
 }
 
@@ -7411,7 +7571,7 @@ static Cljc *prim_macroexpand_1(CljcEnv *env, Cljc **argv, int nargs) {
     }
     if (!fn) {
         Binding *b = head->as.symc.root_cache;
-        if (!b) b = root_find(env_root(env), head->as.symc.name, head->as.symc.home_ns);
+        if (!b) b = root_find(env_root(env), head->as.symc.name, head->as.symc.home_ns, false);
         if (b) fn = b->value;
     }
     if (!fn || fn->tag != CLJC_FN || !fn->as.fn.is_macro) return form;
@@ -7687,7 +7847,7 @@ static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *v = argv[0];
     if (v != NIL && v->tag == CLJC_ATOM) return v->as.atom.value;
     if (v != NIL && v->tag == CLJC_VAR) {     /* deref a Var -> its current value */
-        Binding *b = root_find(env_root(env), v->as.var.name, NULL);
+        Binding *b = root_find(env_root(env), v->as.var.name, NULL, false);
         return b ? b->value : NIL;
     }
     if (v != NIL && v->tag == CLJC_MAP) {
@@ -9734,7 +9894,9 @@ static const char *PRELUDE =
     "(defmacro taoensso.timbre/debug [& _] nil) (defmacro taoensso.timbre/error [& _] nil)\n"
     "(defmacro taoensso.timbre/trace [& _] nil) (defmacro taoensso.timbre/spy [& body] (last body))\n"
     "(defmacro taoensso.timbre/warnf [& _] nil) (defmacro taoensso.timbre/errorf [& _] nil)\n"
-    "(defmacro defn- [name & body] `(defn ~name ~@body))\n"
+    /* defn- marks the def ^:private via a with-meta name wrapper — the same
+       shape reader meta produces, so def's peel/record path sees it. */
+    "(defmacro defn- [name & body] `(defn (with-meta ~name {:private true}) ~@body))\n"
     "(defn vary-meta [x f & args] (with-meta x (apply f (meta x) args)))\n"
     /* c resolves to a type keyword (deftype name, or a host-class stub/keyword);
        compare against the value's (type x). Unknown host classes are keywords
@@ -10522,8 +10684,30 @@ static const char *PRELUDE =
        work unchanged while reflective code (import-def) can read :name. */
     "(defmacro var [s] `(cljc/resolve-var '~s))\n"
     "(defn resolve ([sym] (cljc/resolve-var sym)) ([_ns sym] (cljc/resolve-var sym)))\n"
-    "(def ns-resolve resolve)\n"
+    /* The namespace-object layer: cljc has no Namespace type — a namespace IS
+       its symbol (*ns*, find-ns, all-ns all deal in symbols), which covers the
+       idioms real code uses: (str *ns*), (ns-name *ns*), (in-ns 'x), ns-publics. */
+    "(defn all-ns [] (map symbol (cljc/namespaces*)))\n"
+    "(defn find-ns [n] (let [s (symbol (str n))] (when (some #(= % s) (all-ns)) s)))\n"
+    "(defn the-ns [n] (or (find-ns n) (throw (ex-info (str \"No namespace: \" n \" found\") {:ns n}))))\n"
+    "(defn create-ns [n] (cljc/create-ns* (str n)) (symbol (str n)))\n"
+    "(defn in-ns [n] (cljc/in-ns* (str n)) (symbol (str n)))\n"
+    "(defn ns-resolve [n s]\n"
+    "  (or (and (nil? (namespace s)) (cljc/resolve-var (str (ns-name (the-ns n)) \"/\" (name s))))\n"
+    "      (resolve s)))\n"
     "(defn requiring-resolve [sym] (cljc/resolve-var sym))\n"
+    "(defn ns-interns [n] (let [ns (str (ns-name (the-ns n)))]\n"
+    "  (into {} (map (fn [nm] [(symbol nm) (cljc/resolve-var (str ns \"/\" nm))])\n"
+    "                (cljc/ns-interns* ns)))))\n"
+    "(defn ns-publics [n] (let [ns (str (ns-name (the-ns n)))]\n"
+    "  (into {} (map (fn [nm] [(symbol nm) (cljc/resolve-var (str ns \"/\" nm))])\n"
+    "                (cljc/ns-publics* ns)))))\n"
+    /* flat-global approximation: a namespace's own interns (no core/refer maps) */
+    "(defn ns-map [n] (ns-interns n))\n"
+    "(defn ns-aliases [n]\n"
+    "  (into {} (map (fn [[a t]] [(symbol a) (symbol t)])\n"
+    "                (cljc/ns-aliases* (str (ns-name (the-ns n)))))))\n"
+    "(defn alias [a ns-sym] (cljc/alias* (str a) (str ns-sym)))\n"
     "(defn var? [x] (= (type x) :var))\n"
     "(defn var-get [v] (deref v))\n"
     "(defn find-var [sym] (cljc/resolve-var sym))\n"
@@ -10942,6 +11126,10 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/current-ns*", prim_current_ns);
     cljc_define_native(e, "cljc/in-ns*", prim_in_ns);
     cljc_define_native(e, "cljc/ns-publics*", prim_ns_publics);
+    cljc_define_native(e, "cljc/ns-interns*", prim_ns_interns);
+    cljc_define_native(e, "cljc/namespaces*", prim_namespaces);
+    cljc_define_native(e, "cljc/create-ns*", prim_create_ns);
+    cljc_define_native(e, "cljc/ns-aliases*", prim_ns_aliases);
     cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
     cljc_define_native(e, "cljc/resolve-var", prim_resolve_var);
     cljc_define_native(e, "cljc/set-var!", prim_set_var);
@@ -11811,7 +11999,8 @@ CljcEnv *cljc_new_env(void) {
      * The preamble above loaded with cur_reader_ns NULL, so core defs stay bare
      * and core code (NULL home-ns) never sees the user refers. `user` defs are
      * kept bare too (see env_define_root) so nothing else shifts. */
-    cur_reader_ns = intern("user", 4);
+    register_ns(intern("clojure.core", 12));   /* core is native; make it findable */
+    set_cur_ns(env_root(e), intern("user", 4));
     return e;
 }
 

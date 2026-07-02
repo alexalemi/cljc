@@ -53,7 +53,7 @@ you have.
 | **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote var` |
 | **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets), **auto-gensym `x#`**; `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` `doseq` `dotimes` `doto` `letfn` `with-out-str` `with-redefs` … most written in cljc itself (the prelude) |
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
-| **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*` |
+| **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*`/`in-ns`/`find-ns`/`all-ns`/`ns-publics`/`ns-interns`/`ns-aliases`/`ns-resolve`, **`^:private` enforced** across namespaces (`#'a/x` var access stays open, like Clojure) |
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`extend-protocol`/`satisfies?`, **`deftype`/`defrecord`** with real method dispatch (this is what lets Emmy/DataScript/instaparse run), `binding` |
 | **Errors** | `throw` any value, `try`/`catch`/`finally`, `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type |
 | **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit`, string readers/writers |
@@ -275,7 +275,11 @@ embeddability matter; use bb/JVM where throughput does.
 - `()` is the empty list (not `nil`), but seq fns treat an exhausted seq as
   `nil`, as in Clojure
 - Namespaces are a flat global with per-namespace aliases (not separate var
-  interning per ns); `Math/sqrt` resolves as a host-method symbol
+  interning per ns), fronted by a namespace-object layer: a namespace IS its
+  symbol (`*ns*`, `find-ns`, `all-ns` all deal in symbols — there's no
+  Namespace type to print as `#object[...]`); top-level `user` defs stay
+  bare, so they're visible from other namespaces (real Clojure isolates
+  them); `Math/sqrt` resolves as a host-method symbol
 - Metadata works (`with-meta`/`meta`/`^{}`) and propagates through collection
   ops (`conj`/`assoc`/`into`, incl. transient roundtrips)
 - `#?(:cljc …)` reader conditionals; `#(…)`, `\a` char literals, `^meta` supported

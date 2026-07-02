@@ -5934,8 +5934,15 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc **argv, int nargs) {
     if (v->tag == CLJC_LIST) return FALSE;  /* a cons is never empty */
     if (v->tag == CLJC_LAZY) return mk_bool(seq1(v) == NIL);
     if (v->tag == CLJC_VECTOR) return mk_bool(vec_len(v) == 0);
-    if (v->tag == CLJC_MAP || v->tag == CLJC_SET)
+    if (v->tag == CLJC_MAP || v->tag == CLJC_SET) {
+        /* a deftype with its own count (e.g. PriorityMap) is empty by THAT
+         * count, not by its field count (which is never zero) */
+        Cljc *out;
+        if (v->tag == CLJC_MAP &&
+            dispatch_deftype_method(env, v, "count", NULL, 0, &out))
+            return mk_bool(out != NIL && out->tag == CLJC_INT && out->as.i == 0);
         return mk_bool(v->as.map.count == 0);
+    }
     if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
     if (v->tag == CLJC_SORTED) return mk_bool(sorted_count(v) == 0);
     cljc_error("empty?: %s is not a collection", val_type_name(v));
@@ -6216,6 +6223,19 @@ static Cljc *prim_list(CljcEnv *env, Cljc **argv, int nargs) {
 
 static Cljc *prim_first(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
+    /* sorted colls: O(log n) leftmost walk — (first sorted-map) previously
+     * materialized the WHOLE entry list, making priority-queue peek O(n). */
+    Cljc *v = argv[0];
+    if (v != NIL && v->tag == CLJC_SORTED) {
+        Cljc *node = v->as.sorted.root;
+        if (node == NIL) return NIL;
+        while (node->as.tnode.left != NIL) node = node->as.tnode.left;
+        if (v->as.sorted.is_map) {
+            Cljc *kv[2] = { node->as.tnode.key, node->as.tnode.val };
+            return mk_vector(kv, 2);
+        }
+        return node->as.tnode.key;
+    }
     Cljc *s = seq1_slot(&argv[0]);  /* advances the root: skipping into a long
                                        lazy chain (e.g. filter) stays O(1) live */
     return s == NIL ? NIL : s->as.cons.head;
@@ -11381,14 +11401,20 @@ CljcEnv *cljc_new_env(void) {
         /* peek/pop on maps: priority-map semantics — the entry with the
          * smallest value. O(n) scan; backs clojure.data.priority-map. */
         "(def cljc/peek-impl peek)\n"
+        "(defn cljc/dt-method [c name]\n"   /* deftype method lookup by tag */
+        "  (when (map? c)\n"
+        "    (when-let [t (get c :cljc/type)]\n"
+        "      (get (get @cljc/multi-tables name) t))))\n"
         "(defn peek [c]\n"
         "  (cond\n"
+        "    (cljc/dt-method c 'peek) ((cljc/dt-method c 'peek) c)\n"
         "    (map? c) (when (seq c) (apply min-key second (seq c)))\n"
         "    (cljc/queue? c) (first c)\n"            /* queue: FIFO front */
         "    :else (cljc/peek-impl c)))\n"
         "(def cljc/pop-impl pop)\n"
         "(defn pop [c]\n"
         "  (cond\n"
+        "    (cljc/dt-method c 'pop) ((cljc/dt-method c 'pop) c)\n"
         "    (map? c) (dissoc c (first (peek c)))\n"
         "    (cljc/queue? c) (with-meta (vec (rest c)) {:cljc/queue true})\n"
         "    :else (cljc/pop-impl c)))\n");

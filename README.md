@@ -183,6 +183,14 @@ parser, a host serializer): `clojure.data.xml` (StAX), `cognitect.transit`,
 big, multi-file, deftype-heavy ones — are reachable; libraries that lean on a
 specific Java library for their core work are not, until that library is ported.
 
+**Advent of Code as a stress test**: cljc runs a complete set of Clojure
+solutions for **every Advent of Code day, 2015–2025 (262 puzzles)** on real
+inputs, each producing answers verified against an independent reference
+(Python/Janet/JVM Clojure). The campaign doubled as a bug hunt — it surfaced
+(and fixed) eight interpreter bugs the test suite and fuzzers had missed,
+from a sort re-entrancy segfault to `load-file` scope leakage. (The solutions
+reference private puzzle inputs, so they live outside this repo.)
+
 ## Tooling
 
 - **Linting**: ships a `.clj-kondo/config.edn` tuned for the dialect.

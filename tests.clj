@@ -2032,4 +2032,13 @@
 (assert= [5 6] (let [{c 0 d 1} [5 6]] [c d]))            ; int-key destructure on vector
 (assert= '(1) (for [x [[1 2]] :let [{a 0} x]] a))
 
+; ── load-file evaluates top-level forms in the ROOT env ──
+; A required file defining (defn paths ...) used to resolve its own call sites
+; to require-one's `paths` let-local (the candidate-file lazy seq) instead.
+(spit "cljc-shadowtest.clj"
+      "(ns cljc-shadowtest)\n(defn paths [a b] [(str a b)])\n(def result (first (paths \"x\" \"y\")))\n")
+(require 'cljc-shadowtest)
+(assert= "xy" cljc-shadowtest/result)
+(sh "rm -f cljc-shadowtest.clj")
+
 (println "tests complete")

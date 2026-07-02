@@ -7195,13 +7195,20 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)nargs;
     const char *src = as_str(argv[0], "eval-forms");
     const char *saved_ns = cur_reader_ns;
+    /* Top-level forms evaluate in the ROOT env, not the caller's lexical
+     * scope — load-file runs inside cljc/require-one's `let`, whose locals
+     * (paths, hit, rel, ...) would otherwise shadow same-named globals in
+     * the loaded file (a file defining (defn paths ..) resolved its own
+     * call sites to require-one's candidate-list lazy seq). */
+    CljcEnv *root = env;
+    while (root->parent) root = root->parent;
     Cljc *last = NIL;
     while (*src) {
         skip_ws(&src);
         if (!*src) break;
         Cljc *form = read_form(&src);
         if (!form) break;
-        last = eval(env, form);
+        last = eval(root, form);
     }
     cur_reader_ns = saved_ns;
     return last;

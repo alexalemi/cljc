@@ -1552,6 +1552,59 @@
 (assert= :hit (let [r (cljc-a/chan 1)]
                 (cljc-a/<!! (cljc-a/go (cljc-a/>! r :hit) (first (cljc-a/alts! [r]))))))
 
+; ── futures & promises (fiber-scheduler-backed, blocking deref) ──
+; NOTE: these run BEFORE any server test — the bare-@(promise) deadlock check
+; below is only detectable while nothing is parked on an accept fd (a live
+; server means "something could still deliver", so deref rightly blocks).
+(assert= 3 @(future (+ 1 2)))
+(assert= :fast (deref (future :fast) 100 :timeout))        ; timeout arity, realized in time
+(assert= :timeout (deref (promise) 50 :timeout))           ; timeout arity, never delivered
+(assert= :timeout (deref (future (Thread/sleep 1500) :slow) 30 :timeout))
+; blocking deref of a promise delivered by a future (deref pumps the scheduler)
+(assert= :delivered (let [p (promise)]
+                      (future (Thread/sleep 20) (deliver p :delivered))
+                      @p))
+; a failed future rethrows at the deref site
+(assert= "boom" (try @(future (throw (ex-info "boom" {})))
+                     (catch Exception e (ex-message e))))
+; deref of an undeliverable promise is a deadlock error, not a hang or nil
+(assert= :deadlock (try @(promise) (catch Exception e :deadlock)))
+(assert= [false true] (let [p (promise)] [(realized? p) (do (deliver p 1) (realized? p))]))
+(assert= 1 (let [p (promise)] (deliver p 1) (deliver p 2) @p))   ; first deliver wins
+(assert= true (let [f (future 1)] @f (and (realized? f) (future-done? f) (future? f))))
+(assert= [true :cancelled] (let [f (future :never-runs)]
+                             [(future-cancel f)
+                              (try @f (catch Exception e :cancelled))]))
+(assert= false (let [f (future 1)] @f (future-cancel f)))  ; too late to cancel
+(assert= [2 4 6] (pvalues (+ 1 1) (+ 2 2) (+ 3 3)))
+; fiber-aware Thread/sleep: two 40ms futures overlap instead of serializing
+; (wall-clock bound → skipped under GC stress, per file convention)
+(when-not (cljc/env* "CLJC_GC_STRESS")
+  (assert= true (let [t0 (cljc/now-ms*)
+                      f1 (future (Thread/sleep 40) :one)
+                      f2 (future (Thread/sleep 40) :two)]
+                  (and (= :one @f1) (= :two @f2)
+                       (< (- (cljc/now-ms*) t0) 75)))))
+; one shared scheduler: csp go blocks and futures pump each other
+(assert= :from-future (let [ch (cljc-a/chan 1)]
+                        (future (cljc-a/go (cljc-a/>! ch :from-future)))
+                        (cljc-a/<!! ch)))
+(assert= :from-go (let [p (promise)]
+                    (cljc-a/go (cljc-a/<! (cljc-a/timeout 15)) (deliver p :from-go))
+                    @p))
+; clojure.core.async on the shared scheduler: sleep in a go block parks the
+; fiber (doesn't stall the loop), and @future inside a go block parks too
+(require '[clojure.core.async :as cljc-ca])
+(when-not (cljc/env* "CLJC_GC_STRESS")
+  (assert= true (let [t0 (cljc/now-ms*)
+                      c1 (cljc-ca/go (Thread/sleep 40) :a)
+                      c2 (cljc-ca/go (Thread/sleep 40) :b)]
+                  (and (= :a (cljc-ca/<!! c1)) (= :b (cljc-ca/<!! c2))
+                       (< (- (cljc/now-ms*) t0) 75)))))
+(assert= 43 (let [f (future (Thread/sleep 10) 42)]
+              (cljc-ca/<!! (cljc-ca/go (+ 1 @f)))))
+(assert= :threaded (cljc-ca/<!! (cljc-ca/thread (Thread/sleep 10) :threaded)))
+
 ; async I/O event loop: a loopback echo server + client, both go blocks, served
 ; through poll() — no blocking, one thread
 (def cljc-csp-srv (tcp/listen 8094 "127.0.0.1"))

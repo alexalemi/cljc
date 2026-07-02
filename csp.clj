@@ -11,22 +11,13 @@
 ;; Load with: (require '[csp :as a])  or  (load-file "csp.clj")
 
 ;; ── scheduler ──────────────────────────────────────────────────────────────
-;; *self* is the coroutine running the current go block; <!/>! read it to
-;; register themselves as the parked party. The scheduler binds it per resume.
-(def ^:dynamic *self* nil)
-(def ready  (atom []))     ; queue of [coro resume-value] ready to run
-(def timers (atom []))     ; vector of [deadline-ms chan]
-
-(defn schedule! [coro val] (swap! ready conj [coro val]))
-
-(defn- run-one! []         ; run one ready coro to its next park; true if any
-  (let [item (first @ready)]
-    (when item
-      (swap! ready subvec 1)
-      (let [[coro val] item]
-        (when (coro/alive? coro)
-          (binding [*self* coro] (coro/resume coro val))))
-      true)))
+;; The scheduler itself lives in the runtime (the fiber/* layer in the
+;; bootstrap): one shared ready queue + timer wheel + fd-park table that this
+;; library, clojure.core futures/promises, and Thread/sleep all pump. That
+;; sharing is the point — a main-thread (deref fut) resumes parked go blocks,
+;; and <!! drives pending futures. fiber/*self* is the coroutine running the
+;; current go block; <!/>! read it to register themselves as the parked party.
+(def schedule! fiber/schedule!)
 
 ;; ── channels ───────────────────────────────────────────────────────────────
 ;; A taker is a HANDLER {:co coro :done (atom false) :sel (atom nil)} so a
@@ -44,7 +35,7 @@
           :add (when xform
                  (xform (fn ([] []) ([b] b) ([b v] (conj b v)))))})))
 
-(defn- handler [] {:co *self* :done (atom false) :sel (atom nil)})
+(defn- handler [] {:co fiber/*self* :done (atom false) :sel (atom nil)})
 
 (defn- deliver-take! [h v ch]           ; wake a taker handler once
   (when-not @(:done h)
@@ -109,7 +100,7 @@
     (flush-buf! ch)
     (cond
       closing?                            (do (close! ch) true)
-      (> (count (:buf @ch)) (:n @ch))     (do (swap! ch update :putters conj [*self* ::xform])
+      (> (count (:buf @ch)) (:n @ch))     (do (swap! ch update :putters conj [fiber/*self* ::xform])
                                               (coro/yield nil) true)
       :else                               true)))
 
@@ -129,7 +120,7 @@
         (do (deliver-take! h v ch) true)               ; direct handoff
         (if (< (count (:buf c)) (:n c))
           (do (swap! ch update :buf conj v) true)       ; buffer
-          (do (swap! ch update :putters conj [*self* v]); park
+          (do (swap! ch update :putters conj [fiber/*self* v]); park
               (coro/yield nil) true))))))
 
 (defn close! [ch]
@@ -156,55 +147,21 @@
 (defmacro go-loop [binds & body] `(go (loop ~binds ~@body)))
 
 ;; ── timeouts ──────────────────────────────────────────────────────────────
+;; A timeout is a channel closed by the shared timer wheel at its deadline.
 (defn timeout [ms]
   (let [ch (chan)]
-    (swap! timers conj [(+ (cljc/now-ms*) ms) ch])
+    (fiber/timer! (+ (cljc/now-ms*) ms) (fn [] (close! ch)))
     ch))
 
-(defn- fire-timers! []
-  (let [now (cljc/now-ms*)
-        due (filterv (fn [[t _]] (<= t now)) @timers)]
-    (when (seq due)
-      (swap! timers (fn [ts] (vec (remove (fn [[t _]] (<= t now)) ts))))
-      (doseq [[_ ch] due] (close! ch))
-      true)))
-
-(defn- idle-till-timer! []              ; sleep until the nearest deadline
-  (when (seq @timers)
-    (let [next-t (reduce min (map first @timers))]
-      (cljc/sleep-ms* (max 0 (- next-t (cljc/now-ms*))))
-      true)))
-
 ;; ── the async I/O event loop ────────────────────────────────────────────────
-;; A goroutine parks on an fd via park-io; the scheduler's idle phase poll()s
-;; all parked fds (bounded by the nearest timer) and resumes whoever is ready.
-;; This is what turns the cooperative scheduler into a real event loop — the
-;; thing that makes non-blocking servers possible.
+;; A goroutine parks on an fd via fiber/park-io!; the scheduler's idle phase
+;; poll()s all parked fds (bounded by the nearest timer) and resumes whoever is
+;; ready. This is what turns the cooperative scheduler into a real event loop —
+;; the thing that makes non-blocking servers possible.
 (def POLLIN  1)   ; wait for readable (or peer-closed)
 (def POLLOUT 2)   ; wait for writable
-(def io-waiters (atom []))   ; vector of {:fd :ev :co}
 
-(defn- park-io [fd ev]
-  (swap! io-waiters conj {:fd fd :ev ev :co *self*})
-  (coro/yield nil))
-
-;; poll() the parked fds, bounded by the nearest timer (or block forever if
-;; only I/O is pending). Resume every goroutine whose fd is ready. Returns true
-;; if there was anything to wait on, so the driver loop keeps going.
-(defn- io-poll! []
-  (let [ws @io-waiters]
-    (when (seq ws)
-      (let [ts (seq @timers)
-            timeout (if ts (long (max 0 (- (reduce min (map first @timers)) (cljc/now-ms*)))) -1)
-            revents (cljc/poll-fds* (mapv :fd ws) (mapv :ev ws) timeout)
-            kept (atom [])]
-        (dotimes [i (count ws)]
-          (let [w (nth ws i)]
-            (if (pos? (bit-and (nth revents i) (:ev w)))
-              (schedule! (:co w) nil)
-              (swap! kept conj w))))
-        (reset! io-waiters @kept)
-        true))))
+(defn- park-io [fd ev] (fiber/park-io! fd ev))
 
 ;; Async socket ops — park until the fd is ready, then do the (now non-blocking)
 ;; operation. Use these inside go blocks instead of the raw tcp/* primitives so
@@ -228,8 +185,7 @@
 
 ;; ── drivers ─────────────────────────────────────────────────────────────────
 (defn run! []                           ; pump until everything is idle
-  (loop [] (cond (run-one!) (recur) (fire-timers!) (recur)
-                 (io-poll!) (recur) (idle-till-timer!) (recur) :else nil)))
+  (loop [] (when (fiber/pump!) (recur))))
 
 ;; <!! — BLOCKING take from outside a go (pumps the scheduler). cljc's bonus
 ;; over JS core.async. Throws on deadlock.
@@ -237,10 +193,7 @@
   (loop []
     (let [[hit v] (take-ready! ch)]
       (cond hit v
-            (run-one!) (recur)
-            (fire-timers!) (recur)
-            (io-poll!) (recur)
-            (idle-till-timer!) (recur)
+            (fiber/pump!) (recur)
             :else (throw (ex-info "<!!: deadlock — no runnable work" {}))))))
 
 ;; ── alts! (take-only) ──────────────────────────────────────────────────────

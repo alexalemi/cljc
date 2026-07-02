@@ -6,49 +6,31 @@
   (:refer-clojure :exclude [reduce transduce into merge map take partition partition-by]))
 
 ;; ── scheduler ───────────────────────────────────────────────────────────
-(def ^:private run-q (atom []))           ; queue of 0-arg thunks
-(def ^:private timers (atom []))          ; vector of [deadline-ms thunk]
-(def ^:private current-coro (atom nil))   ; the go-coroutine currently running
+;; Backed by the runtime's shared fiber layer (fiber/ready, fiber/timers,
+;; fiber/io-waiters — the same queue that runs clojure.core futures/promises,
+;; Thread/sleep and csp.clj). Sharing one scheduler means a blocking <!! also
+;; drives pending futures, a main-thread (deref fut) also resumes parked go
+;; blocks, and Thread/sleep or @promise INSIDE a go block parks the fiber
+;; instead of stalling the whole loop. The go-coroutine currently running is
+;; fiber/*self* (bound by fiber/schedule! around every resume).
 (def ^:private pumping (atom false))
 
-(defn- dispatch! [thunk] (swap! run-q conj thunk))
-
-(defn- pop-run! []
-  (let [q @run-q]
-    (when (seq q)
-      (reset! run-q (subvec q 1))
-      (nth q 0))))
+(defn- dispatch! [thunk] (fiber/dispatch! thunk))
 
 (defn- run-loop! [done? block?]
   (loop []
     (when-not (and done? (done?))
-      (if-let [th (pop-run!)]
-        (do (th) (recur))
-        (let [now (cljc/now-ms*)
-              ts  @timers
-              due (filterv (fn [t] (<= (nth t 0) now)) ts)]
-          (cond
-            (seq due)
-            (do (reset! timers (filterv (fn [t] (> (nth t 0) now)) ts))
-                (doseq [t due] ((nth t 1)))
-                (recur))
-            (and block? (seq ts) (or (nil? done?) (not (done?))))
-            (do (cljc/sleep-ms* (max 0 (- (apply min (clojure.core/map first ts)) now)))
-                (recur))
-            :else nil))))))
+      (cond
+        (fiber/run-one!)     (recur)
+        (fiber/fire-timers!) (recur)
+        (and block? (or (fiber/io-poll!) (fiber/idle!))) (recur)
+        :else nil))))
 
 (defn- pump! []
   (when-not @pumping
     (reset! pumping true)
     (run-loop! nil false)
     (reset! pumping false)))
-
-;; resume a parked go-coroutine with a value, tracking the current coro
-(defn- resume! [co v]
-  (let [prev @current-coro]
-    (reset! current-coro co)
-    (coro/resume co v)
-    (reset! current-coro prev)))
 
 ;; ── buffers ─────────────────────────────────────────────────────────────
 (defn buffer [n]          (atom {:items [] :n n :type :fixed}))
@@ -123,13 +105,13 @@
 
 ;; ── go / parking ops ─────────────────────────────────────────────────────
 (defn <! [ch]
-  (let [co @current-coro
-        box (do-take ch (fn [v] (dispatch! (fn [] (resume! co v)))))]
+  (let [co fiber/*self*
+        box (do-take ch (fn [v] (fiber/schedule! co v)))]
     (if box (first box) (coro/yield))))
 
 (defn >! [ch v]
-  (let [co @current-coro
-        box (do-put ch v (fn [ok] (dispatch! (fn [] (resume! co ok)))))]
+  (let [co fiber/*self*
+        box (do-put ch v (fn [ok] (fiber/schedule! co ok)))]
     (if box (first box) (coro/yield))))
 
 (defn go-call [thunk]
@@ -138,7 +120,7 @@
                        (let [r (thunk)]
                          (when (some? r) (do-put c r (fn [_])))
                          (close! c))))]
-    (dispatch! (fn [] (resume! co nil)))
+    (fiber/schedule! co nil)
     (pump!)
     c))
 
@@ -180,10 +162,9 @@
       nil)))
 
 ;; ── timeout ────────────────────────────────────────────────────────────
-(def ^:private timeout-chans (atom {}))
 (defn timeout [ms]
   (let [c (chan)]
-    (swap! timers conj [(+ (cljc/now-ms*) ms) (fn [] (close! c))])
+    (fiber/timer! (+ (cljc/now-ms*) ms) (fn [] (close! c)))
     c))
 
 ;; ── alts! : first ready op wins (a shared one-shot flag) ──────────────────
@@ -195,14 +176,14 @@
       (let [p (first ps)
             [ch v put?] (if (vector? p) [(nth p 0) (nth p 1) true] [p nil false])
             cb (fn [r] (when (compare-and-set! flag false true)
-                         (dispatch! (fn [] (resume! co [(if put? r r) ch])))))
+                         (fiber/schedule! co [r ch])))
             box (if put? (do-put ch v cb) (do-take ch cb))]
         (if box
           (when (compare-and-set! flag false true) [(first box) ch])
           (recur (rest ps)))))))
 
 (defn alts! [ports & {:as opts}]
-  (let [co   @current-coro
+  (let [co   fiber/*self*
         flag (atom false)
         r    (alt-op ports flag co)]
     (cond
@@ -226,8 +207,15 @@
         (do (run-loop! (fn [] (not= ::none @res)) true) @res))))
 
 ;; ── misc helpers commonly used ────────────────────────────────────────────
+;; thread-call: a "thread" is a fiber here — f runs concurrently with the
+;; caller (it may park), its result lands on the returned channel.
 (defn thread-call [f]
-  (let [c (chan 1) r (f)] (when (some? r) (do-put c r (fn [_]))) (close! c) c))
+  (let [c (chan 1)]
+    (fiber/spawn! (fn []
+                    (let [r (f)]
+                      (when (some? r) (do-put c r (fn [_])))
+                      (close! c))))
+    c))
 (defmacro thread [& body] `(thread-call (fn [] ~@body)))
 
 (defn pipe

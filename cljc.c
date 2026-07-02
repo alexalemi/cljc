@@ -7843,7 +7843,6 @@ static Cljc *prim_atom(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)nargs;
     Cljc *v = argv[0];
     if (v != NIL && v->tag == CLJC_ATOM) return v->as.atom.value;
     if (v != NIL && v->tag == CLJC_VAR) {     /* deref a Var -> its current value */
@@ -7871,6 +7870,12 @@ static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
     }
     /* a deftype implementing deref/IDeref (e.g. SCI's Var) */
     Cljc *out;
+    /* (deref x timeout-ms timeout-val) — blocking refs (promise/future) carry
+     * a cljc/deref-timeout method; anything else falls through to plain deref
+     * (an atom's value is always "already delivered"). */
+    if (nargs >= 3 &&
+        dispatch_deftype_method(env, v, "cljc/deref-timeout", argv + 1, 2, &out))
+        return out;
     if (dispatch_deftype_method(env, v, "deref", NULL, 0, &out)) return out;
     /* a scalar is clearly not derefable: surface the mistake rather than
      * silently returning it (which becomes a cryptic error downstream). */
@@ -10382,7 +10387,7 @@ static const char *PRELUDE =
     "(defn integer? [x] (or (int? x) (bigint? x)))\n"
     "(defn ratio? [x] (= (type x) :ratio))\n"
     "(defn rational? [x] (or (integer? x) (ratio? x)))\n"
-    "(defn volatile? [x] (= :atom (type x))) (defn realized? [_] true)\n"
+    "(defn volatile? [x] (= :atom (type x)))\n"   /* realized?: Tier 3.5 */
     "(defn inst? [_] false) (defn uri? [_] false) (defn uuid? [_] false)\n"
     "(defn object? [x] (some? x)) (defn special-symbol? [_] false)\n"
     "(defn bytes? [_] false) (defn array? [_] false) (defn chunked-seq? [_] false)\n"
@@ -10420,7 +10425,8 @@ static const char *PRELUDE =
     "(defn rseq [v] (seq (reverse v))) (defn supers [_] #{})\n"
     "(defn munge [x] x) (defn namespace-munge [x] (str x))\n"
     "(defn add-watch [r _ _] r) (defn remove-watch [r _] r)\n"
-    "(defn promise [] (atom nil)) (defn deliver [p v] (reset! p v) p)\n"
+    /* promise/deliver/future are real (fiber-scheduler-backed, blocking deref)
+       — defined in Tier 3.5 after deftype exists. */
     "(defn line-seq [rdr] (seq (str/split-lines (str rdr))))\n"
     "(defn iterator-seq [x] (seq x)) (defn enumeration-seq [x] (seq x))\n"
     "(defn array-seq [x] (seq x)) (defn xml-seq [x] (seq x))\n"
@@ -11872,6 +11878,170 @@ CljcEnv *cljc_new_env(void) {
         "                                    (cons 'fn (cons (vec (second m)) (drop 2 m))))) ms)\n"
         "        inst (list 'hash-map :cljc/type t :cljc/impls (cons 'hash-map impls))]\n"
         "    (concat (list 'do) regs (list inst))))\n");
+    /* Tier 3.5: the fiber scheduler + Clojure's blocking concurrency API.
+     * One shared cooperative scheduler (ready queue of thunks, timer wheel,
+     * fd-park table) that futures, promises, Thread/sleep, csp.clj and
+     * clojure.core.async all pump — so a main-thread (deref fut) runs parked
+     * go blocks and a <!! runs pending futures. Janet's ev/ model: blocking
+     * ops park the current fiber when inside one, and drive the loop when on
+     * the main thread. Defined after deftype (promise/future are deftypes). */
+    cljc_eval_string(e,
+        "(def ^:dynamic fiber/*self* nil)\n"   /* coroutine currently running */
+        "(def fiber/ready (atom []))\n"        /* queue of ready 0-arg thunks */
+        "(def fiber/timers (atom []))\n"       /* vector of [deadline-ms wake-fn] */
+        "(def fiber/io-waiters (atom []))\n"   /* vector of {:fd :ev :co} */
+        "(defn fiber/dispatch! [thunk] (swap! fiber/ready conj thunk) nil)\n"
+        "(defn fiber/schedule! [co v]\n"
+        "  (fiber/dispatch!\n"
+        "    (fn [] (when (coro/alive? co)\n"
+        "             (binding [fiber/*self* co] (coro/resume co v))))))\n"
+        "(defn fiber/spawn! [thunk] (let [co (coro/new thunk)] (fiber/schedule! co nil) co))\n"
+        "(defn fiber/timer! [deadline wake] (swap! fiber/timers conj [deadline wake]) nil)\n"
+        "(defn fiber/run-one! []\n"
+        "  (let [q (deref fiber/ready)]\n"
+        "    (when (seq q)\n"
+        "      (swap! fiber/ready subvec 1)\n"
+        "      ((nth q 0))\n"
+        "      true)))\n"
+        "(defn fiber/fire-timers! []\n"
+        "  (let [now (cljc/now-ms*)\n"
+        "        due (filterv (fn [t] (<= (first t) now)) (deref fiber/timers))]\n"
+        "    (when (seq due)\n"
+        "      (swap! fiber/timers (fn [ts] (filterv (fn [t] (> (first t) now)) ts)))\n"
+        "      (doseq [t due] ((second t)))\n"
+        "      true)))\n"
+        "(defn fiber/next-deadline []\n"
+        "  (let [ts (deref fiber/timers)] (when (seq ts) (reduce min (map first ts)))))\n"
+        /* poll the parked fds, bounded by the nearest timer (block forever if
+           only I/O is pending); wake every fiber whose fd is ready. */
+        "(defn fiber/io-poll! []\n"
+        "  (let [ws (deref fiber/io-waiters)]\n"
+        "    (when (seq ws)\n"
+        "      (let [nd (fiber/next-deadline)\n"
+        "            tmo (if nd (long (max 0 (- nd (cljc/now-ms*)))) -1)\n"
+        "            revents (cljc/poll-fds* (mapv :fd ws) (mapv :ev ws) tmo)\n"
+        "            kept (atom [])]\n"
+        "        (dotimes [i (count ws)]\n"
+        "          (let [w (nth ws i)]\n"
+        "            (if (pos? (bit-and (nth revents i) (:ev w)))\n"
+        "              (fiber/schedule! (:co w) nil)\n"
+        "              (swap! kept conj w))))\n"
+        "        (reset! fiber/io-waiters (deref kept))\n"
+        "        true))))\n"
+        "(defn fiber/park-io! [fd ev]\n"
+        "  (swap! fiber/io-waiters conj {:fd fd :ev ev :co fiber/*self*})\n"
+        "  (coro/yield nil))\n"
+        "(defn fiber/idle! []\n"               /* nothing runnable: sleep till nearest timer */
+        "  (when-let [nd (fiber/next-deadline)]\n"
+        "    (cljc/sleep-ms* (max 0 (- nd (cljc/now-ms*))))\n"
+        "    true))\n"
+        /* one scheduler step; false only when NOTHING can ever make progress */
+        "(defn fiber/pump! []\n"
+        "  (or (fiber/run-one!) (fiber/fire-timers!) (fiber/io-poll!) (fiber/idle!) false))\n"
+        "(defn fiber/sleep! [ms]\n"            /* park the current fiber for ms */
+        "  (let [self fiber/*self*]\n"
+        "    (fiber/timer! (+ (cljc/now-ms*) ms) (fn [] (fiber/schedule! self nil)))\n"
+        "    (coro/yield nil)))\n"
+        /* one-shot wake for the current fiber: registered with several sources
+           (a promise's waiter list AND a timeout timer) — first to fire wins */
+        "(defn fiber/waker []\n"
+        "  (let [done (atom false) self fiber/*self*]\n"
+        "    (fn [] (when-not (deref done) (reset! done true) (fiber/schedule! self nil)))))\n"
+        /* ── pending cells: the shared engine under promise and future ── */
+        "(defn cljc/pending* [] (atom {:realized false :val nil :err nil :waiters []}))\n"
+        "(defn cljc/pending-realize! [state v err]\n"
+        "  (let [s (deref state)]\n"
+        "    (when-not (:realized s)\n"
+        "      (swap! state assoc :realized true :val v :err err :waiters [])\n"
+        "      (doseq [w (:waiters s)] (w))\n"
+        "      true)))\n"
+        /* blocking deref: in a fiber, park on the waiter list; on the main
+           thread, drive the scheduler until delivered (or provably stuck). */
+        "(defn cljc/pending-await [state what]\n"
+        "  (loop []\n"
+        "    (let [s (deref state)]\n"
+        "      (cond\n"
+        "        (:realized s) (if (:err s) (throw (:err s)) (:val s))\n"
+        "        fiber/*self* (do (swap! state update :waiters conj (fiber/waker))\n"
+        "                         (coro/yield nil) (recur))\n"
+        "        (fiber/pump!) (recur)\n"
+        "        :else (throw (ex-info (str \"deref: deadlock - nothing can deliver this \" what) {}))))))\n"
+        "(defn cljc/pending-await-tmo [state ms tval]\n"
+        "  (let [deadline (+ (cljc/now-ms*) ms)]\n"
+        "    (if fiber/*self*\n"
+        "      (loop [armed false]\n"
+        "        (let [s (deref state)]\n"
+        "          (cond\n"
+        "            (:realized s) (if (:err s) (throw (:err s)) (:val s))\n"
+        "            (or armed (>= (cljc/now-ms*) deadline)) tval\n"
+        "            :else (let [w (fiber/waker)]\n"
+        "                    (swap! state update :waiters conj w)\n"
+        "                    (fiber/timer! deadline w)\n"
+        "                    (coro/yield nil)\n"
+        "                    (recur true)))))\n"
+        "      (do (fiber/timer! deadline (fn [] nil))\n"   /* bound the idle sleep */
+        "          (loop []\n"
+        "            (let [s (deref state)]\n"
+        "              (cond\n"
+        "                (:realized s) (if (:err s) (throw (:err s)) (:val s))\n"
+        "                (>= (cljc/now-ms*) deadline) tval\n"
+        "                :else (do (fiber/pump!) (recur)))))))))\n"
+        /* ── promise / future (Clojure API, cooperative semantics) ── */
+        "(deftype CljcPromise [state]\n"
+        "  clojure.lang.IDeref\n"
+        "  (deref [_] (cljc/pending-await state \"promise\"))\n"
+        "  (cljc/deref-timeout [_ ms tval] (cljc/pending-await-tmo state ms tval)))\n"
+        "(defn promise [] (CljcPromise. (cljc/pending*)))\n"
+        "(defn deliver [p v]\n"
+        "  (if (and (map? p) (= :CljcPromise (:cljc/type p)))\n"
+        "    (when (cljc/pending-realize! (:state p) v nil) p)\n"   /* nil if already delivered */
+        "    (do (reset! p v) p)))\n"                               /* legacy atom-as-promise */
+        "(deftype CljcFuture [state]\n"
+        "  clojure.lang.IDeref\n"
+        "  (deref [_] (cljc/pending-await state \"future\"))\n"
+        "  (cljc/deref-timeout [_ ms tval] (cljc/pending-await-tmo state ms tval)))\n"
+        "(defn future-call [f]\n"
+        "  (let [state (cljc/pending*)]\n"
+        "    (fiber/spawn!\n"
+        "      (fn []\n"
+        "        (if (:cancelled (deref state))\n"
+        "          (cljc/pending-realize! state nil (ex-info \"future cancelled\" {:cljc/cancelled true}))\n"
+        "          (do (swap! state assoc :started true)\n"
+        "              (try (cljc/pending-realize! state (f) nil)\n"
+        "                   (catch Exception e (cljc/pending-realize! state nil e)))))))\n"
+        "    (CljcFuture. state)))\n"
+        "(defmacro future [& body] `(future-call (fn [] ~@body)))\n"
+        "(defn future? [x] (and (map? x) (= :CljcFuture (:cljc/type x))))\n"
+        "(defn future-done? [fut]\n"
+        "  (let [s (deref (:state fut))] (boolean (or (:realized s) (:cancelled s)))))\n"
+        /* cancel only wins before the fiber first runs — a running fiber is
+           cooperative and cannot be interrupted */
+        "(defn future-cancel [fut]\n"
+        "  (let [s (deref (:state fut))]\n"
+        "    (if (or (:realized s) (:started s) (:cancelled s))\n"
+        "      false\n"
+        "      (do (swap! (:state fut) assoc :cancelled true) true))))\n"
+        "(defn future-cancelled? [fut] (boolean (:cancelled (deref (:state fut)))))\n"
+        "(defn pcalls [& fns] (map deref (mapv future-call fns)))\n"
+        "(defmacro pvalues [& exprs] `(pcalls ~@(map (fn [e] `(fn [] ~e)) exprs)))\n"
+        "(defn realized? [x]\n"
+        "  (if (and (map? x) (contains? x :cljc/type))\n"
+        "    (cond\n"
+        "      (= :CljcPromise (:cljc/type x)) (:realized (deref (:state x)))\n"
+        "      (= :CljcFuture  (:cljc/type x)) (:realized (deref (:state x)))\n"
+        "      (= :CljcDelay   (:cljc/type x)) (nil? (deref (:f x)))\n"
+        "      :else true)\n"
+        "    true))\n"
+        /* Thread/sleep, fiber-aware (shadows the PRELUDE stub): in a fiber,
+           park on the timer wheel; on the main thread, keep background fibers
+           running while waiting out the deadline. */
+        "(defn Thread/sleep [ms & _]\n"
+        "  (if fiber/*self*\n"
+        "    (fiber/sleep! ms)\n"
+        "    (let [deadline (+ (cljc/now-ms*) ms)]\n"
+        "      (fiber/timer! deadline (fn [] nil))\n"
+        "      (loop [] (when (< (cljc/now-ms*) deadline) (fiber/pump!) (recur)))))\n"
+        "  nil)\n");
     /* FFI glue generator — declare C signatures as data, compile, load:
      * (ffi/define [[:double cos [:double]] [:int getpid []]]
      *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */

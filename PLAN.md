@@ -821,6 +821,41 @@ required by conservative stack scanning, same as Boehm GC).
     stable for the root_cache). Suite + vendored-namespace smoke (26/26) +
     AoC 16-file sample clean.
 
+46. ~~Tier-1 concurrency: shared fiber scheduler + real future/promise~~
+    ✅ done 2026-07-02 — the Janet ev/ model completed. New bootstrap
+    Tier 3.5 (after deftype): a runtime-owned cooperative scheduler —
+    fiber/ready (thunk queue), fiber/timers ([deadline wake-fn] wheel),
+    fiber/io-waiters (fd park table), fiber/pump! (one step: ready →
+    due timers → poll(2) bounded by nearest deadline → idle) — that
+    clojure.core, csp.clj and vendor core.async ALL share; fiber/*self*
+    is the running coroutine (bound around every resume). On it:
+    (a) promise/deliver and future/future-call as deftypes (CljcPromise/
+    CljcFuture) whose deref BLOCKS correctly — parks the fiber when
+    inside one, drives the scheduler on the main thread, throws a
+    deadlock ex-info when provably stuck (old shim returned nil from an
+    undelivered promise!). A failed future stores the error and rethrows
+    at deref. (b) (deref x ms tval) timeout arity: prim_deref dispatches
+    a cljc/deref-timeout deftype method when nargs>=3 (@atom hot path
+    untouched). (c) Thread/sleep is fiber-aware: parks on the timer
+    wheel inside a fiber (two sleeping futures/go blocks overlap), pumps
+    background fibers while waiting on the main thread. (d) realized?/
+    future-done?/future-cancel (wins only before first run — cooperative)
+    /future-cancelled?/future?/pcalls/pvalues. (e) csp.clj + vendored
+    clojure.core.async rebased onto the shared layer (their private
+    schedulers deleted; core.async's current-coro atom replaced by
+    fiber/*self*, so Thread/sleep and @future inside its go blocks park
+    instead of stalling the loop; a/thread is now a concurrent fiber,
+    not inline execution). Cross-pump regression tests: <!! runs pending
+    futures, main-thread @promise resumes parked go blocks. GOTCHA
+    (correct but easy to trip): the bare-@(promise) deadlock error can
+    only fire when io-waiters is empty — a live server parked on an
+    accept fd means "something could still deliver", so deref blocks
+    (real Clojure semantics); the tests.clj concurrency block therefore
+    runs BEFORE any server test. pmap deliberately stays = map (fibers
+    give no CPU parallelism; eager future-spawning would break lazy
+    bigness). Tier 2 (if ever wanted): isolated worker OS threads with
+    per-thread heaps + copying channels, Janet ev/thread-style.
+
 ## Known divergences from Clojure (deliberate)
 - `catch` is untyped; hash maps/sets iterate in hash order; plain int64
   arithmetic wraps (see README's list — it supersedes this one)

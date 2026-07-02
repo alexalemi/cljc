@@ -112,6 +112,7 @@ typedef enum {
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
     CLJC_CHUNK,     /* internal: compiled bytecode for one fn arity body */
     CLJC_CORO,      /* stackful coroutine (coro/new): own C stack + vstack segment */
+    CLJC_IARRAY,    /* mutable flat int64 array: (int-array n) — no per-element boxing */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
     CLJC_EMPTY,     /* the empty list () — a distinct singleton: truthy, seq?/list?
                      * true, (= () nil) false, but seq/to_seq of it is NIL so the
@@ -198,6 +199,8 @@ struct Cljc {
         struct { uint32_t *code; Cljc **consts;
                  uint32_t ncode; uint16_t nconst; } chunk;
         struct Coro *coro;   /* CLJC_CORO: heap-allocated coroutine state */
+        /* CLJC_IARRAY: cell-owned flat buffer (freed on sweep); no GC children */
+        struct { int64_t *data; uint32_t n; } iarr;
     } as;
 };
 
@@ -425,6 +428,7 @@ static const char *val_type_name(Cljc *v) {
         case CLJC_ATOM:    return "an atom";
         case CLJC_VAR:     return "a var";
         case CLJC_CORO:    return "a coroutine";
+        case CLJC_IARRAY:  return "an int-array";
         default:           return "a value";
     }
 }
@@ -1045,6 +1049,7 @@ static void gc_collect(void) {
             if (c->tag != CLJC_FREE) {
                 switch (c->tag) {
                     case CLJC_STRING: free(c->as.str); break;
+                    case CLJC_IARRAY: free(c->as.iarr.data); break;
                     case CLJC_BIGINT: free(c->as.big.mag); break;
                     case CLJC_CHUNK:
                         free(c->as.chunk.code);
@@ -1744,6 +1749,11 @@ static Cljc *prim_persistent_bang(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     if (argv[0] != NIL && (argv[0]->tag == CLJC_MAP || argv[0]->tag == CLJC_SET))
         return argv[0];                       /* shim passthrough */
+    if (argv[0] != NIL && argv[0]->tag == CLJC_IARRAY) {   /* array -> vector copy */
+        Cljc *arr = argv[0], *v = mk_empty_vec();
+        for (uint32_t i = 0; i < arr->as.iarr.n; i++) v = vec_conj1(v, mk_int(arr->as.iarr.data[i]));
+        return v;
+    }
     Cljc *t = as_tvec(argv[0], "persistent!");
     t->as.vec.alive = false;            /* invalidate further edits */
     Cljc *nv = vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
@@ -1803,7 +1813,16 @@ static Cljc *prim_conj_bang(CljcEnv *env, Cljc **argv, int nargs) {
     return t;
 }
 
+static int64_t as_int(Cljc *v, const char *what);
 static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
+    if (argv[0] != NIL && argv[0]->tag == CLJC_IARRAY) {
+        Cljc *arr = argv[0];
+        int64_t i = as_int(argv[1], "assoc!");
+        if (i < 0 || (uint32_t)i >= arr->as.iarr.n)
+            cljc_error("assoc!: index %lld out of bounds for length %u", (long long)i, arr->as.iarr.n);
+        arr->as.iarr.data[i] = as_int(argv[2], "assoc!");
+        return arr;
+    }
     (void)env; (void)nargs;
     if (argv[0] != NIL && argv[0]->tag == CLJC_MAP)
         return prim_assoc(env, argv, nargs);  /* shim: persistent assoc */
@@ -3770,6 +3789,12 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
         if (sorted_get(env, fn, a0, &out)) return out;
         return a1;
     }
+    if (fn->tag == CLJC_IARRAY) {
+        if (a0 == NIL || a0->tag != CLJC_INT || a0->as.i < 0 ||
+            (uint32_t)a0->as.i >= fn->as.iarr.n)
+            cljc_error("int-array lookup: bad index");
+        return mk_int(fn->as.iarr.data[a0->as.i]);
+    }
     if (fn->tag == CLJC_VECTOR || fn->tag == CLJC_TVEC) {  /* transients too */
         if (a0->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
         if (a0->as.i < 0 || (size_t)a0->as.i >= vec_len(fn))
@@ -4018,7 +4043,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL: case CLJC_EMPTY:
         case CLJC_BIGINT: case CLJC_RATIO: case CLJC_VAR:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
-        case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO:
+        case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO: case CLJC_IARRAY:
         case CLJC_SORTED:  /* a constructed sorted coll has no reader literal */
         case CLJC_TNODE:   /* internal sorted-tree node; self-evaluates if it leaks */
         case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
@@ -4759,6 +4784,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_EMPTY: sb_puts(sb, "()"); break;
         case CLJC_BOOL: sb_puts(sb, v->as.b ? "true" : "false"); break;
         case CLJC_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
+        case CLJC_IARRAY: sb_printf(sb, "#<int-array %u>", v->as.iarr.n); break;
         case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); if (readably) sb_putc(sb, 'N'); free(s); } break;
         case CLJC_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
             sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
@@ -5716,6 +5742,8 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
     }
     if (tag == CLJC_VECTOR || tag == CLJC_TVEC)
         return mk_int((int64_t)vec_len(argv[0]));
+    if (tag == CLJC_IARRAY)
+        return mk_int((int64_t)argv[0]->as.iarr.n);
     if (tag == CLJC_MAP || tag == CLJC_SET)
         return mk_int((int64_t)argv[0]->as.map.count);
     if (tag == CLJC_SORTED)
@@ -5743,6 +5771,11 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
             if (not_found) return not_found;
             cljc_error("nth: index %lld out of bounds", (long long)orig_idx);
         }
+    }
+    if (coll && coll->tag == CLJC_IARRAY) {
+        if (n >= 0 && (uint32_t)n < coll->as.iarr.n) return mk_int(coll->as.iarr.data[n]);
+        if (not_found) return not_found;
+        cljc_error("nth: index %lld out of bounds for length %u", (long long)orig_idx, coll->as.iarr.n);
     }
     if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
@@ -5950,6 +5983,74 @@ static Cljc *prim_hash_map(CljcEnv *env, Cljc **argv, int nargs) {
     return m;
 }
 
+/* ── primitive int64 arrays ──
+ * Flat cell-owned buffer: 8 bytes/element vs ~160 for the old transient-vector
+ * shim; aget/aset are O(1) loads/stores with no allocation (beyond the
+ * smallint cache covering most aget results). */
+static Cljc *mk_iarray(uint32_t n) {
+    Cljc *a = alloc(CLJC_IARRAY);
+    a->as.iarr.n = n;
+    a->as.iarr.data = xmalloc(sizeof(int64_t) * (n ? n : 1));
+    memset(a->as.iarr.data, 0, sizeof(int64_t) * (n ? n : 1));
+    gc_extra_bytes += sizeof(int64_t) * (n ? n : 1);
+    return a;
+}
+
+static Cljc *prim_int_array(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    Cljc *a0 = argv[0];
+    if (a0 != NIL && a0->tag == CLJC_INT) {           /* (int-array n) / (int-array n init) */
+        if (a0->as.i < 0) cljc_error("int-array: negative size");
+        Cljc *arr = mk_iarray((uint32_t)a0->as.i);
+        if (nargs > 1) {
+            int64_t init = as_int(argv[1], "int-array");
+            for (uint32_t i = 0; i < arr->as.iarr.n; i++) arr->as.iarr.data[i] = init;
+        }
+        return arr;
+    }
+    Cljc *s = to_seq(a0);                             /* (int-array coll) */
+    size_t n = list_len(s);
+    Cljc *arr = mk_iarray((uint32_t)n);
+    size_t i = 0;
+    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+        arr->as.iarr.data[i++] = as_int(l->as.cons.head, "int-array");
+    return arr;
+}
+
+static Cljc *prim_aget(CljcEnv *env, Cljc **argv, int nargs) {
+    Cljc *a = argv[0];
+    if (a != NIL && a->tag == CLJC_IARRAY) {
+        int64_t i = as_int(argv[1], "aget");
+        if (i < 0 || (uint32_t)i >= a->as.iarr.n)
+            cljc_error("aget: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
+        return mk_int(a->as.iarr.data[i]);
+    }
+    /* legacy path: transient vectors / vectors behave as arrays */
+    Cljc *two[2] = {a, argv[1]};
+    return prim_nth(env, two, 2);
+}
+
+static Cljc *prim_aset(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)nargs;
+    Cljc *a = argv[0];
+    if (a != NIL && a->tag == CLJC_IARRAY) {
+        int64_t i = as_int(argv[1], "aset");
+        if (i < 0 || (uint32_t)i >= a->as.iarr.n)
+            cljc_error("aset: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
+        a->as.iarr.data[i] = as_int(argv[2], "aset");
+        return argv[2];
+    }
+    Cljc *r = prim_assoc_bang(env, argv, 3);          /* legacy transient path */
+    (void)r;
+    return argv[2];
+}
+
+static Cljc *prim_alength(CljcEnv *env, Cljc **argv, int nargs) {
+    Cljc *a = argv[0];
+    if (a != NIL && a->tag == CLJC_IARRAY) return mk_int((int64_t)a->as.iarr.n);
+    return prim_count(env, argv, nargs);
+}
+
 static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *coll = argv[0];
     Cljc *k = argv[1];
@@ -5967,6 +6068,9 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
     } else if (coll != NIL && coll->tag == CLJC_SORTED) {
         Cljc *out;
         if (sorted_get(env, coll, k, &out)) return out;
+    } else if (coll != NIL && coll->tag == CLJC_IARRAY && k->tag == CLJC_INT) {
+        if (k->as.i >= 0 && (uint32_t)k->as.i < coll->as.iarr.n)
+            return mk_int(coll->as.iarr.data[k->as.i]);
     } else if (coll != NIL && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)
                && k->tag == CLJC_INT) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
@@ -6214,6 +6318,14 @@ static Cljc *to_seq(Cljc *v) {
         Cljc *out = NIL, **t = &out;
         for (size_t i = 0; i < vec_len(v); i++) {
             *t = mk_cons(vec_nth(v, i), NIL);
+            t = &(*t)->as.cons.tail;
+        }
+        return out;
+    }
+    if (v->tag == CLJC_IARRAY) {
+        Cljc *out = NIL, **t = &out;
+        for (uint32_t i = 0; i < v->as.iarr.n; i++) {
+            *t = mk_cons(mk_int(v->as.iarr.data[i]), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
@@ -10175,11 +10287,8 @@ static const char *PRELUDE =
     "(defn IllegalStateException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
     "(defn UnsupportedOperationException. [msg] (ex-info (str msg) {}))\n"
     /* mutable arrays, as transient vectors (assoc! mutates in place) */
-    "(defn int-array\n"
-    "  ([x] (transient (vec (if (int? x) (repeat x 0) x))))\n"
-    "  ([n v] (transient (vec (repeat n v)))))\n"
-    "(def byte-array int-array)\n"
-    "(def long-array int-array)\n"
+    /* int-array/long-array/byte-array are C natives (flat int64 buffers) */
+
     /* Object arrays default to nil (not 0 like int arrays) — DataScript relies on
        (when-some [x (aget arr i)] ..) skipping unfilled slots. */
     "(defn object-array [x] (transient (vec (if (int? x) (repeat x nil) x))))\n"
@@ -10192,9 +10301,8 @@ static const char *PRELUDE =
     "(defn HashMap. ([] (atom {})) ([_] (atom {})) ([_ _] (atom {})))\n"
     "(defn .putAll [hm m] (swap! hm merge m) hm)\n"
     "(defn .put [hm k v] (swap! hm assoc k v) v)\n"
-    "(defn aget [a i] (a i))\n"
-    "(defn aset [a i v] (assoc! a i v) v)\n"
-    "(defn alength [a] (count a))\n"
+    /* aget/aset/alength are C natives (IARRAY fast path, legacy fallback) */
+
     /* remaining array constructors / ops as transient (mutable) arrays */
     "(def double-array int-array) (def float-array int-array) (def short-array int-array)\n"
     "(def char-array int-array) (def boolean-array int-array)\n"
@@ -10716,6 +10824,12 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cons",    prim_cons);
     cljc_define_native(e, "conj",    prim_conj);
     cljc_define_native(e, "count",   prim_count);
+    cljc_define_native(e, "int-array",  prim_int_array);
+    cljc_define_native(e, "long-array", prim_int_array);
+    cljc_define_native(e, "byte-array", prim_int_array);
+    cljc_define_native(e, "aget",    prim_aget);
+    cljc_define_native(e, "aset",    prim_aset);
+    cljc_define_native(e, "alength", prim_alength);
     cljc_define_native(e, "nth",     prim_nth);
     cljc_define_native(e, "vector",  prim_vector);
     cljc_define_native(e, "apply",   prim_apply);

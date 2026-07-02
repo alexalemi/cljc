@@ -12138,10 +12138,14 @@ CljcEnv *cljc_new_env(void) {
         "       \" } CljcFfiApi;\\n\"\n"
         "       \"static CljcFfiApi *api;\\n\"))\n"
         "(defn cljc/ffi-build [code libs]\n"
-        "  (let [base (str \"/tmp/cljc-ffi4-\" (Math/abs (hash (str code libs))))]\n"
+        ";; CLJC_CC (same env var bundle.clj honors) overrides the glue compiler —\n"
+        ";; needed e.g. under Rosetta, where plain cc emits the wrong architecture.\n"
+        ";; It participates in the cache key so two arches can't share a module.\n"
+        "  (let [cc (or (cljc/env* \"CLJC_CC\") \"cc\")\n"
+        "        base (str \"/tmp/cljc-ffi4-\" (Math/abs (hash (str code libs cc))))]\n"
         "    (when-not (zero? (:exit (sh (str \"test -f \" base \".so\"))))\n"
         "      (spit (str base \".c\") code)\n"
-        "      (let [r (sh (str \"cc -shared -fPIC -O2 -o \" base \".so \" base \".c \" libs))]\n"
+        "      (let [r (sh (str cc \" -shared -fPIC -O2 -o \" base \".so \" base \".c \" libs))]\n"
         "        (when-not (zero? (:exit r))\n"
         "          (throw (ex-info (str \"ffi: compile failed:\\n\" (:out r)) {})))))\n"
         "    (ffi-load* (str base \".so\"))))\n"
@@ -13046,6 +13050,13 @@ int main(int argc, char **argv) {
         if (want > rl.rlim_cur) { rl.rlim_cur = want; setrlimit(RLIMIT_STACK, &rl); }
     }
 #endif
+    if (getenv("CLJC_UNBUFFERED")) {
+        /* Diagnostic mode: redirected stdout is fully buffered, so a crash
+         * loses the tail and stderr interleaves out of order — unbuffered
+         * output makes "last line printed" pinpoint the dying form. */
+        setvbuf(stdout, NULL, _IONBF, 0);
+        setvbuf(stderr, NULL, _IONBF, 0);
+    }
     cljc_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
     CljcEnv *env = cljc_new_env();
     const char *cmd = argc > 1 ? argv[1] : NULL;

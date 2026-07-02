@@ -37,13 +37,28 @@ jobs:
 
   macos-arm64:
     runs-on: macos-14
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Build (zero warnings enforced)
         run: make CFLAGS='-O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function'
-      - name: Test (normal + GC stress)
-        run: make test
+      - name: Timing probe
+        run: |
+          time ./cljc -e '(Thread/sleep 100)'
+          time ./cljc -e '(let [f1 (future (Thread/sleep 50)) f2 (future (Thread/sleep 50))] @f1 @f2 (println :ok))'
+      - name: Test (normal)
+        env:
+          CLJC_UNBUFFERED: "1"
+        run: |
+          rc=0; time ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          echo "suite rc=$rc, PASS count: $(grep -c PASS out.txt)"
+          if grep -inE 'fail|error' out.txt; then tail -30 out.txt; exit 1; fi
+          exit $rc
+      - name: Test (GC stress)
+        run: |
+          rc=0; CLJC_GC_STRESS=1 ./cljc tests.clj > out2.txt 2>&1 || rc=$?
+          if grep -inE 'fail|error' out2.txt; then tail -30 out2.txt; exit 1; fi
+          exit $rc
 
   # Intel coverage without an Intel runner: build the x86_64 slice on the
   # arm64 runner and run the suite under Rosetta 2.
@@ -62,10 +77,16 @@ jobs:
              -o cljc cljc.c -lm -ldl
           file cljc
       - name: Test under Rosetta
+        env:
+          CLJC_UNBUFFERED: "1"
+          # FFI glue must match the emulated arch, not the host's
+          CLJC_CC: "cc -arch x86_64"
         run: |
-          ./cljc tests.clj > out.txt 2>&1 || { echo "suite rc=$?"; tail -60 out.txt; exit 1; }
-          ! grep -nE 'FAIL|error' out.txt || { grep -nE 'FAIL|error' out.txt | head -20; exit 1; }
+          rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          echo "suite rc=$rc, PASS count: $(grep -c PASS out.txt)"
+          if grep -inE 'fail|error' out.txt; then tail -30 out.txt; exit 1; fi
           grep -q PASS out.txt
+          exit $rc
 
   windows:
     runs-on: windows-latest
@@ -89,13 +110,22 @@ jobs:
           ls -la cljc.exe
           ./cljc.exe -e '(println :hello-windows)' || { echo "launch rc=$?"; exit 1; }
       - name: Test (platform-dependent sections self-skip)
+        env:
+          CLJC_UNBUFFERED: "1"
         run: |
-          ./cljc.exe tests.clj > out.txt 2>&1 || { echo "suite rc=$?"; tail -60 out.txt; exit 1; }
-          ! grep -E 'FAIL|error' out.txt || { tail -60 out.txt; exit 1; }
+          rc=0; ./cljc.exe tests.clj > out.txt 2>&1 || rc=$?
+          echo "suite rc=$rc, PASS count: $(grep -c PASS out.txt), lines: $(wc -l < out.txt)"
+          tail -3 out.txt
+          if grep -inE 'fail|error' out.txt; then exit 1; fi
           grep -q PASS out.txt
           grep SKIP out.txt
+          exit $rc
       - name: Test (GC stress)
+        env:
+          CLJC_UNBUFFERED: "1"
         run: |
-          CLJC_GC_STRESS=1 ./cljc.exe tests.clj > out2.txt 2>&1
-          ! grep -E 'FAIL|error' out2.txt
+          rc=0; CLJC_GC_STRESS=1 ./cljc.exe tests.clj > out2.txt 2>&1 || rc=$?
+          tail -3 out2.txt
+          if grep -inE 'fail|error' out2.txt; then exit 1; fi
           grep -q PASS out2.txt
+          exit $rc

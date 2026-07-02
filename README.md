@@ -43,6 +43,20 @@ Installed, `cljc` works from anywhere: batteries (`json.clj`, `fs.clj`,
 `CLJC_PATH` (colon-separated) for extra roots. `cljc --version` tells you what
 you have.
 
+## Platforms
+
+CI builds and runs the full suite (normal + GC-stress) on every push:
+
+| Platform | Status |
+|---|---|
+| Linux | full — the reference platform (plus an ASan/UBSan job) |
+| macOS arm64 + x86_64 | full, including coroutines/csp (ucontext) |
+| Windows (mingw-w64) | core language, collections, lazy seqs, regex, sockets; **no** coroutines/`csp`/`core.async`/nREPL, plain-line REPL |
+
+The test suite probes capabilities at startup (`cljc-test-unix?`,
+`cljc-test-coro?` in `tests.clj`) and self-skips what a platform lacks, so the
+same `tests.clj` runs everywhere.
+
 ## What's inside
 
 | Area | Coverage |

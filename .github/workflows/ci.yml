@@ -63,8 +63,8 @@ jobs:
           file cljc
       - name: Test under Rosetta
         run: |
-          ./cljc tests.clj > out.txt 2>&1
-          ! grep -E 'FAIL|error' out.txt
+          ./cljc tests.clj > out.txt 2>&1 || { echo "suite rc=$?"; tail -60 out.txt; exit 1; }
+          ! grep -nE 'FAIL|error' out.txt || { grep -nE 'FAIL|error' out.txt | head -20; exit 1; }
           grep -q PASS out.txt
 
   windows:
@@ -83,11 +83,15 @@ jobs:
       - name: Build (zero warnings enforced)
         run: |
           gcc -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function \
-              -o cljc.exe cljc.c -lm -lws2_32
+              -static -o cljc.exe cljc.c -lm -lws2_32
+      - name: Smoke test
+        run: |
+          ls -la cljc.exe
+          ./cljc.exe -e '(println :hello-windows)' || { echo "launch rc=$?"; exit 1; }
       - name: Test (platform-dependent sections self-skip)
         run: |
-          ./cljc.exe tests.clj > out.txt 2>&1
-          ! grep -E 'FAIL|error' out.txt
+          ./cljc.exe tests.clj > out.txt 2>&1 || { echo "suite rc=$?"; tail -60 out.txt; exit 1; }
+          ! grep -E 'FAIL|error' out.txt || { tail -60 out.txt; exit 1; }
           grep -q PASS out.txt
           grep SKIP out.txt
       - name: Test (GC stress)

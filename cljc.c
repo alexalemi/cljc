@@ -420,10 +420,35 @@ static Cljc *NIL, *TRUE, *FALSE, *EMPTY;
  * cur_exc when (throw x) raised it, or NULL meaning "use err_msg" for
  * interpreter-raised errors. */
 
-typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; int esp_save; } ErrFrame;
+/* Live VM call frames, for error traces only. A global shadow stack — NOT
+ * stack-local frames linked by address: publishing a local's address would
+ * make every apply() a potential writer to vm_run's frame and deoptimize
+ * the dispatch loop (~4% on call-heavy code). Each vm_run claims slot
+ * vm_tsp (recording only the first VM_TRACE_MAX levels); VOP_CALL/VOP_EVAL
+ * store the code index of the in-flight call into that private slot, and
+ * trace_snapshot decodes the call-site form (with its :line/:col meta) from
+ * the chunk's const pool at throw time. `esp` is eval_sp at vm_run entry:
+ * it interleaves these frames with the tree-walker's eval_stack frames. */
+typedef struct VmTraceFrame {
+    Cljc *chunk;
+    uint32_t pc;          /* index PAST the in-flight call op; 0 = none */
+    int esp;
+} VmTraceFrame;
+#define VM_TRACE_MAX 256
+static VmTraceFrame vm_trace[VM_TRACE_MAX];
+static int vm_tsp;        /* live VM frame depth (can exceed VM_TRACE_MAX) */
+
+typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; int esp_save;
+                          int vm_tsp_save; } ErrFrame;
 #define EVAL_STACK_MAX 4096
 static Cljc *eval_stack[EVAL_STACK_MAX];
 static int eval_sp;
+/* Call-site form of an in-flight VOP_TAILCALL sentinel. Set by the VM just
+ * before it returns the sentinel (only VOP_RET runs in between), consumed by
+ * the trampoline that dispatches it — an airtight handoff, so a single slot
+ * suffices. Lets tail-call trace frames carry the source form without
+ * growing the pooled recur cell. */
+static Cljc *g_tc_form;
 static char err_trace[1536];
 static const char *err_src_text;   /* retained main-script source */
 static const char *err_src_name;   /* its display name */
@@ -474,6 +499,7 @@ typedef struct Coro {
     ErrFrame *s_err_top;   /* saved err_top while suspended */
     Cljc *s_cur_exc;
     int s_eval_sp;
+    int s_vm_tsp;
 } Coro;
 
 static Coro *coro_current;        /* NULL = main is the active context */
@@ -483,6 +509,7 @@ static void *coro_main_saved_sp;  /* main's SP at the point it entered coro-land
 static ErrFrame *main_s_err_top;
 static Cljc *main_s_cur_exc;
 static int main_s_eval_sp;
+static int main_s_vm_tsp;
 static Cljc **main_s_vstack;
 static size_t main_s_vsp;
 static size_t main_s_vstack_cap;
@@ -848,14 +875,23 @@ static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
     return NULL;
 }
 
+static Cljc *vm_frame_form(VmTraceFrame *vf);   /* needs the VOP enum, defined later */
+
 static void trace_snapshot(void) {
     err_trace[0] = '\0';
     err_line = -1;
     err_col = -1;
     size_t off = 0;
     int shown = 0;
-    for (int i = eval_sp - 1; i >= 0 && shown < 8; i--) {
-        Cljc *f = eval_stack[i];
+    /* Two frame sources, innermost first: live VM frames (vm_trace shadow
+     * stack) and tree-walker frames (eval_stack). A VM frame entered after
+     * eval_stack[i] was pushed has esp > i, so it is the inner one. */
+    int v = (vm_tsp < VM_TRACE_MAX ? vm_tsp : VM_TRACE_MAX) - 1;
+    int i = eval_sp - 1;
+    while (shown < 8 && (v >= 0 || i >= 0)) {
+        Cljc *f;
+        if (v >= 0 && vm_trace[v].esp > i) f = vm_frame_form(&vm_trace[v--]);
+        else f = eval_stack[i--];
         if (f == NULL || f == NIL || f->tag != CLJC_LIST) continue;
         const char *head = f->as.cons.head->tag == CLJC_SYMBOL
             ? f->as.cons.head->as.sym : "...";
@@ -1138,6 +1174,10 @@ static void gc_collect(void) {
     gc_mark(NIL); gc_mark(TRUE); gc_mark(FALSE); gc_mark(EMPTY);
     gc_mark(cur_exc);  /* exception value may be in flight between throw and catch */
     for (size_t vi = 0; vi < vsp; vi++) gc_mark(vstack[vi]);
+    /* trace frames: a VM tail-call frame can outlive the chunk whose const
+     * pool owns the form, so the frames must be roots in their own right */
+    for (int ei = 0; ei < eval_sp; ei++) gc_mark(eval_stack[ei]);
+    gc_mark(g_tc_form);
     for (int i = 0; i < gc_n_root_envs; i++) gc_mark_env(gc_root_envs[i]);
 
     /* Active stack scan. When a coroutine is running, the live C stack is the
@@ -3071,6 +3111,19 @@ enum {
     VOP_REBIND, VOP_RECURFN, VOP_TAILCALL, VOP_RET
 };
 
+/* Decode the source form of a VM frame's in-flight call: pc indexes just
+ * past the VOP_CALL/VOP_EVAL being dispatched, and the op's const operand
+ * is the call-site form — which carries :line/:col meta from the reader. */
+static Cljc *vm_frame_form(VmTraceFrame *vf) {
+    if (!vf->pc) return NIL;
+    uint32_t ins = vf->chunk->as.chunk.code[vf->pc - 1];
+    uint8_t op = ins & 0xff;
+    uint32_t arg = ins >> 8;
+    if (op == VOP_CALL || op == VOP_TAILCALL) return vf->chunk->as.chunk.consts[arg >> 8];
+    if (op == VOP_EVAL) return vf->chunk->as.chunk.consts[arg];
+    return NIL;
+}
+
 /* Lexical addressing: every simple-symbol binding records the frame it
  * lives in and its slot index within that frame, so a reference compiles
  * to VOP_LOCAL (depth, slot) — `depth` parent hops then sval[slot] — with
@@ -3628,6 +3681,13 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
      * scan can't see, so the chunk cell is their only root here. */
     Cljc * volatile chunk_keep = chunk;
     (void)chunk_keep;
+    int tslot = vm_tsp < VM_TRACE_MAX ? vm_tsp : -1;
+    vm_tsp++;
+    if (tslot >= 0) {
+        vm_trace[tslot].chunk = chunk;
+        vm_trace[tslot].pc = 0;
+        vm_trace[tslot].esp = eval_sp;
+    }
     CljcEnv * volatile env_keep = env_in;
     CljcEnv *env = env_in;
     uint32_t ins, a;
@@ -3696,6 +3756,11 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                     vsp -= n + 1;
                     r = eval(env, K[a >> 8]);
                 } else {
+                    /* mark the in-flight call for error traces. Deliberately
+                     * never cleared: a raise at a non-recording op (unresolved
+                     * sym, destructure) then shows the body's previous call —
+                     * nearby — instead of paying a second store per call. */
+                    if (tslot >= 0) vm_trace[tslot].pc = pc;
                     r = apply(env, f, &vstack[vsp - n], (int)n);
                     vsp -= n + 1;
                 }
@@ -3706,7 +3771,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
             VM_CASE(VOP_JMPF) if (!is_truthy(vstack[--vsp])) pc = a; VM_NEXT();
             VM_CASE(VOP_JMPF_KEEP) if (!is_truthy(vstack[vsp - 1])) pc = a; VM_NEXT();
             VM_CASE(VOP_JMPT_KEEP) if (is_truthy(vstack[vsp - 1])) pc = a; VM_NEXT();
-            VM_CASE(VOP_EVAL) vpush(eval(env, K[a])); VM_NEXT();
+            VM_CASE(VOP_EVAL) { if (tslot >= 0) vm_trace[tslot].pc = pc; vpush(eval(env, K[a])); } VM_NEXT();
             VM_CASE(VOP_CLOSURE) vpush(make_fn(env, K[a], false)); VM_NEXT();
             VM_CASE(VOP_LAZY) {
                 Cljc *t = make_fn(env, K[a], false);
@@ -3776,6 +3841,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                     vpush(eval(env, K[a >> 8]));
                     VM_NEXT();
                 }
+                g_tc_form = K[a >> 8];               /* trace frame for the trampoline */
                 Cljc *r = alloc(CLJC_RECUR);         /* args still rooted on the vstack */
                 Cljc **vals = r->as.recur.iv;
                 if (n > 3) {
@@ -3791,6 +3857,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                 VM_NEXT();
             }
             VM_CASE(VOP_RET) {
+                vm_tsp--;
                 Cljc *r = vstack[vsp - 1];
                 vsp = base;
                 (void)env_keep;
@@ -3872,6 +3939,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
          * optimizer must not elide it. */
         Cljc * volatile recur_keep = NIL;
         (void)recur_keep;
+        int tc_frame = -1;   /* trace-frame slot successive tail calls replace */
         for (;;) {
             if (!fn->as.fn.fc_ready) fastcall_init(fn);  /* fn can change via a tail call */
             Cljc *chosen;
@@ -3935,9 +4003,19 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
             Cljc *result = chosen->meta->tag == CLJC_CHUNK
                 ? vm_run(call, chosen->meta)
                 : eval_body(call, chosen->as.cons.tail);
-            if (!(result && result->tag == CLJC_RECUR)) return result;
+            if (!(result && result->tag == CLJC_RECUR)) {
+                if (tc_frame >= 0) eval_sp = tc_frame;
+                return result;
+            }
             /* recur/tailcall: the sentinel's value array IS the next argv. */
             recur_keep = result;   /* root the cell across the next iteration */
+            /* a tail call REPLACES this fn's trace frame (mirrors real frame
+             * elision; recur loops stay at one slot) */
+            if (g_tc_form) {
+                if (tc_frame < 0 && eval_sp < EVAL_STACK_MAX) tc_frame = eval_sp++;
+                if (tc_frame >= 0) eval_stack[tc_frame] = g_tc_form;
+                g_tc_form = NULL;
+            }
             argv = result->as.recur.spill
                 ? (Cljc **)result->as.recur.iv[0] : result->as.recur.iv;
             nargs = (int)result->as.recur.n;
@@ -3952,6 +4030,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
                      * recur_keep after the call pins the sentinel live. */
                     Cljc *rv = apply(env, newfn, argv, nargs);
                     recur_keep = result;
+                    if (tc_frame >= 0) eval_sp = tc_frame;
                     return rv;
                 }
             }
@@ -4438,6 +4517,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     frame.prev = err_top;
                     frame.vsp_save = vsp;
                     frame.esp_save = eval_sp;
+                    frame.vm_tsp_save = vm_tsp;
                     err_top = &frame;
                     if (setjmp(frame.jb) == 0) {
                         result = eval_body(env, body_v);
@@ -4446,6 +4526,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         err_top = frame.prev;
                         vsp = frame.vsp_save;
                         eval_sp = frame.esp_save;
+                        vm_tsp = frame.vm_tsp_save;
                         if (catch_v) {
                             /* Bind the exception value; run the handler under
                              * its own frame so finally still runs if it throws. */
@@ -4458,6 +4539,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             hframe.prev = err_top;
                             hframe.vsp_save = vsp;
                             hframe.esp_save = eval_sp;
+                            hframe.vm_tsp_save = vm_tsp;
                             err_top = &hframe;
                             if (setjmp(hframe.jb) == 0) {
                                 result = eval_body(scope, cc->as.cons.tail->as.cons.tail);
@@ -4466,6 +4548,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                 err_top = hframe.prev;
                                 vsp = hframe.vsp_save;
                                 eval_sp = hframe.esp_save;
+                                vm_tsp = hframe.vm_tsp_save;
                                 pending = true;     /* handler threw */
                             }
                         } else {
@@ -4622,6 +4705,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         frame.prev = err_top;
                         frame.vsp_save = vsp;
                         frame.esp_save = eval_sp;
+                        frame.vm_tsp_save = vm_tsp;
                         err_top = &frame;
                         Cljc * volatile result = NIL;
                         volatile bool threw = false;
@@ -4632,6 +4716,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             err_top = frame.prev;
                             vsp = frame.vsp_save;
                             eval_sp = frame.esp_save;
+                            vm_tsp = frame.vm_tsp_save;
                             threw = true;
                         }
                         for (size_t i = 0; i < n; i++) slots[i]->value = saved[i];
@@ -7604,6 +7689,16 @@ static Cljc *prim_doc_put(CljcEnv *env, Cljc **argv, int nargs) {
 /* (cljc/fn-source* f) — the fn's arity clauses as FORMS: (([params] body...)
  * ...) — the stored source, so `source` can reconstruct a defn. nil for
  * natives/non-fns (no source retained). */
+/* Trace snapshot of the most recent throw (caught or not): the
+ * "  at (f ...) line N" block as a string, nil if it had no located frames.
+ * Lets user code inspect where a caught exception came from; the top-level
+ * error printer renders the same data. */
+static Cljc *prim_last_trace(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    if (!err_trace[0]) return NIL;
+    return mk_str(err_trace, strlen(err_trace));
+}
+
 static Cljc *prim_fn_source(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *f = argv[0];
@@ -7745,6 +7840,13 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)nargs;
     const char *src = as_str(argv[0], "eval-forms");
     const char *saved_ns = cur_reader_ns;
+    /* Fresh line tracking for the nested source (same discipline as
+     * read-string): without it, forms loaded mid-file inherit the host
+     * reader's position and their :line meta lands offset in error traces. */
+    int save_line = rd_line;
+    const char *save_start = rd_line_start;
+    rd_line = 1;
+    rd_line_start = src;
     /* Top-level forms evaluate in the ROOT env, not the caller's lexical
      * scope — load-file runs inside cljc/require-one's `let`, whose locals
      * (paths, hit, rel, ...) would otherwise shadow same-named globals in
@@ -7790,13 +7892,20 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
          * compiles to a TAILCALL sentinel meant for apply's trampoline —
          * dispatch it here (volatile keep: the sentinel owns the argv). */
         Cljc *volatile sentinel_keep = NIL;
+        int tcf = -1;   /* trace-frame slot for the top-level tail call */
         while (last && last->tag == CLJC_RECUR && last->meta) {
             sentinel_keep = last;
+            if (g_tc_form) {
+                if (tcf < 0 && eval_sp < EVAL_STACK_MAX) tcf = eval_sp++;
+                if (tcf >= 0) eval_stack[tcf] = g_tc_form;
+                g_tc_form = NULL;
+            }
             Cljc **av = last->as.recur.spill
                 ? (Cljc **)last->as.recur.iv[0] : last->as.recur.iv;
             last = apply(root, last->meta, av, (int)last->as.recur.n);
             (void)sentinel_keep;
         }
+        if (tcf >= 0) eval_sp = tcf;
         if (chunk && def_name) {            /* now perform the def itself */
             vpush(last);
             Cljc *q = mk_cons(mk_sym(intern("quote", 5)), mk_cons(last, NIL));
@@ -7809,6 +7918,8 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
         vsp--;
     }
     set_cur_ns(env_root(env), saved_ns);   /* restore ns + *ns* (NULL pre-boot: ok) */
+    rd_line = save_line;
+    rd_line_start = save_start;
     return last;
 }
 
@@ -7882,6 +7993,25 @@ static Cljc *prim_meta(CljcEnv *env, Cljc **argv, int nargs) {
             if (mf != NIL && mf->tag == CLJC_ATOM) return mf->as.atom.value;
             return mf;
         }
+    }
+    /* Var metadata carries :name, :doc, :arglists (Clojure compat) — built on
+     * demand from the doc registry + the binding's fn arities. Core docstrings
+     * appear once docs.clj has loaded (any (doc ...)/(find-doc ...) call);
+     * user defn docstrings are registered at definition time. */
+    if (v != NIL && v->tag == CLJC_VAR) {
+        Cljc *sym = mk_sym(v->as.var.name);
+        Cljc *args1[1] = { sym };
+        Cljc *info = prim_doc_info(env, args1, 1);
+        Cljc *m = v->meta ? v->meta : mk_map();
+        m = map_assoc(m, mk_kw(intern("name", 4)), sym);
+        if (info != NIL && info->tag == CLJC_MAP) {
+            Cljc *d, *al;
+            if (map_find(info, mk_kw(intern("doc", 3)), &d) && d != NIL)
+                m = map_assoc(m, mk_kw(intern("doc", 3)), d);
+            if (map_find(info, mk_kw(intern("arglists", 8)), &al) && al != NIL)
+                m = map_assoc(m, mk_kw(intern("arglists", 8)), al);
+        }
+        return m;
     }
     return (v != NIL && v->meta) ? v->meta : NIL;
 }
@@ -9704,14 +9834,18 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
  * so each coro keeps its own stable array (absolute argv pointers stay valid). */
 static void state_save(Coro *c) {
     if (c) { c->s_err_top = err_top; c->s_cur_exc = cur_exc; c->s_eval_sp = eval_sp;
+             c->s_vm_tsp = vm_tsp;
              c->s_vstack = vstack; c->s_vsp = vsp; c->s_vstack_cap = vstack_cap; }
     else   { main_s_err_top = err_top; main_s_cur_exc = cur_exc; main_s_eval_sp = eval_sp;
+             main_s_vm_tsp = vm_tsp;
              main_s_vstack = vstack; main_s_vsp = vsp; main_s_vstack_cap = vstack_cap; }
 }
 static void state_load(Coro *c) {
     if (c) { err_top = c->s_err_top; cur_exc = c->s_cur_exc; eval_sp = c->s_eval_sp;
+             vm_tsp = c->s_vm_tsp;
              vstack = c->s_vstack; vsp = c->s_vsp; vstack_cap = c->s_vstack_cap; }
     else   { err_top = main_s_err_top; cur_exc = main_s_cur_exc; eval_sp = main_s_eval_sp;
+             vm_tsp = main_s_vm_tsp;
              vstack = main_s_vstack; vsp = main_s_vsp; vstack_cap = main_s_vstack_cap; }
 }
 
@@ -9756,12 +9890,13 @@ static Cljc *coro_yield(Cljc *val) {
 static void coro_trampoline(void) {
     Coro *self = coro_current;
     ErrFrame base; base.prev = NULL; base.vsp_save = vsp; base.esp_save = eval_sp;
+    base.vm_tsp_save = vm_tsp;
     err_top = &base;
     if (setjmp(base.jb) == 0) {
         self->xfer = apply(gc_root_envs[0], self->thunk, NULL, 0);
         self->error = NULL;
     } else {
-        vsp = base.vsp_save; eval_sp = base.esp_save;
+        vsp = base.vsp_save; eval_sp = base.esp_save; vm_tsp = base.vm_tsp_save;
         self->error = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
         self->xfer = self->error;
     }
@@ -11433,6 +11568,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "conj",    prim_conj);
     cljc_define_native(e, "count",   prim_count);
     cljc_define_native(e, "cljc/fn-source*", prim_fn_source);
+    cljc_define_native(e, "cljc/last-trace*", prim_last_trace);
     cljc_define_native(e, "int-array",  prim_int_array);
     cljc_define_native(e, "long-array", prim_int_array);
     cljc_define_native(e, "byte-array", prim_int_array);
@@ -12542,7 +12678,7 @@ Cljc *cljc_eval_string(CljcEnv *env, const char *src) {
     cljc_set_stack_base(&stack_anchor);  /* ensure at least this frame is scanned */
     Cljc * volatile result = NIL;  /* survives the error longjmp */
     cljc_eval_errored = false;
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; cljc_eval_errored = true; return NIL; }
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; cljc_eval_errored = true; return NIL; }
     while (*src) {
         skip_ws(&src);
         if (!*src) break;
@@ -12582,6 +12718,7 @@ static int run_stream(CljcEnv *env, FILE *f, const char *name) {
         print_error();
         vsp = 0;
         eval_sp = 0;
+        vm_tsp = 0;
         free(src);
         return 1;
     }
@@ -12965,6 +13102,7 @@ static int run_repl(CljcEnv *env) {
             print_error();
             vsp = 0;
             eval_sp = 0;
+            vm_tsp = 0;
             continue;
         }
         /* the entered form is the error-excerpt source for this input */
@@ -13263,7 +13401,7 @@ static void set_args(CljcEnv *env, int argc, char **argv, int from) {
 /* Run an internal clj program string. Errors render and exit 1; with
  * truthy_exit, a falsy final value also exits 1 (e.g. run-tests). */
 static int run_subprogram(CljcEnv *env, const char *src, bool truthy_exit) {
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; return 1; }
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; return 1; }
     const char *p = src;
     Cljc *volatile last = TRUE;
     while (*p) {
@@ -13293,7 +13431,7 @@ static int lint_file(CljcEnv *env, const char *path) {
     err_src_name = path;
     err_src_text = src;             /* retained: error rendering may use it */
     rd_line = 1;
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; rd_line = 0; return 1; }
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; rd_line = 0; return 1; }
     const char *p = src;
     while (*p) {
         skip_ws(&p);

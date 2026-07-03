@@ -2201,4 +2201,17 @@
                (ex-message (try (read-string "(def a\n  (let [x 1\n") (catch Exception e e)))
                "(line 3)"))
 
+; ── var meta carries :doc/:arglists; error traces reach into VM'd bodies ──
+(let [m (meta (var docqol-f))]
+  (assert= 'docqol-f (:name m))
+  (assert= "My test doc." (:doc m))
+  (assert= '([x]) (:arglists m)))
+(spit "cljc_tracetest.clj"
+      "(defn tt-f [x]\n  (nth [1 2 3] x))\n(defn tt-g [y]\n  (tt-f (+ y 90)))\n(tt-g 9)\n")
+(let [tr (do (try (load-file "cljc_tracetest.clj") (catch Exception e nil))
+             (cljc/last-trace*))]
+  (assert= true (clojure.string/includes? tr "at (nth ...) line 2"))   ; innermost frame, exact body line
+  (assert= true (clojure.string/includes? tr "at (tt-g ...) line 5"))) ; top-level tail call framed too
+(sh "rm -f cljc_tracetest.clj")
+
 (println "tests complete")

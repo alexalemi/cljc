@@ -2226,4 +2226,17 @@
 (assert= '([map key] [map key not-found]) (:arglists (meta (var get))))
 (assert= true (string? (cljc/exe-dir*)))
 
+; ── QoL round 4: special-form docs, dir, dbg/#p, named fn printing, pst ──
+(assert= true (clojure.string/includes? (doc-str 'if) "Special form"))
+(assert= true (clojure.string/includes? (doc-str 'when) "truthy"))
+(assert= true (clojure.string/includes? (with-out-str (cljc/dir* 'clojure.set)) "union"))
+(assert= true (clojure.string/includes? (pr-str (fn [ab cd] ab)) "[ab cd]"))
+(defn qol4-named [x] x)
+(assert= true (clojure.string/includes? (pr-str qol4-named) "qol4-named"))
+(let [out (with-out-str (dbg (* 2 3)))]
+  (assert= true (clojure.string/includes? out "(* 2 3) => 6"))
+  (assert= true (clojure.string/includes? out "tests.clj")))   ; &form carries the location
+(assert= 6 #p (* 2 3))                                          ; reader shorthand evaluates through
+(assert= true (fn? pst))
+
 (println "tests complete")

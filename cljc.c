@@ -458,7 +458,13 @@ static VmTraceFrame vm_trace[VM_TRACE_MAX];
 static int vm_tsp;        /* live VM frame depth (can exceed VM_TRACE_MAX) */
 
 typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; int esp_save;
-                          int vm_tsp_save; } ErrFrame;
+                          int vm_tsp_save;
+                          /* reader state: a throw mid-load must not leave the
+                           * host file's line/file tracking pointing into the
+                           * nested source (stale :file/:line meta on every
+                           * later form) */
+                          int rd_line_save; const char *rd_start_save;
+                          Cljc *rd_file_save; } ErrFrame;
 #define EVAL_STACK_MAX 4096
 static Cljc *eval_stack[EVAL_STACK_MAX];
 static int eval_sp;
@@ -471,6 +477,8 @@ static Cljc *g_tc_form;
 static Cljc *rd_file_cell;   /* display name of the file being read (one string
                               * cell per load, shared by every form's :file
                               * meta); NULL = unnamed source. GC-rooted. */
+static int rd_line;                 /* 1-based; 0 = no tracking */
+static const char *rd_line_start;   /* for column computation */
 static char err_trace[1536];
 static char err_file[160];         /* :file of the innermost located frame ("" = none) */
 static const char *err_src_text;   /* retained main-script source */
@@ -2188,9 +2196,6 @@ static void sb_printf(SBuf *sb, const char *fmt, ...) {
 
 /* ───── Reader ───────────────────────────────────────────────────────── */
 
-static int rd_line;                 /* 1-based; 0 = no tracking */
-static const char *rd_line_start;   /* for column computation */
-
 /* Reader syntax error with the source line when tracking is on —
  * "unterminated list" with no location sent users paren-hunting. */
 #if defined(__GNUC__) || defined(__clang__)
@@ -2513,6 +2518,26 @@ static Cljc *read_form(const char **p) {
         *p += 2;
         Cljc *form = read_form(p);
         return mk_cons(mk_sym(intern("var", 3)), mk_cons(form, NIL));
+    }
+    if (c == '#' && (*p)[1] == 'p' &&
+        (isspace((unsigned char)(*p)[2]) || (*p)[2] == '(' || (*p)[2] == '[' ||
+         (*p)[2] == '{' || (*p)[2] == '"')) {
+        /* #p expr — debug-print shorthand: reads as (dbg expr). The guard
+         * (whitespace or opening delimiter after the p) keeps genuine tagged
+         * literals like #path{...} out of this branch. */
+        int line0 = rd_line;
+        *p += 2;
+        skip_ws(p);
+        Cljc *form = read_form(p);
+        Cljc *w = mk_cons(mk_sym(intern("dbg", 3)), mk_cons(form, NIL));
+        if (form != NULL && form != NIL && form->tag == CLJC_LIST && form->meta)
+            w->meta = form->meta;              /* dbg reports the inner form's location */
+        else if (line0) {
+            Cljc *m = map_assoc(mk_map(), mk_kw(intern("line", 4)), mk_int(line0));
+            if (rd_file_cell) m = map_assoc(m, mk_kw(intern("file", 4)), rd_file_cell);
+            w->meta = m;
+        }
+        return w;
     }
     if (c == '#' && (*p)[1] == '#') {  /* ##Inf ##-Inf ##NaN */
         *p += 2;
@@ -3139,6 +3164,19 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro);
 static void print_to(SBuf *sb, Cljc *v, bool readably);
 
+/* Expand a macro with &form bound to the call form for the duration — its
+ * :line/:file meta is how location-aware macros (dbg) know where they are.
+ * The binding is a plain root set/restore; a throw mid-expansion leaves the
+ * stale form behind, which only ever mislabels the next reader of &form. */
+static Cljc *macro_expand1(CljcEnv *env, Cljc *fn, Cljc **args, int n, Cljc *form) {
+    Binding *b = root_find(env_root(env), intern("&form", 5), NULL, false);
+    Cljc *saved = b ? b->value : NULL;
+    if (b) b->value = form;
+    Cljc *r = apply(env, fn, args, n);
+    if (b) b->value = saved;
+    return r;
+}
+
 /* Instruction = arg:24 | op:8. Sub-packings: CALL arg = call-site form
  * const:16 | argc:8; REBIND arg = unwind-depth:8 | names const:16.
  * Hence vm_compile's bails: ncode <= 0xffffff, nconst <= 0xffff. */
@@ -3636,7 +3674,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             size_t base = vsp;
             for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
                 vpush(a->as.cons.head);
-            Cljc *expansion = apply(cenv, mfn, &vstack[base], (int)(vsp - base));
+            Cljc *expansion = macro_expand1(cenv, mfn, &vstack[base], (int)(vsp - base), form);
             vsp = base;
             if (expansion != NIL && expansion->tag == CLJC_LIST) {
                 form->as.cons.head = expansion->as.cons.head;
@@ -4557,6 +4595,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     frame.vsp_save = vsp;
                     frame.esp_save = eval_sp;
                     frame.vm_tsp_save = vm_tsp;
+                    frame.rd_line_save = rd_line;
+                    frame.rd_start_save = rd_line_start;
+                    frame.rd_file_save = rd_file_cell;
                     err_top = &frame;
                     if (setjmp(frame.jb) == 0) {
                         result = eval_body(env, body_v);
@@ -4566,6 +4607,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         vsp = frame.vsp_save;
                         eval_sp = frame.esp_save;
                         vm_tsp = frame.vm_tsp_save;
+                        rd_line = frame.rd_line_save;
+                        rd_line_start = frame.rd_start_save;
+                        rd_file_cell = frame.rd_file_save;
                         if (catch_v) {
                             /* Bind the exception value; run the handler under
                              * its own frame so finally still runs if it throws. */
@@ -4579,6 +4623,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             hframe.vsp_save = vsp;
                             hframe.esp_save = eval_sp;
                             hframe.vm_tsp_save = vm_tsp;
+                            hframe.rd_line_save = rd_line;
+                            hframe.rd_start_save = rd_line_start;
+                            hframe.rd_file_save = rd_file_cell;
                             err_top = &hframe;
                             if (setjmp(hframe.jb) == 0) {
                                 result = eval_body(scope, cc->as.cons.tail->as.cons.tail);
@@ -4588,6 +4635,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                 vsp = hframe.vsp_save;
                                 eval_sp = hframe.esp_save;
                                 vm_tsp = hframe.vm_tsp_save;
+                                rd_line = hframe.rd_line_save;
+                                rd_line_start = hframe.rd_start_save;
+                                rd_file_cell = hframe.rd_file_save;
                                 pending = true;     /* handler threw */
                             }
                         } else {
@@ -4745,6 +4795,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         frame.vsp_save = vsp;
                         frame.esp_save = eval_sp;
                         frame.vm_tsp_save = vm_tsp;
+                        frame.rd_line_save = rd_line;
+                        frame.rd_start_save = rd_line_start;
+                        frame.rd_file_save = rd_file_cell;
                         err_top = &frame;
                         Cljc * volatile result = NIL;
                         volatile bool threw = false;
@@ -4756,6 +4809,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             vsp = frame.vsp_save;
                             eval_sp = frame.esp_save;
                             vm_tsp = frame.vm_tsp_save;
+                            rd_line = frame.rd_line_save;
+                            rd_line_start = frame.rd_start_save;
+                            rd_file_cell = frame.rd_file_save;
                             threw = true;
                         }
                         for (size_t i = 0; i < n; i++) slots[i]->value = saved[i];
@@ -5065,7 +5121,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
             if (fn->tag == CLJC_FN && fn->as.fn.is_macro) {
                 for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
                     vpush(a->as.cons.head);    /* unevaluated forms */
-                Cljc *expansion = apply(env, fn, &vstack[base], (int)(vsp - base));
+                Cljc *expansion = macro_expand1(env, fn, &vstack[base], (int)(vsp - base), form);
                 vsp = base;
                 /* Splice the expansion into the call site: each macro use
                  * expands ONCE (like compiled Clojure — re-expansion was
@@ -5360,7 +5416,32 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_TVEC:  sb_puts(sb, "#<transient-vector>"); break;
         case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
         case CLJC_TNODE: sb_puts(sb, "#<tree-node>"); break;  /* never user-visible */
-        case CLJC_FN:     sb_puts(sb, "#<fn>"); break;
+        case CLJC_FN: {   /* #<fn name [params] ...> when known — REPL/error clarity */
+            sb_puts(sb, "#<fn");
+            Cljc *nm;
+            if (v->meta && v->meta->tag == CLJC_MAP &&
+                map_find(v->meta, mk_kw(intern("name", 4)), &nm) &&
+                nm != NIL && nm->tag == CLJC_SYMBOL) {
+                sb_putc(sb, ' ');
+                sb_puts(sb, nm->as.sym);
+            }
+            int shown = 0;
+            for (Cljc *ar = v->as.fn.arities;
+                 ar != NIL && ar->tag == CLJC_LIST && shown < 3; ar = ar->as.cons.tail, shown++) {
+                sb_puts(sb, " [");
+                bool first = true;
+                for (Cljc *p = ar->as.cons.head->as.cons.head;
+                     p != NIL && p->tag == CLJC_LIST; p = p->as.cons.tail) {
+                    if (!first) sb_putc(sb, ' ');
+                    first = false;
+                    print_to(sb, p->as.cons.head, readably);
+                }
+                sb_putc(sb, ']');
+            }
+            if (shown == 3) sb_puts(sb, " ...");
+            sb_putc(sb, '>');
+            break;
+        }
         case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
         case CLJC_CORO:   sb_puts(sb, "#<coroutine>"); break;
         case CLJC_ATOM:
@@ -8188,7 +8269,7 @@ static Cljc *prim_macroexpand_1(CljcEnv *env, Cljc **argv, int nargs) {
     size_t base = vsp;
     for (Cljc *a = form->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
         vpush(a->as.cons.head);
-    Cljc *expansion = apply(env, fn, &vstack[base], (int)(vsp - base));
+    Cljc *expansion = macro_expand1(env, fn, &vstack[base], (int)(vsp - base), form);
     vsp = base;
     return expansion;
 }
@@ -10158,12 +10239,16 @@ static void coro_trampoline(void) {
     Coro *self = coro_current;
     ErrFrame base; base.prev = NULL; base.vsp_save = vsp; base.esp_save = eval_sp;
     base.vm_tsp_save = vm_tsp;
+    base.rd_line_save = rd_line; base.rd_start_save = rd_line_start;
+    base.rd_file_save = rd_file_cell;
     err_top = &base;
     if (setjmp(base.jb) == 0) {
         self->xfer = apply(gc_root_envs[0], self->thunk, NULL, 0);
         self->error = NULL;
     } else {
         vsp = base.vsp_save; eval_sp = base.esp_save; vm_tsp = base.vm_tsp_save;
+        rd_line = base.rd_line_save; rd_line_start = base.rd_start_save;
+        rd_file_cell = base.rd_file_save;
         self->error = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
         self->xfer = self->error;
     }
@@ -12190,6 +12275,33 @@ CljcEnv *cljc_new_env(void) {
         "(defn not-every? [pred coll] (not (every? pred coll)))\n"
         "(defn edn/read-string [s] (read-string s))\n"
         "(defn pprint ([x] (pprint x 80)) ([x w] (println (cljc/pprint-str* x (if (int? w) w 80)))))\n"
+        "(def *e nil)\n"
+        "(defn pst\n"
+        "  \"Prints the message and trace of the most recent error (or of e).\"\n"
+        "  ([] (pst *e))\n"
+        "  ([e]\n"
+        "   (when e\n"
+        "     (println (or (and (map? e) (ex-message e))\n"
+        "                  (if (string? e) e (pr-str e)))))\n"
+        "   (when-let [t (cljc/last-trace*)] (print t))\n"
+        "   nil))\n"
+        "(defn cljc/dir* [n]\n"
+        "  (when-not (find-ns n) (try (require n) (catch Exception e nil)))\n"
+        "  (run! println (sort (map str (keys (ns-publics n)))))\n"
+        "  nil)\n"
+        "(defmacro dir\n"
+        "  \"Prints the sorted public names of a namespace: (dir clojure.string).\"\n"
+        "  [n] (list 'cljc/dir* (list 'quote n)))\n"
+        "(defmacro dbg\n"
+        "  \"Prints file:line, the expression, and its value; returns the value.\n"
+        "  Wrap any subexpression: (+ 1 (dbg (* 2 3))). Reader shorthand: #p expr.\"\n"
+        "  [expr]\n"
+        "  (let [m (meta &form)\n"
+        "        loc (if (and m (get m :file)) (str (get m :file) \":\" (get m :line) \" \") \"\")\n"
+        "        v (gensym \"dbgv\")]\n"
+        "    (list 'let [v expr]\n"
+        "          (list 'println (str \"#dbg \" loc (pr-str expr) \" =>\") (list 'pr-str v))\n"
+        "          v)))\n"
         "(defn cljc/repeatedly* [f n]\n"   /* lazy + chunked, like repeat */
         "  (lazy-seq\n"
         "    (when (or (nil? n) (pos? n))\n"
@@ -13331,6 +13443,27 @@ static bool balanced(const char *s) {
     return depth <= 0 && !in_str;
 }
 
+/* Open-paren depth of a pending REPL form (same scan as balanced) — the
+ * continuation prompt indents two spaces per level so multi-line entry
+ * reads like an editor would lay it out. */
+static int open_depth(const char *s) {
+    int depth = 0;
+    bool in_str = false, in_com = false;
+    for (const char *c = s; *c; c++) {
+        if (in_com) { if (*c == '\n') in_com = false; continue; }
+        if (in_str) {
+            if (*c == '\\' && c[1]) c++;
+            else if (*c == '"') in_str = false;
+            continue;
+        }
+        if (*c == '"') in_str = true;
+        else if (*c == ';') in_com = true;
+        else if (strchr("([{", *c)) depth++;
+        else if (strchr(")]}", *c)) depth--;
+    }
+    return depth < 0 ? 0 : depth;
+}
+
 /* Record a result in the absolute history: *results* grows by one and
  * (*results* n) retrieves by prompt number because vectors are callable.
  * Index 0 is a nil spacer so numbers match the prompt. (*out* was
@@ -13364,13 +13497,20 @@ static int run_repl(CljcEnv *env) {
         if (!rl_edit(prompt, line, sizeof line)) break;
         snprintf(form, sizeof form, "%s", line);
         while (form[0] != '!' && !balanced(form)) {
-            if (!rl_edit("    ...> ", line, sizeof line)) break;
+            char cprompt[64];
+            int ind = open_depth(form) * 2;
+            if (ind > 40) ind = 40;
+            snprintf(cprompt, sizeof cprompt, "    ...> %*s", ind, "");
+            if (!rl_edit(cprompt, line, sizeof line)) break;
             size_t fl = strlen(form);
             snprintf(form + fl, sizeof form - fl, "\n%s", line);
         }
         if (!form[0]) continue;
         hist_add(form);
         if (setjmp(err_jmp) != 0) {
+            /* *e / (pst): keep the exception around for the post-mortem */
+            Cljc *exc = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
+            env_define_root(env_root(env), intern("*e", 2), exc);
             print_error();
             vsp = 0;
             eval_sp = 0;

@@ -39,6 +39,10 @@
 #include <time.h>
 #include <unistd.h>      /* isatty, close — REPL detection, tcp primitives */
 #include <sys/stat.h>    /* stat — file mtimes (clerk file watching) */
+#include <signal.h>      /* SIGINT/SIGTERM — watch-mode child exit checks */
+#ifndef _WIN32
+#include <sys/ioctl.h>   /* TIOCGWINSZ — REPL pretty-print width */
+#endif
 #include <dirent.h>      /* opendir — directory walking (clerk dir mode) */
 #ifdef _WIN32
 /* ── Windows portability shims ──
@@ -370,33 +374,48 @@ static void mark_private_def(const char *qual, bool priv) {
  * root_find returns, so lookup follows exactly the resolution the symbol
  * itself gets. Interactive feature: a growable linear array is plenty.
  * Strings are copied (a docstring cell's buffer dies with the cell). */
-typedef struct { const char *name; char *doc; } DocEntry;
+typedef struct { const char *name; char *doc; char *args; } DocEntry;
 static DocEntry *doc_entries;
 static int n_docs, cap_docs;
 static void *xmalloc(size_t n);
-static void doc_put(const char *name, const char *doc) {
-    size_t len = strlen(doc);
+static char *xstrdup_(const char *s) {
+    size_t len = strlen(s);
     char *copy = xmalloc(len + 1);
-    memcpy(copy, doc, len + 1);
+    memcpy(copy, s, len + 1);
+    return copy;
+}
+/* args: printed arglists like "([coll] [coll x & xs])", or NULL — gives doc
+ * output and (meta (var f)) signatures for NATIVES, whose fn cells carry no
+ * arity forms to reflect on. */
+static void doc_put(const char *name, const char *doc, const char *args) {
+    char *copy = xstrdup_(doc);
+    char *acopy = args ? xstrdup_(args) : NULL;
     for (int i = 0; i < n_docs; i++)
         if (doc_entries[i].name == name) {
             free(doc_entries[i].doc);
             doc_entries[i].doc = copy;
+            if (acopy) { free(doc_entries[i].args); doc_entries[i].args = acopy; }
             return;
         }
     if (n_docs == cap_docs) {
         cap_docs = cap_docs ? cap_docs * 2 : 256;
         DocEntry *grown = realloc(doc_entries, sizeof(DocEntry) * cap_docs);
-        if (!grown) { free(copy); return; }   /* docs are best-effort */
+        if (!grown) { free(copy); free(acopy); return; }   /* docs are best-effort */
         doc_entries = grown;
     }
     doc_entries[n_docs].name = name;
     doc_entries[n_docs].doc = copy;
+    doc_entries[n_docs].args = acopy;
     n_docs++;
 }
 static const char *doc_get(const char *name) {
     for (int i = 0; i < n_docs; i++)
         if (doc_entries[i].name == name) return doc_entries[i].doc;
+    return NULL;
+}
+static const char *doc_args_get(const char *name) {
+    for (int i = 0; i < n_docs; i++)
+        if (doc_entries[i].name == name) return doc_entries[i].args;
     return NULL;
 }
 
@@ -449,7 +468,11 @@ static int eval_sp;
  * suffices. Lets tail-call trace frames carry the source form without
  * growing the pooled recur cell. */
 static Cljc *g_tc_form;
+static Cljc *rd_file_cell;   /* display name of the file being read (one string
+                              * cell per load, shared by every form's :file
+                              * meta); NULL = unnamed source. GC-rooted. */
 static char err_trace[1536];
+static char err_file[160];         /* :file of the innermost located frame ("" = none) */
 static const char *err_src_text;   /* retained main-script source */
 static const char *err_src_name;   /* its display name */
 static long long err_line = -1;    /* innermost located frame at raise */
@@ -879,6 +902,7 @@ static Cljc *vm_frame_form(VmTraceFrame *vf);   /* needs the VOP enum, defined l
 
 static void trace_snapshot(void) {
     err_trace[0] = '\0';
+    err_file[0] = '\0';
     err_line = -1;
     err_col = -1;
     size_t off = 0;
@@ -896,20 +920,30 @@ static void trace_snapshot(void) {
         const char *head = f->as.cons.head->tag == CLJC_SYMBOL
             ? f->as.cons.head->as.sym : "...";
         long long line = -1;
+        const char *file = NULL;
         if (f->meta) {
             Cljc *lv;
             if (map_find(f->meta, mk_kw(intern("line", 4)), &lv) && lv->tag == CLJC_INT)
                 line = (long long)lv->as.i;
+            if (map_find(f->meta, mk_kw(intern("file", 4)), &lv) && lv->tag == CLJC_STRING)
+                file = lv->as.str;
         }
         int n;
         if (line >= 0 && err_line < 0) {
             err_line = line;
+            snprintf(err_file, sizeof err_file, "%s", file ? file : "");
             Cljc *cv;
             if (f->meta && map_find(f->meta, mk_kw(intern("col", 3)), &cv) &&
                 cv->tag == CLJC_INT)
                 err_col = (long long)cv->as.i;
         }
-        if (line >= 0)
+        /* name the file only when it isn't the main script — single-file runs
+         * stay clean, cross-file frames become unambiguous */
+        if (file && err_src_name && strcmp(file, err_src_name) == 0) file = NULL;
+        if (line >= 0 && file)
+            n = snprintf(err_trace + off, sizeof err_trace - off,
+                         "  at (%s ...) %s:%lld\n", head, file, line);
+        else if (line >= 0)
             n = snprintf(err_trace + off, sizeof err_trace - off,
                          "  at (%s ...) line %lld\n", head, line);
         else
@@ -1178,6 +1212,7 @@ static void gc_collect(void) {
      * pool owns the form, so the frames must be roots in their own right */
     for (int ei = 0; ei < eval_sp; ei++) gc_mark(eval_stack[ei]);
     gc_mark(g_tc_form);
+    gc_mark(rd_file_cell);
     for (int i = 0; i < gc_n_root_envs; i++) gc_mark_env(gc_root_envs[i]);
 
     /* Active stack scan. When a coroutine is running, the live C stack is the
@@ -2167,6 +2202,8 @@ static void rd_error(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
+    if (rd_line > 0 && rd_file_cell)
+        cljc_error("%s (%s:%d)", msg, rd_file_cell->as.str, rd_line);
     if (rd_line > 0) cljc_error("%s (line %d)", msg, rd_line);
     cljc_error("%s", msg);
 }
@@ -2364,6 +2401,8 @@ static Cljc *read_list(const char **p, char close) {
                 Cljc *m = mk_map();
                 m = map_assoc(m, mk_kw(intern("line", 4)), mk_int(line0));
                 if (col0) m = map_assoc(m, mk_kw(intern("col", 3)), mk_int(col0));
+                if (rd_file_cell)
+                    m = map_assoc(m, mk_kw(intern("file", 4)), rd_file_cell);
                 head->meta = m;
             }
             return head;
@@ -4753,7 +4792,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     {
                         const char *st = env_define_root(env_root(env), name, m);
                         if (strchr(st, '/')) mark_private_def(st, mac_private);
-                        if (mac_doc != NIL) doc_put(st, mac_doc->as.str);
+                        if (mac_doc != NIL) doc_put(st, mac_doc->as.str, NULL);
                     }
                     return m;
                 }
@@ -4831,7 +4870,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     {
                         const char *st = env_define_root(env_root(env), name, val);
                         if (strchr(st, '/')) mark_private_def(st, def_private);
-                        if (def_doc != NIL) doc_put(st, def_doc->as.str);
+                        if (def_doc != NIL) doc_put(st, def_doc->as.str, NULL);
                     }
                     /* Attach :name metadata to a def'd function (fresh per defn, so
                      * no shared-cell hazard) the first time it's named, so
@@ -5343,6 +5382,123 @@ static void print(Cljc *v) {
     if (sb.data) { fwrite(sb.data, 1, sb.len, COUT); free(sb.data); }
 }
 
+/* ── pretty printer ─────────────────────────────────────────────────────
+ * Fits-or-breaks: render v flat; if the flat form overflows `width` from
+ * column `col`, rewind and break the collection one element per line,
+ * continuation lines aligned one past the opening bracket (map values sit
+ * after their flat-printed key). Atoms and tagged instances never break.
+ * Honors *print-length* like print_to. */
+static void pp_spaces(SBuf *sb, int n) { for (int i = 0; i < n; i++) sb_putc(sb, ' '); }
+
+/* Column the buffer's cursor sits at. Root pp calls start with an empty
+ * buffer at column 0, so before the first newline the length IS the column. */
+static int pp_cur_col(SBuf *sb) {
+    for (size_t i = sb->len; i > 0; i--)
+        if (sb->data[i - 1] == '\n') return (int)(sb->len - i);
+    return (int)sb->len;
+}
+
+static void pp_to(SBuf *sb, Cljc *v, int col, int width, int depth) {
+    size_t start = sb->len;
+    print_to(sb, v, true);
+    if ((int)(sb->len - start) <= width - col || depth > 32 || v == NULL || v == NIL)
+        return;
+    int plen = PRINT_LEN(), cnt = 0;
+    switch (v->tag) {
+        case CLJC_MAP: {
+            Cljc *ty;   /* tagged instances render via their flat/toString form */
+            if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty)) return;
+            sb->len = start;
+            sb_putc(sb, '{');
+            bool first = true;
+            for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+                if (!first) { sb_putc(sb, '\n'); pp_spaces(sb, col + 1); }
+                first = false;
+                if (plen >= 0 && cnt++ >= plen) { sb_puts(sb, "..."); break; }
+                size_t kstart = sb->len;
+                print_to(sb, e->as.cons.head->as.cons.head, true);
+                sb_putc(sb, ' ');
+                pp_to(sb, e->as.cons.head->as.cons.tail,
+                      col + 1 + (int)(sb->len - kstart), width, depth + 1);
+            }
+            sb_putc(sb, '}');
+            return;
+        }
+        case CLJC_SORTED:
+            if (v->as.sorted.is_map) {
+                sb->len = start;
+                sb_putc(sb, '{');
+                bool first = true;
+                for (Cljc *e = sorted_entry_list(v); e != NIL && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+                    if (!first) { sb_putc(sb, '\n'); pp_spaces(sb, col + 1); }
+                    first = false;
+                    if (plen >= 0 && cnt++ >= plen) { sb_puts(sb, "..."); break; }
+                    Cljc *ent = e->as.cons.head;
+                    size_t kstart = sb->len;
+                    print_to(sb, vec_nth(ent, 0), true);
+                    sb_putc(sb, ' ');
+                    pp_to(sb, vec_nth(ent, 1), col + 1 + (int)(sb->len - kstart), width, depth + 1);
+                }
+                sb_putc(sb, '}');
+                return;
+            }
+            /* sorted set: fall through to the fill layout below */
+            /* FALLTHROUGH */
+        case CLJC_VECTOR: case CLJC_SET: case CLJC_LIST: case CLJC_LAZY: {
+            /* fill layout: pack elements, breaking the line only before an
+             * element whose flat form would overflow — scalars stay dense,
+             * oversized children break internally via recursion */
+            bool is_vec = v->tag == CLJC_VECTOR;
+            bool is_set = v->tag == CLJC_SET || v->tag == CLJC_SORTED;
+            Cljc *e = NIL; size_t vn = 0, vi = 0;
+            if (is_vec) vn = vec_len(v);
+            else if (v->tag == CLJC_SORTED) e = sorted_entry_list(v);
+            else { e = to_seq(v); if (e == NIL) return; }
+            sb->len = start;
+            sb_puts(sb, is_set ? "#{" : is_vec ? "[" : "(");
+            int icol = col + (is_set ? 2 : 1);
+            bool first = true;
+            for (;;) {
+                Cljc *elem;
+                if (is_vec) {
+                    if (vi >= vn) break;
+                    elem = vec_nth(v, vi++);
+                } else {
+                    if (e == NIL || e->tag != CLJC_LIST) break;
+                    elem = e->as.cons.head;
+                    Cljc *t = e->as.cons.tail;
+                    if (t != NIL && t->tag != CLJC_LIST) t = to_seq(t);  /* lazy tails */
+                    e = t;
+                }
+                if (plen >= 0 && cnt++ >= plen) { if (!first) sb_putc(sb, ' '); sb_puts(sb, "..."); break; }
+                size_t m = sb->len;                 /* measure the flat form */
+                print_to(sb, elem, true);
+                int elen = (int)(sb->len - m);
+                sb->len = m;
+                int cur = pp_cur_col(sb);
+                if (!first && cur + 1 + elen > width) { sb_putc(sb, '\n'); pp_spaces(sb, icol); cur = icol; }
+                else if (!first) { sb_putc(sb, ' '); cur++; }
+                pp_to(sb, elem, cur, width, depth + 1);
+                first = false;
+            }
+            sb_putc(sb, is_set ? '}' : is_vec ? ']' : ')');
+            return;
+        }
+        default: return;   /* atoms (long strings, ratios, ...) stay flat */
+    }
+}
+
+/* Width of the attached terminal, for the REPL's break-or-fit decision. */
+static int term_width(void) {
+#ifndef _WIN32
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20) return ws.ws_col;
+#endif
+    const char *c = getenv("COLUMNS");
+    if (c) { int n = atoi(c); if (n > 20) return n; }
+    return 100;
+}
+
 /* Levenshtein distance, capped — for "did you mean" suggestions. */
 static int lev(const char *a, const char *b, int cap) {
     int la = (int)strlen(a), lb = (int)strlen(b);
@@ -5368,13 +5524,57 @@ static int lev(const char *a, const char *b, int cap) {
 static const char *suggest(const char *token) {
     if (!gc_n_root_envs) return NULL;
     const char *best = NULL;
-    int bestd = 3;  /* accept distance <= 2 */
+    size_t tlen = strlen(token), bestlen = 0;
+    int maxd = tlen <= 3 ? 1 : 2;   /* short typos: only 1 edit away is credible */
+    int bestd = maxd + 1, bestpre = -1;
     for (Binding *b = gc_root_envs[0]->bindings; b; b = b->next) {
         if (strstr(b->name, "**") || !strncmp(b->name, "cljc/", 5)) continue;
-        int d = lev(token, b->name, 2);
-        if (d < bestd) { bestd = d; best = b->name; }
+        int d = lev(token, b->name, maxd);
+        if (d > maxd) continue;
+        size_t blen = strlen(b->name);
+        /* prefix containment breaks ties: `incc` names `inc` over `inc'` */
+        size_t pre = 0;
+        while (token[pre] && b->name[pre] && token[pre] == b->name[pre]) pre++;
+        int contained = (pre == blen || pre == tlen);
+        if (d < bestd ||
+            (d == bestd && (contained > bestpre ||
+                            (contained == bestpre && blen < bestlen)))) {
+            bestd = d; best = b->name; bestlen = blen; bestpre = contained;
+        }
     }
     return best;
+}
+
+/* When an unresolved symbol is ns-qualified and that namespace's source file
+ * exists on *load-path*, the fix is a require, not a spelling change. */
+static char req_hint_buf[128];
+static const char *require_hint(const char *token) {
+    const char *slash = strrchr(token, '/');
+    if (!slash || slash == token) return NULL;
+    size_t nlen = (size_t)(slash - token);
+    if (nlen >= sizeof req_hint_buf || !gc_n_root_envs) return NULL;
+    memcpy(req_hint_buf, token, nlen);
+    req_hint_buf[nlen] = '\0';
+    char rel[160];   /* ns → path munge: . → /, - → _ */
+    if (nlen >= sizeof rel) return NULL;
+    for (size_t i = 0; i < nlen; i++)
+        rel[i] = token[i] == '.' ? '/' : token[i] == '-' ? '_' : token[i];
+    rel[nlen] = '\0';
+    Binding *b = root_find(gc_root_envs[0], intern("*load-path*", 11), NULL, false);
+    if (!b || b->value == NIL || b->value->tag != CLJC_VECTOR) return NULL;
+    Cljc *lp = b->value;
+    for (size_t i = 0; i < vec_len(lp); i++) {
+        Cljc *d = vec_nth(lp, i);
+        if (d == NIL || d->tag != CLJC_STRING) continue;
+        static const char *ext[2] = { "clj", "cljc" };
+        for (int k = 0; k < 2; k++) {
+            char path[512];
+            snprintf(path, sizeof path, "%s/%s.%s", d->as.str, rel, ext[k]);
+            FILE *f = fopen(path, "r");
+            if (f) { fclose(f); return req_hint_buf; }
+        }
+    }
+    return NULL;
 }
 
 static bool term_utf8(void) {
@@ -5414,8 +5614,11 @@ static void print_error(void) {
         fprintf(CERR, "%s\n", err_msg);
     }
 
-    /* the offending source line, caret under the token when findable */
-    if (err_line > 0 && err_src_text) {
+    /* the offending source line, caret under the token when findable —
+     * only when the innermost located frame is IN the displayed source
+     * (a frame from a loaded file would caret the wrong text) */
+    if (err_line > 0 && err_src_text &&
+        (!err_file[0] || (err_src_name && strcmp(err_file, err_src_name) == 0))) {
         const char *p = err_src_text;
         for (long long l = 1; l < err_line && p; l++) {
             p = strchr(p, '\n');
@@ -5453,8 +5656,15 @@ static void print_error(void) {
     }
 
     if (err_token) {
-        const char *s = suggest(err_token);
-        if (s) fprintf(CERR, "\n%sDid you mean %s`%s`%s?%s\n", YEL, OFF, s, YEL, OFF);
+        const char *ns = require_hint(err_token);
+        if (ns)
+            fprintf(CERR, "\n%sNamespace %s`%s`%s is on the load path but not loaded"
+                          " %s\u2014 try %s(require '%s)%s first.%s\n",
+                    YEL, OFF, ns, YEL, YEL, OFF, ns, YEL, OFF);
+        else {
+            const char *sug = suggest(err_token);
+            if (sug) fprintf(CERR, "\n%sDid you mean %s`%s`%s?%s\n", YEL, OFF, sug, YEL, OFF);
+        }
         err_token = NULL;
     }
 
@@ -7679,10 +7889,11 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
 /* (cljc/doc-put* "name" "text") — register a docstring under a root-binding
  * name. The docs.clj battery bulk-loads native/prelude docs through this. */
 static Cljc *prim_doc_put(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; (void)nargs;
+    (void)env;
     char *name = as_str(argv[0], "cljc/doc-put*");
     char *text = as_str(argv[1], "cljc/doc-put*");
-    doc_put(intern(name, strlen(name)), text);
+    const char *args = (nargs > 2 && argv[2] != NIL) ? as_str(argv[2], "cljc/doc-put*") : NULL;
+    doc_put(intern(name, strlen(name)), text, args);
     return NIL;
 }
 
@@ -7697,6 +7908,19 @@ static Cljc *prim_last_trace(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     if (!err_trace[0]) return NIL;
     return mk_str(err_trace, strlen(err_trace));
+}
+
+/* (cljc/pprint-str* x width) — pretty-printed rendering, no trailing \n. */
+static Cljc *prim_pprint_str(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    int width = (nargs > 1 && argv[1] != NIL && argv[1]->tag == CLJC_INT)
+        ? (int)argv[1]->as.i : 80;
+    if (width < 20) width = 20;
+    SBuf sb = {0};
+    pp_to(&sb, argv[0], 0, width, 0);
+    Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
+    free(sb.data);
+    return r;
 }
 
 static Cljc *prim_fn_source(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7744,6 +7968,18 @@ static Cljc *prim_doc_info(CljcEnv *env, Cljc **argv, int nargs) {
         }
     }
     const char *stored = b ? b->name : name;
+    if (arglists == NIL) {   /* natives: parse the registry's printed form */
+        const char *args = doc_args_get(stored);
+        if (args) {
+            int save_line = rd_line; const char *save_start = rd_line_start;
+            Cljc *save_file = rd_file_cell;
+            rd_line = 0; rd_file_cell = NULL;
+            const char *p = args;
+            Cljc *form = read_form(&p);
+            rd_line = save_line; rd_line_start = save_start; rd_file_cell = save_file;
+            if (form && form != NIL && form->tag == CLJC_LIST) arglists = form;
+        }
+    }
     Cljc *m = mk_map();
     m = map_assoc(m, mk_kw(intern("name", 4)), mk_str(stored, strlen(stored)));
     m = map_assoc(m, mk_kw(intern("doc", 3)),
@@ -7832,12 +8068,13 @@ static Cljc *prim_set_var(CljcEnv *env, Cljc **argv, int nargs) {
     return argv[1];
 }
 
-/* (cljc/eval-forms* src) — read and eval each top-level form in turn (NOT
- * read-all-then-eval), so a leading (ns ..) is active when later forms are
- * READ — their bare refs to ns-local defs then resolve. cur_reader_ns is
- * saved/restored so loading a file doesn't leak its ns to the caller. */
+/* (cljc/eval-forms* src) or (cljc/eval-forms* src name) — read and eval each
+ * top-level form in turn (NOT read-all-then-eval), so a leading (ns ..) is
+ * active when later forms are READ — their bare refs to ns-local defs then
+ * resolve. cur_reader_ns is saved/restored so loading a file doesn't leak its
+ * ns to the caller. `name` (load-file passes its path) becomes the forms'
+ * :file meta, so error traces can say which file a frame lives in. */
 static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)nargs;
     const char *src = as_str(argv[0], "eval-forms");
     const char *saved_ns = cur_reader_ns;
     /* Fresh line tracking for the nested source (same discipline as
@@ -7845,8 +8082,11 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
      * reader's position and their :line meta lands offset in error traces. */
     int save_line = rd_line;
     const char *save_start = rd_line_start;
+    Cljc *save_file = rd_file_cell;
     rd_line = 1;
     rd_line_start = src;
+    rd_file_cell = (nargs > 1 && argv[1] != NIL && argv[1]->tag == CLJC_STRING)
+        ? argv[1] : NULL;
     /* Top-level forms evaluate in the ROOT env, not the caller's lexical
      * scope — load-file runs inside cljc/require-one's `let`, whose locals
      * (paths, hit, rel, ...) would otherwise shadow same-named globals in
@@ -7920,6 +8160,7 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
     set_cur_ns(env_root(env), saved_ns);   /* restore ns + *ns* (NULL pre-boot: ok) */
     rd_line = save_line;
     rd_line_start = save_start;
+    rd_file_cell = save_file;
     return last;
 }
 
@@ -8049,23 +8290,47 @@ static Cljc *prim_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
 /* The share dir relative to THIS executable (PREFIX/bin/cljc -> PREFIX/share/cljc),
  * so a binary installed under any PREFIX finds its batteries regardless of the
  * compile-time CLJC_SHAREDIR. nil if the exe path can't be determined. */
-static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; (void)argv; (void)nargs;
-    char buf[4096];
+/* Absolute path of the running executable; false when the platform can't say. */
+static bool exe_path(char *buf, size_t bufsz) {
 #if defined(__linux__)
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) return NIL;
+    ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
+    if (n <= 0) return false;
     buf[(size_t)n] = '\0';
+    return true;
 #elif defined(__APPLE__)
     char raw[4096];
     uint32_t sz = sizeof(raw);
-    if (_NSGetExecutablePath(raw, &sz) != 0) return NIL;
-    if (!realpath(raw, buf)) return NIL;  /* resolve symlinks, like /proc/self/exe */
+    if (_NSGetExecutablePath(raw, &sz) != 0) return false;
+    if (!realpath(raw, buf)) return false;  /* resolve symlinks, like /proc/self/exe */
+    return true;
+#elif defined(_WIN32)
+    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)bufsz);
+    if (n == 0 || n >= bufsz) return false;
+    for (char *p = buf; *p; p++) if (*p == '\\') *p = '/';
+    return true;
 #else
-    (void)buf;
-    return NIL;
+    (void)buf; (void)bufsz;
+    return false;
 #endif
-#if defined(__linux__) || defined(__APPLE__)
+}
+
+/* (cljc/exe-dir*) — directory holding the executable. A repo build keeps its
+ * batteries and vendor/ right next to the binary, so this goes on the load
+ * path: an uninstalled ./cljc then resolves requires from any cwd. */
+static Cljc *prim_exe_dir(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    char buf[4096];
+    if (!exe_path(buf, sizeof buf)) return NIL;
+    char *slash = strrchr(buf, '/');
+    if (!slash || slash == buf) return NIL;
+    *slash = '\0';
+    return mk_str(buf, strlen(buf));
+}
+
+static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    char buf[4096];
+    if (!exe_path(buf, sizeof buf)) return NIL;
     char *slash = strrchr(buf, '/');     /* drop the exe name -> .../bin */
     if (!slash) return NIL;
     *slash = '\0';
@@ -8075,7 +8340,6 @@ static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
     char path[sizeof(buf) + 32];
     snprintf(path, sizeof(path), "%s/share/cljc", buf);
     return mk_str(path, strlen(path));
-#endif
 }
 
 /* (cljc/os*) → :linux | :macos | :windows | :unknown — lets scripts and the
@@ -9757,11 +10021,14 @@ static Cljc *prim_read_string(CljcEnv *env, Cljc **argv, int nargs) {
      * line meta and error carets point at the wrong line. */
     int save_line = rd_line;
     const char *save_start = rd_line_start;
+    Cljc *save_file = rd_file_cell;
     rd_line = 1;
     rd_line_start = p;
+    rd_file_cell = NULL;
     Cljc *form = read_form(&p);
     rd_line = save_line;
     rd_line_start = save_start;
+    rd_file_cell = save_file;
     return form ? form : NIL;
 }
 
@@ -11203,6 +11470,7 @@ static const char *PRELUDE =
     "                           (str/split p \":\"))\n"
     /* exe-relative share dir first (works under any install PREFIX), then the
        compile-time one as a fallback */
+    "                         (when-let [d (cljc/exe-dir*)] [d (str d \"/vendor\")])\n"
     "                         (when-let [d (cljc/exe-sharedir*)] [d (str d \"/vendor\")])\n"
     "                         [(cljc/sharedir*) (str (cljc/sharedir*) \"/vendor\")]))))\n"
     "(def cljc/loaded-namespaces (atom #{}))\n"
@@ -11271,7 +11539,8 @@ static const char *PRELUDE =
     "                     (empty? (cljc/ns-publics* (str nsname))))\n"
     "            (binding [*out* *err*]\n"
     "              (println (str \"WARNING: could not locate namespace \" nsname\n"
-    "                            \" on the load path\")))))))\n"
+    "                            \" on the load path (searched \"\n"
+    "                            (str/join \" \" *load-path*) \")\")))))))\n"
     "    (when-let [refers (and (vector? spec) (cljc/spec-opt spec :refer))]\n"
     "      (let [cur (cljc/current-ns*)]\n"
     "        (doseq [r (if (= refers :all) (map symbol (cljc/ns-publics* (str nsname))) refers)]\n"
@@ -11569,6 +11838,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "count",   prim_count);
     cljc_define_native(e, "cljc/fn-source*", prim_fn_source);
     cljc_define_native(e, "cljc/last-trace*", prim_last_trace);
+    cljc_define_native(e, "cljc/pprint-str*", prim_pprint_str);
     cljc_define_native(e, "int-array",  prim_int_array);
     cljc_define_native(e, "long-array", prim_int_array);
     cljc_define_native(e, "byte-array", prim_int_array);
@@ -11611,6 +11881,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/os*",       prim_os);
     cljc_define_native(e, "cljc/sharedir*", prim_sharedir);
     cljc_define_native(e, "cljc/exe-sharedir*", prim_exe_sharedir);
+    cljc_define_native(e, "cljc/exe-dir*", prim_exe_dir);
     cljc_define_native(e, "int",       prim_int);
     cljc_define_native(e, "identical?", prim_identical);
     cljc_define_native(e, "with-meta",  prim_with_meta);
@@ -11918,7 +12189,7 @@ CljcEnv *cljc_new_env(void) {
         "(defn not-any? [pred coll] (not (some pred coll)))\n"
         "(defn not-every? [pred coll] (not (every? pred coll)))\n"
         "(defn edn/read-string [s] (read-string s))\n"
-        "(defn pprint [x] (prn x))\n"
+        "(defn pprint ([x] (pprint x 80)) ([x w] (println (cljc/pprint-str* x (if (int? w) w 80)))))\n"
         "(defn cljc/repeatedly* [f n]\n"   /* lazy + chunked, like repeat */
         "  (lazy-seq\n"
         "    (when (or (nil? n) (pos? n))\n"
@@ -12657,7 +12928,7 @@ CljcEnv *cljc_new_env(void) {
     "                (some (fn [d] (cljc/slurp-maybe (str d \"/\" path))) *load-path*)\n"
     "                (throw (ex-info (str \"load-file: not found on *load-path*: \" path) {})))]\n"
     /* incremental: a leading (ns ..) is active when later forms are read */
-    "    (cljc/eval-forms* src)))\n");
+    "    (cljc/eval-forms* src path)))\n");
     /* Top-level user code runs in the `user` namespace (like Clojure's REPL), so
      * a top-level (:refer [reduce ..]) of a core-shadowing name registers a
      * "user/reduce" refer ALIAS instead of clobbering the global core binding.
@@ -12723,6 +12994,7 @@ static int run_stream(CljcEnv *env, FILE *f, const char *name) {
         return 1;
     }
     rd_line = 1;   /* track source lines for error traces */
+    rd_file_cell = mk_str(name, strlen(name));
     err_src_text = src;            /* retained for error display */
     const char *p = src;
     while (*p) {
@@ -13110,6 +13382,7 @@ static int run_repl(CljcEnv *env) {
         err_src_name = "<repl>";
         rd_line = 1;
         rd_line_start = form;
+        rd_file_cell = NULL;   /* typed forms have no :file (a stale one would mislabel) */
         if (form[0] == '!') {                  /* shell mode: !ls -la */
             const char *cmd = form + 1;
             while (*cmd == ' ') cmd++;
@@ -13135,7 +13408,14 @@ static int run_repl(CljcEnv *env) {
             Cljc *result = eval(env, f);
             repl_record(env, result);
             printf("\x1b[2m[%d]\x1b[0m ", out_n);
-            print(result);
+            {   /* wide results pretty-print instead of wrapping mid-token */
+                SBuf sb = {0};
+                int tw = term_width();
+                print_to(&sb, result, true);
+                if ((int)sb.len > tw - 8) { sb.len = 0; pp_to(&sb, result, 0, tw - 8, 0); }
+                if (sb.data) fwrite(sb.data, 1, sb.len, stdout);
+                free(sb.data);
+            }
             putchar('\n');
             out_n++;
         }
@@ -13386,6 +13666,8 @@ static void usage(FILE *f) {
         "  lint [files...]            reader syntax check, full error rendering\n"
         "  fmt [check] <files...>     format with cljfmt (fix in place; check only)\n"
         "  bundle <file> <out>        script + runtime → one native binary\n"
+        "  watch <file> [args]        run the script, rerun whenever it changes\n"
+        "  doctor                     print resolved load path + batteries\n"
         "  version                    print version\n"
         "  help                       this text\n",
         f);
@@ -13431,6 +13713,7 @@ static int lint_file(CljcEnv *env, const char *path) {
     err_src_name = path;
     err_src_text = src;             /* retained: error rendering may use it */
     rd_line = 1;
+    rd_file_cell = mk_str(path, strlen(path));
     if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; rd_line = 0; return 1; }
     const char *p = src;
     while (*p) {
@@ -13449,6 +13732,105 @@ static int run_script(CljcEnv *env, const char *path) {
     int rc = run_stream(env, f, path);
     fclose(f);
     return rc;
+}
+
+/* `cljc watch <file> [args]` — run the script, rerun when its mtime changes.
+ * Each run is a fresh child process (clean slate: no stale defs, no leaked
+ * state), so this is exec-based rather than in-process. The 200ms poll is
+ * portable everywhere stat is. A run in progress is not interrupted — the
+ * next change is picked up when it finishes. */
+static void watch_sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+#endif
+}
+
+static int run_watch(int argc, char **argv) {
+    if (argc < 3) { usage(stderr); return 1; }
+    const char *file = argv[2];
+    char exe[4096];
+    if (!exe_path(exe, sizeof exe)) {
+        fprintf(stderr, "watch: cannot locate own executable\n");
+        return 1;
+    }
+    SBuf cmd = {0};   /* "exe" "file" "arg"... — double quotes work in sh and cmd */
+    for (int i = 0; i < argc - 1; i++) {
+        const char *a = i == 0 ? exe : argv[i + 1];
+        if (i) sb_putc(&cmd, ' ');
+        sb_putc(&cmd, '"');
+        for (const char *c = a; *c; c++) {
+            if (*c == '"' || *c == '\\') sb_putc(&cmd, '\\');
+            sb_putc(&cmd, *c);
+        }
+        sb_putc(&cmd, '"');
+    }
+    bool color = isatty(fileno(stderr));
+    const char *DIM = color ? "\033[2m" : "";
+    const char *OFF = color ? "\033[0m" : "";
+    time_t last = (time_t)-1;
+    int runs = 0;
+    for (;;) {
+        struct stat st;
+        if (stat(file, &st) != 0) {
+            fprintf(stderr, "watch: cannot stat %s\n", file);
+            free(cmd.data);
+            return 1;
+        }
+        if (st.st_mtime != last) {
+            last = st.st_mtime;
+            if (runs++) fprintf(stderr, "\n%s\u2500\u2500 watch: %s changed, rerunning \u2500\u2500%s\n", DIM, file, OFF);
+            int rc = system(cmd.data);
+#ifndef _WIN32
+            if (rc != -1 && WIFSIGNALED(rc) &&
+                (WTERMSIG(rc) == SIGINT || WTERMSIG(rc) == SIGTERM)) {
+                free(cmd.data);
+                return 130;   /* the user ^C'd the child: stop watching too */
+            }
+            int shown = rc == -1 ? -1 : WIFEXITED(rc) ? WEXITSTATUS(rc) : rc;
+#else
+            int shown = rc;
+#endif
+            fprintf(stderr, "%s\u2500\u2500 watch: exit %d \u2014 waiting for changes to %s \u2500\u2500%s\n",
+                    DIM, shown, file, OFF);
+        }
+        watch_sleep_ms(200);
+    }
+}
+
+/* `cljc doctor` — print the resolved environment so "why isn't my require
+ * finding anything" is a ten-second question, not a debugging session. */
+static int run_doctor(CljcEnv *env) {
+    char exe[4096];
+    printf("cljc %s\n", CLJC_VERSION);
+    printf("executable:     %s\n", exe_path(exe, sizeof exe) ? exe : "(unknown)");
+    printf("built sharedir: %s\n", CLJC_SHAREDIR);
+    printf("load path:\n");
+    bool docs = false, vend = false;
+    char hit_docs[640] = "", hit_vend[640] = "";
+    Binding *b = root_find(env_root(env), intern("*load-path*", 11), NULL, false);
+    if (b && b->value != NIL && b->value->tag == CLJC_VECTOR) {
+        for (size_t i = 0; i < vec_len(b->value); i++) {
+            Cljc *d = vec_nth(b->value, i);
+            if (d == NIL || d->tag != CLJC_STRING) continue;
+            struct stat st;
+            bool ok = stat(d->as.str, &st) == 0 && S_ISDIR(st.st_mode);
+            printf("  %-8s %s\n", ok ? "ok" : "missing", d->as.str);
+            char p[600];
+            FILE *f;
+            snprintf(p, sizeof p, "%s/docs.clj", d->as.str);
+            if (!docs && (f = fopen(p, "r"))) { fclose(f); docs = true; snprintf(hit_docs, sizeof hit_docs, "%s", p); }
+            snprintf(p, sizeof p, "%s/clojure/set.clj", d->as.str);
+            if (!vend && (f = fopen(p, "r"))) { fclose(f); vend = true; snprintf(hit_vend, sizeof hit_vend, "%s", p); }
+        }
+    }
+    printf("batteries:      %s\n",
+           docs ? hit_docs : "NOT FOUND (no docs.clj on the load path) - `make install`, or run from the repo");
+    printf("vendored libs:  %s\n",
+           vend ? hit_vend : "NOT FOUND (no clojure/set.clj on the load path) - requires of clojure.* will fail");
+    return (docs && vend) ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -13491,6 +13873,8 @@ int main(int argc, char **argv) {
         printf("cljc %s\n", CLJC_VERSION);
         return 0;
     }
+    if (!strcmp(cmd, "doctor") || !strcmp(cmd, "--doctor")) return run_doctor(env);
+    if (!strcmp(cmd, "watch") || !strcmp(cmd, "--watch")) return run_watch(argc, argv);
     if (!strcmp(cmd, "repl")) {
         set_args(env, argc, argv, 2);
         return run_repl(env);

@@ -2210,8 +2210,20 @@
       "(defn tt-f [x]\n  (nth [1 2 3] x))\n(defn tt-g [y]\n  (tt-f (+ y 90)))\n(tt-g 9)\n")
 (let [tr (do (try (load-file "cljc_tracetest.clj") (catch Exception e nil))
              (cljc/last-trace*))]
-  (assert= true (clojure.string/includes? tr "at (nth ...) line 2"))   ; innermost frame, exact body line
-  (assert= true (clojure.string/includes? tr "at (tt-g ...) line 5"))) ; top-level tail call framed too
+  ;; frames from a loaded file carry file:line (main-script frames stay bare "line N")
+  (assert= true (clojure.string/includes? tr "at (nth ...) cljc_tracetest.clj:2"))
+  (assert= true (clojure.string/includes? tr "at (tt-g ...) cljc_tracetest.clj:5")))
 (sh "rm -f cljc_tracetest.clj")
+
+; ── QoL round 3: pprint, native arglists, exe-dir ──
+(assert= "{:a 1}" (cljc/pprint-str* {:a 1} 80))
+(let [pp (cljc/pprint-str* (vec (range 40)) 40)]
+  (assert= true (clojure.string/includes? pp "\n"))     ; wide vector breaks across lines
+  (assert= (vec (range 40)) (read-string pp)))          ; and still reads back
+(let [pp (cljc/pprint-str* {:k (vec (range 30)) :other "x"} 50)]
+  (assert= {:k (vec (range 30)) :other "x"} (read-string pp)))
+(assert= true (clojure.string/includes? (doc-str 'conj) "[coll x & xs]"))  ; native arglists in doc
+(assert= '([map key] [map key not-found]) (:arglists (meta (var get))))
+(assert= true (string? (cljc/exe-dir*)))
 
 (println "tests complete")

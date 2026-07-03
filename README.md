@@ -40,8 +40,46 @@ PREFIX=/usr/local ./install.sh    # system-wide
 Installed, `cljc` works from anywhere: batteries (`json.clj`, `fs.clj`,
 `process.clj`, …) and vendored libraries (`clojure.set`, `clojure.tools.logging`,
 `nextjournal.markdown`, medley, …) resolve through `$PREFIX/share/cljc`, with
-`CLJC_PATH` (colon-separated) for extra roots. `cljc --version` tells you what
-you have.
+`CLJC_PATH` (colon-separated) for extra roots. An uninstalled `./cljc` also
+works from any directory (its own directory joins the load path). When requires
+misbehave, `cljc doctor` prints the resolved load path and where the batteries
+were found.
+
+## Day-to-day niceties
+
+**Discovery, in the REPL.** `(doc map)` — docstring *and* arglists, including
+special forms (`(doc if)`) and natives. `(source take-while)` reconstructs a
+fn's stored definition. `(dir clojure.string)` lists a namespace's publics
+(auto-requiring it). `(apropos "index")` and `(find-doc "lazy")` search.
+Tab completes, `Ctrl-R` reverse-searches history, `↑↓` walk it, results are
+numbered (`*1 *2 *3`, `(*results* n)`), wide results pretty-print to your
+terminal width, and multi-line entry indents with paren depth.
+
+**Debugging.** Wrap any subexpression in `(dbg expr)` — or use the reader
+shorthand `#p expr` — and it prints `#dbg file.clj:12 (* x x) => 49` while
+returning the value, so code keeps working while you watch it. After an error,
+`*e` holds the exception and `(pst)` reprints its message and trace. `(pprint x)`
+is a real pretty-printer (fill layout, aligned map values).
+
+**Errors that point somewhere.** Uncaught errors show the offending source line
+with a caret, a trace with exact lines that reaches *inside* function bodies
+(`at (nth ...) other_file.clj:2`), typo suggestions (`Did you mean `println`?`),
+and — when an unresolved symbol's namespace exists on the load path —
+the actual fix: `try (require 'clojure.set) first`. Stack overflows say
+"deep non-tail recursion? use loop/recur". Reader errors carry `file:line`.
+
+**Workflow subcommands.**
+
+```sh
+cljc watch script.clj    # rerun on every save (fresh process each run)
+cljc vendor weavejester/medley                  # or a full git URL:
+cljc vendor https://github.com/clojure/data.json
+cljc doctor              # why isn't my require finding anything?
+```
+
+`cljc vendor` shallow-clones a pure-Clojure library, copies its `.clj`/`.cljc`
+sources into `./vendor/` (already on the load path), then *tries each namespace*
+and reports which load cleanly — JVM-interop-heavy libraries may need porting.
 
 ## Platforms
 
@@ -69,7 +107,7 @@ same `tests.clj` runs everywhere.
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
 | **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*`/`in-ns`/`find-ns`/`all-ns`/`ns-publics`/`ns-interns`/`ns-aliases`/`ns-resolve`, **`^:private` enforced** across namespaces (`#'a/x` var access stays open, like Clojure) |
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`extend-protocol`/`satisfies?`, **`deftype`/`defrecord`** with real method dispatch (this is what lets Emmy/DataScript/instaparse run), `binding` |
-| **Errors** | `throw` any value, `try`/`catch`/`finally`, `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type |
+| **Errors** | `throw` any value, `try`/`catch`/`finally`, `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type, unresolved symbols get typo/require suggestions; uncaught errors render the source line + caret and a `file:line` trace that reaches inside compiled fn bodies (`*e`/`(pst)` for the post-mortem) |
 | **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit`, string readers/writers |
 | **Regex** | self-contained backtracking engine: `\d \w \s`, classes, groups, `(?:…)`, lookahead `(?=)`, alternation, `{n,m}` quantifiers, lazy quantifiers, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
 | **Transducers** | `map`/`filter`/`take`/`mapcat`/… as transducers, `transduce`, `eduction`, `into` with an xform — compose over infinite seqs with `reduced` early-exit |
@@ -91,6 +129,21 @@ Speaks bencode nREPL (`clone` `describe` `eval` `load-file` `close`
 evaluation results come back as `value`, `println` output as `out`
 messages, errors as `err`. Definitions persist across evals. One client
 at a time, loopback only.
+
+Connect in 30 seconds (the server writes `.nrepl-port`, which most clients
+auto-detect):
+
+- **VS Code / Calva** — "Calva: Connect to a Running REPL Server", choose
+  "Generic", accept the detected port.
+- **Emacs / CIDER** — `M-x cider-connect-clj`, host `localhost`, the port
+  from `.nrepl-port`.
+- **Neovim / Conjure** — open a `.clj` file; it picks up `.nrepl-port`
+  automatically.
+- **vim-iced** — `iced connect <port>`.
+
+Expect eval/load-file to work everywhere; completion/introspection middleware
+varies by client (cljc answers the core ops, not the full CIDER middleware
+set).
 
 ## JIT: compile hot functions to native C
 
@@ -213,6 +266,9 @@ reference private puzzle inputs, so they live outside this repo.)
   a `(declare …)` like `libc.clj` does.
 - **Tests**: `clojure.test` is bundled — `deftest`, `is` (with `thrown?`),
   `testing`, `run-tests`.
+- **Dependencies**: `cljc vendor <git-url|github-user/repo>` copies a
+  pure-Clojure library's sources into `./vendor/` and reports which of its
+  namespaces load.
 - **Editor/LSP**: `./cljc --nrepl` for eval (Conjure/CIDER/Calva); clojure-lsp's
   static features work on cljc files via the same clj-kondo analysis.
 

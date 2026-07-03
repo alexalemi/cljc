@@ -46,7 +46,16 @@
 (defn file-exists? [path] (zero? (access path F_OK)))
 (defn cwd [] (cljc_libc_cwd))
 (defn now-epoch [] (cljc/epoch*))
-(defn mkdir-p [path] (mkdir path 493))   ; 0755
+(defn mkdir-p
+  "Create path AND any missing parents (like mkdir -p); 0 when path exists after."
+  [path]
+  (loop [parts (remove empty? (str/split path "/"))
+         cur   (when (str/starts-with? path "/") "")]
+    (if (empty? parts)
+      (if (zero? (access path F_OK)) 0 -1)
+      (let [cur' (if (nil? cur) (first parts) (str cur "/" (first parts)))]
+        (mkdir cur' 493)                       ; 0755; EEXIST is fine
+        (recur (rest parts) cur')))))
 (defn env
   "Environment variable as string, or default."
   ([k] (getenv k))

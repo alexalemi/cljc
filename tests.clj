@@ -1053,6 +1053,14 @@
 (assert= "hello world's" (process/out "echo" "hello world's"))
 (assert= 0 (:exit (process/sh "true")))
 (assert= :threw (try (process/shell "false") (catch Exception e :threw)))
+;; regression: under (require 'process) the ns-local resolution used to make
+;; process/sh's internal bare `sh` mean ITSELF — an infinite tail-call loop
+(require 'process)
+(assert= 0 (:exit (process/sh "true")))
+;; regression: mkdir-p creates PARENTS (it was a bare one-level mkdir)
+(assert= true (fs/create-dir "/tmp/cljc-fs-suite/deep/nested"))
+(assert= true (fs/directory? "/tmp/cljc-fs-suite/deep/nested"))
+(sh "rm -rf /tmp/cljc-fs-suite")
 ) ; end when-unix
 
 ; str/index-of

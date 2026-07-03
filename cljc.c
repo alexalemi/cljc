@@ -663,11 +663,15 @@ static void cljc_check_stack(void) {
     else
 #endif
         floor = main_stack_floor;
-    if (floor && sp < floor) cljc_error("stack overflow");
+    if (floor && sp < floor)
+        cljc_error("stack overflow — usually deep non-tail recursion: "
+                   "use loop/recur (or reduce) instead of self-calls that grow the stack");
 }
 
 static void vpush(Cljc *v) {
-    if (vsp >= vstack_cap) cljc_error("value stack overflow");
+    if (vsp >= vstack_cap)
+        cljc_error("value stack overflow — usually deep non-tail recursion: "
+                   "use loop/recur (or reduce) instead of self-calls that grow the stack");
     vstack[vsp++] = v;
 }
 
@@ -13384,6 +13388,46 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
             memmove(buf + s, buf + pos, len - pos + 1);
             len -= pos - s; pos = s;
         } else if (c == 12) { printf("\x1b[2J\x1b[H"); }  /* ctrl-l */
+        else if (c == 18) {                               /* ctrl-r: reverse-i-search */
+            char q[128] = "";
+            size_t qn = 0;
+            int start = rl_hist_n - 1;
+            for (;;) {
+                int match = -1;
+                for (int i = start; i >= 0; i--)
+                    if (strstr(rl_hist[i], q)) { match = i; break; }
+                char sp[192];
+                snprintf(sp, sizeof sp, "(reverse-i-search)`%s': ", q);
+                if (match >= 0) snprintf(buf, bufcap, "%s", rl_hist[match]);
+                else if (qn) buf[0] = 0;
+                len = pos = strlen(buf);
+                rl_refresh(sp, buf, pos);
+                int k = getchar();
+                if (k == 18) {                            /* again: next older match */
+                    if (match > 0) start = match - 1;
+                } else if (k == 127 || k == 8) {          /* backspace: shrink query */
+                    if (qn) q[--qn] = 0;
+                    start = rl_hist_n - 1;
+                } else if (k >= 32 && k < 127 && qn < sizeof q - 1) {
+                    q[qn++] = (char)k; q[qn] = 0;
+                    start = rl_hist_n - 1;
+                } else if (k == 7 || k == 3) {            /* ctrl-g/ctrl-c: abort */
+                    buf[0] = 0; len = pos = 0;
+                    break;
+                } else if (k == '\r' || k == '\n') {      /* accept + run */
+                    rl_refresh_opt(prompt, buf, len, false);
+                    tcsetattr(0, TCSAFLUSH, &orig);
+                    printf("\r\n");
+                    return true;
+                } else {                                  /* any other key: edit the match */
+                    if (k == 27) { getchar(); getchar(); }  /* swallow the arrow tail */
+                    if (match >= 0) hidx = match;
+                    break;
+                }
+            }
+            rl_refresh(prompt, buf, pos);
+            continue;
+        }
         else if (c == '\t') {
             rl_complete(buf, &len, &pos, prompt);
             continue;
@@ -13485,7 +13529,7 @@ static void repl_record(CljcEnv *env, Cljc *result) {
 
 static int run_repl(CljcEnv *env) {
     hist_load();
-    printf("cljc %s — tab completes, (doc x) (source x) (apropos s), ↑ history, *1 *2 *3 / (*results* n) hold results, !cmd shells out\n",
+    printf("cljc %s — tab completes, (doc x) (source x) (dir ns) (dbg x), ↑/^R history, *1 *2 *3 / (*results* n) hold results, !cmd shells out\n",
            CLJC_VERSION);
     char form[RL_MAX * 4];
     char line[RL_MAX];
@@ -13807,6 +13851,7 @@ static void usage(FILE *f) {
         "  fmt [check] <files...>     format with cljfmt (fix in place; check only)\n"
         "  bundle <file> <out>        script + runtime → one native binary\n"
         "  watch <file> [args]        run the script, rerun whenever it changes\n"
+        "  vendor <git-url|user/repo> copy a library's .clj sources into ./vendor\n"
         "  doctor                     print resolved load path + batteries\n"
         "  version                    print version\n"
         "  help                       this text\n",
@@ -14063,6 +14108,58 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "notebook") || !strcmp(cmd, "clerk")) {
         set_args(env, argc, argv, 2);
         return run_subprogram(env, "(load-file \"clerk.clj\") (clerk/main)", false);
+    }
+    if (!strcmp(cmd, "vendor")) {
+        /* cljc vendor <git-url | github-user/repo> — shallow-clone a
+         * pure-Clojure library and copy its source tree into ./vendor/,
+         * which is on *load-path*. Needs git on PATH. */
+        if (argc < 3) { fputs("usage: cljc vendor <git-url | github-user/repo>\n", stderr); return 1; }
+        set_args(env, argc, argv, 2);
+        return run_subprogram(env,
+            "(require 'fs) (require 'process)\n"
+            "(defn cljc/vendor-walk* [d]\n"
+            "  (mapcat (fn [n] (let [p (str d \"/\" n)]\n"
+            "                    (if (fs/directory? p) (cljc/vendor-walk* p) [p])))\n"
+            "          (fs/list-dir d)))\n"
+            "(let [src (first *args*)\n"
+            "      gh? (re-matches #\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\" src)\n"
+            "      url (if gh? (str \"https://github.com/\" src) src)\n"
+            "      nm  (str/replace (last (str/split url \"/\")) #\"\\.git$\" \"\")\n"
+            "      tmp (str (fs/temp-dir) \"/cljc-vendor-\" nm)]\n"
+            "  (process/sh \"rm\" \"-rf\" tmp)\n"
+            "  (println (str \"Cloning \" url \" ...\"))\n"
+            "  (let [r (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--quiet\" url tmp)]\n"
+            "    (when-not (zero? (:exit r))\n"
+            "      (println (:err r))\n"
+            "      (throw (ex-info (str \"git clone failed for \" url) {}))))\n"
+            "  (let [root (cond (fs/directory? (str tmp \"/src/main/clojure\")) (str tmp \"/src/main/clojure\")\n"
+            "                   (fs/directory? (str tmp \"/src\"))              (str tmp \"/src\")\n"
+            "                   :else tmp)\n"
+            "        rels (->> (cljc/vendor-walk* root)\n"
+            "                  (map (fn [p] (subs p (inc (count root)))))\n"
+            "                  (filter (fn [rel]\n"
+            "                    (and (re-find #\"\\.cljc?$\" rel)\n"
+            "                         (not (re-find #\"(^|/)(test|tests|dev|examples?|perf|bench)/\" rel))\n"
+            "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj)$\" rel))))))]\n"
+            "    (when (empty? rels)\n"
+            "      (throw (ex-info (str \"no .clj/.cljc sources found under \" root) {})))\n"
+            "    (doseq [rel rels]\n"
+            "      (let [dst (str \"vendor/\" rel)]\n"
+            "        (when-let [dir (fs/parent dst)] (fs/create-dir dir))\n"
+            "        (spit dst (slurp (str root \"/\" rel)))))\n"
+            "    (process/sh \"rm\" \"-rf\" tmp)\n"
+            "    (println (str \"Vendored \" (count rels) \" file(s) into vendor/.\"))\n"
+            "    (doseq [rel (sort rels)]\n"
+            "      (let [nsname (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
+            "                           (str/replace \"/\" \".\")\n"
+            "                           (str/replace \"_\" \"-\"))\n"
+            "            r (try (require (symbol nsname)) :ok\n"
+            "                   (catch Exception e (or (ex-message e) \"load failed\")))]\n"
+            "        (if (= r :ok)\n"
+            "          (println (str \"  (require '\" nsname \")   ; loads OK\"))\n"
+            "          (println (str \"  (require '\" nsname \")   ; FAILS: \" r\n"
+            "                        \" — JVM-interop-heavy libraries may need porting\")))))\n"
+            "    true))", true);
     }
     if (!strcmp(cmd, "test")) {
         set_args(env, argc, argv, 2);

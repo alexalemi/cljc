@@ -2247,4 +2247,26 @@
 (assert= 6 #p (* 2 3))                                          ; reader shorthand evaluates through
 (assert= true (fn? pst))
 
+; ── java.time / UUID / boxed-number interop shims ──
+(assert= "2025-07-02T23:46:40Z" (str (java.time.Instant/ofEpochMilli 1751500000000)))
+(assert= "1970-01-01T00:00:00.123Z" (str (java.time.Instant/ofEpochMilli 123)))
+(assert= 1751500000000 (.toEpochMilli (java.time.Instant/ofEpochMilli 1751500000000)))
+(assert= "2025-07-02T23:46:40Z"
+         (.format java.time.format.DateTimeFormatter/ISO_INSTANT
+                  (java.time.Instant/ofEpochMilli 1751500000000)))
+(assert= true (some? (re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+                                 (random-uuid))))                ; real v4, not the zeros stub
+(assert= false (= (random-uuid) (random-uuid)))
+(assert= 12345678901234567890123456N (bigint "12345678901234567890123456"))  ; parses strings
+(assert= 42 (Long/valueOf "42"))
+(assert= "2a" (Integer/toHexString 42))
+(assert= true (.isInfinite ##Inf))
+(assert= false (.isInfinite 1.5))
+(assert= true (.isNaN ##NaN))
+(let [buf (char-array 5)]
+  (.getChars "hello" 1 4 buf 0)                                  ; copy "ell" into buf[0..3)
+  (assert= "ell" (String. buf 0 3)))
+(assert= :boolean java.lang.Boolean)                             ; class keys resolve for (extend ...)
+(assert= :Instant java.time.Instant)
+
 (println "tests complete")

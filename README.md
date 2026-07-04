@@ -77,9 +77,16 @@ cljc vendor https://github.com/clojure/data.json
 cljc doctor              # why isn't my require finding anything?
 ```
 
-`cljc vendor` shallow-clones a pure-Clojure library, copies its `.clj`/`.cljc`
-sources into `./vendor/` (already on the load path), then *tries each namespace*
-and reports which load cleanly — JVM-interop-heavy libraries may need porting.
+`cljc vendor` resolves `group/artifact` against Clojars first (latest release
+jar, extracted with `unzip`/`bsdtar`), falling back to a GitHub shallow clone;
+sources land in `./vendor/` (already on the load path), then it *tries each
+namespace* and reports which load cleanly. Common JVM interop is shimmed —
+`java.time.Instant`/`DateTimeFormatter` (epoch-backed, real ISO-8601),
+`java.util.UUID` (real v4 `random-uuid`), boxed-number methods, class keys for
+`(extend Cls …)` — enough that e.g. `clojure.data.json` vendors and round-trips
+unmodified (byte-oriented strings mean non-ASCII content in *its* escaping path
+can mangle; cljc's own `json.clj` battery handles UTF-8 natively). Heavier
+interop may still need porting.
 
 ## Platforms
 

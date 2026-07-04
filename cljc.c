@@ -8008,6 +8008,14 @@ static Cljc *prim_pprint_str(CljcEnv *env, Cljc **argv, int nargs) {
     return r;
 }
 
+/* (cljc/nan?* x) — the one predicate Clojure-level code can't express here:
+ * = short-circuits on cell identity, and num_cmp treats NaN as equal-to-all. */
+static Cljc *prim_nan_p(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs;
+    Cljc *v = argv[0];
+    return mk_bool(v != NIL && v->tag == CLJC_DOUBLE && v->as.d != v->as.d);
+}
+
 static Cljc *prim_fn_source(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *f = argv[0];
@@ -11065,7 +11073,7 @@ static const char *PRELUDE =
     "(def Character/MAX_CODE_POINT 1114111)\n"
     "(def Double/POSITIVE_INFINITY ##Inf) (def Double/NEGATIVE_INFINITY ##-Inf)\n"
     "(def Double/NaN ##NaN) (def Double/MAX_VALUE 1.7976931348623157E308) (def Double/MIN_VALUE 4.9E-324)\n"
-    "(defn Double/isNaN [x] (not= x x)) (defn Double/isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
+    "(defn Double/isNaN [x] (cljc/nan?* x)) (defn Double/isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
     "(defn Long/bitCount [n]\n"
     "  (loop [n n c 0] (if (zero? n) c (recur (unsigned-bit-shift-right n 1) (+ c (bit-and n 1))))))\n"
     "(def bit-count Long/bitCount)\n"
@@ -11080,7 +11088,10 @@ static const char *PRELUDE =
     "(defn StringBuilder. ([] {:cljc/type :StringBuilder :v (atom \"\")})\n"
     "  ([s] {:cljc/type :StringBuilder :v (atom (str s))}))\n"
     "(defn cljc/sb-str [o] (if (and (map? o) (= :StringBuilder (:cljc/type o))) (deref (:v o)) (str o)))\n"
-    "(defn .append [sb x] (swap! (:v sb) str x) sb)\n"
+    "(defn .append\n"
+    "  ([sb x] (swap! (:v sb) str x) sb)\n"
+    "  ([sb buf off len]   ; StringBuilder.append(char[] off len) — buf holds codepoints\n"
+    "   (swap! (:v sb) str (apply str (map char (take len (drop off (seq buf)))))) sb))\n"
     "(defn .toString [o] (cljc/sb-str o))\n"
     /* A deftype that implements an interface method whose name collides with a
        built-in string .method (e.g. CharSequence length/charAt/subSequence on
@@ -11181,7 +11192,9 @@ static const char *PRELUDE =
     "(defn neg-int? [x] (and (int? x) (neg? x))) (defn pos-int? [x] (and (int? x) (pos? x)))\n"
     /* numeric coercions (cljc ints are int64, no bignum/ratio) */
     "(defn byte [x] (int x)) (defn short [x] (int x)) (defn long [x] (int x))\n"
-    "(defn num [x] x) (defn bigdec [x] x) (defn bigint [x] (int x)) (defn biginteger [x] (int x))\n"
+    "(defn num [x] x) (defn bigdec [x] (if (string? x) (or (parse-double x) x) x))\n"
+    "(defn bigint [x] (if (string? x) (read-string (str x \"N\")) (int x)))\n"
+    "(defn biginteger [x] (bigint x))\n"
     "(defn rationalize [x] x)\n"   /* numerator/denominator are real natives now */
     "(defn double [x] (* 1.0 x)) (defn float [x] (* 1.0 x))\n"
     /* unchecked math == checked in cljc */
@@ -11222,7 +11235,9 @@ static const char *PRELUDE =
     "(defn ex-cause [e] (when (map? e) (:cause e)))\n"
     "(defn tagged-literal [tag form] {:tag tag :form form})\n"
     "(defn compare-and-set! [a old new] (if (= (deref a) old) (do (reset! a new) true) false))\n"
-    "(defn random-uuid [] \"00000000-0000-0000-0000-000000000000\")\n"
+    "(defn random-uuid []\n"
+    "  (let [h (fn [n] (apply str (map (fn [_] (nth \"0123456789abcdef\" (rand-int 16))) (range n))))]\n"
+    "    (str (h 8) \"-\" (h 4) \"-4\" (h 3) \"-\" (nth \"89ab\" (rand-int 4)) (h 3) \"-\" (h 12))))\n"
     "(defn hash-ordered-coll [c] (hash (vec c))) (defn hash-unordered-coll [c] (hash (set c)))\n"
     "(defn hash-combine [a b] (bit-xor (hash a) (hash b)))\n"
     "(defn pop! [coll] coll)\n"
@@ -11928,6 +11943,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/fn-source*", prim_fn_source);
     cljc_define_native(e, "cljc/last-trace*", prim_last_trace);
     cljc_define_native(e, "cljc/pprint-str*", prim_pprint_str);
+    cljc_define_native(e, "cljc/nan?*", prim_nan_p);
     cljc_define_native(e, "int-array",  prim_int_array);
     cljc_define_native(e, "long-array", prim_int_array);
     cljc_define_native(e, "byte-array", prim_int_array);
@@ -12554,6 +12570,92 @@ CljcEnv *cljc_new_env(void) {
         "(defn cljc/reg-method! [mname tkw f]\n"
         "  (swap! cljc/multi-tables update mname assoc tkw f)\n"
         "  (swap! cljc/deftype-methods update mname assoc tkw f))\n"
+        /* ── java.time / java.util.UUID / java class-key shims ──
+           Instants are {:cljc/type :Instant :ms epoch-millis}; formatting uses
+           Hinnant's civil_from_days. Class names are def'd to the keyword that
+           (type instance) reports, so ported libraries' top-level
+           (extend Cls Proto {..}) forms resolve and dispatch. */
+        "(defn cljc/civil-from-ms* [ms]\n"
+        "  (let [days0 (quot ms 86400000) rem0 (- ms (* days0 86400000))\n"
+        "        days (if (neg? rem0) (dec days0) days0)\n"
+        "        msod (if (neg? rem0) (+ rem0 86400000) rem0)\n"
+        "        z (+ days 719468)\n"
+        "        era (quot (if (neg? z) (- z 146096) z) 146097)\n"
+        "        doe (- z (* era 146097))\n"
+        "        yoe (quot (+ (- doe (quot doe 1460)) (- (quot doe 36524) (quot doe 146096))) 365)\n"
+        "        y (+ yoe (* era 400))\n"
+        "        doy (- doe (- (+ (* 365 yoe) (quot yoe 4)) (quot yoe 100)))\n"
+        "        mp (quot (+ (* 5 doy) 2) 153)\n"
+        "        d (inc (- doy (quot (+ (* 153 mp) 2) 5)))\n"
+        "        m (+ mp (if (< mp 10) 3 -9))]\n"
+        "    [(if (<= m 2) (inc y) y) m d msod]))\n"
+        "(defn cljc/instant-iso* [ms]\n"
+        "  (let [[y m d msod] (cljc/civil-from-ms* ms)\n"
+        "        sec (quot msod 1000) frac (rem msod 1000)\n"
+        "        hh (quot sec 3600) mi (quot (rem sec 3600) 60) ss (rem sec 60)]\n"
+        "    (if (zero? frac)\n"
+        "      (format \"%04d-%02d-%02dT%02d:%02d:%02dZ\" y m d hh mi ss)\n"
+        "      (format \"%04d-%02d-%02dT%02d:%02d:%02d.%03dZ\" y m d hh mi ss frac))))\n"
+        "(def java.time.Instant :Instant)\n"
+        "(defn java.time.Instant/now [] {:cljc/type :Instant :ms (long (cljc/now-ms*))})\n"
+        "(defn java.time.Instant/ofEpochMilli [ms] {:cljc/type :Instant :ms (long ms)})\n"
+        "(cljc/reg-method! 'toEpochMilli :Instant (fn [this] (:ms this)))\n"
+        "(cljc/reg-method! 'getEpochSecond :Instant (fn [this] (quot (:ms this) 1000)))\n"
+        "(cljc/reg-method! 'toString :Instant (fn [this] (cljc/instant-iso* (:ms this))))\n"
+        "(def java.time.format.DateTimeFormatter :DateTimeFormatter)\n"
+        "(def java.time.format.DateTimeFormatter/ISO_INSTANT {:cljc/type :DateTimeFormatter :kind :iso-instant})\n"
+        "(cljc/reg-method! 'format :DateTimeFormatter (fn [this t] (cljc/instant-iso* (:ms t))))\n"
+        "(def java.util.Date :Date)\n"
+        "(defn java.util.Date. ([] {:cljc/type :Date :ms (long (cljc/now-ms*))})\n"
+        "                      ([ms] {:cljc/type :Date :ms (long ms)}))\n"
+        "(cljc/reg-method! 'toInstant :Date (fn [this] {:cljc/type :Instant :ms (:ms this)}))\n"
+        "(cljc/reg-method! 'getTime :Date (fn [this] (:ms this)))\n"
+        "(cljc/reg-method! 'toString :Date (fn [this] (cljc/instant-iso* (:ms this))))\n"
+        "(def java.sql.Date :SqlDate)\n"
+        "(def java.time.ZoneId :ZoneId)\n"
+        "(defn java.time.ZoneId/systemDefault [] {:cljc/type :ZoneId})\n"
+        "(def java.util.UUID :UUID)\n"
+        "(defn java.util.UUID/randomUUID [] (random-uuid))\n"
+        "(defn java.util.UUID/fromString [s] s)\n"
+        "(defn UUID/randomUUID [] (random-uuid))\n"
+        "(def class type)\n"
+        "(def java.lang.CharSequence :java.lang.CharSequence)\n"
+        "(derive :string :java.lang.CharSequence)\n"
+        "(def clojure.lang.Named :clojure.lang.Named)\n"
+        "(derive :keyword :clojure.lang.Named) (derive :symbol :clojure.lang.Named)\n"
+        "(def java.lang.Double :double) (def java.lang.Long :int) (def java.lang.Integer :int)\n"
+        "(def java.lang.Boolean :boolean) (def java.lang.Byte :int) (def java.lang.Short :int)\n"
+        "(def java.lang.Float :double) (def java.lang.Character :char)\n"
+        "(def java.math.BigInteger :bigint) (def clojure.lang.BigInt :bigint)\n"
+        "(def java.math.BigDecimal :BigDecimal)\n"
+        "(def clojure.lang.Ratio :ratio)\n"
+        "(def java.util.Collection :java.util.Collection)\n"
+        "(derive :vector :java.util.Collection) (derive :list :java.util.Collection)\n"
+        "(derive :set :java.util.Collection) (derive :lazy-seq :java.util.Collection)\n"
+        "(def java.util.concurrent.atomic.AtomicInteger :AtomicInteger)\n"
+        "(def java.util.concurrent.atomic.AtomicLong :AtomicLong)\n"
+        /* boxed-number instance methods (Double.isInfinite etc.) as global
+           dot-fns — plain doubles/ints aren't tagged maps, so these dispatch
+           as ordinary functions */
+        "(defn Math/min [a b] (min a b)) (defn Math/max [a b] (max a b))\n"
+        "(defn Math/round [x] (long (Math/floor (+ (double x) 0.5))))\n"
+        "(defn String.\n"
+        "  ([x] (if (string? x) x (apply str (map char (seq x)))))\n"
+        "  ([buf off len] (apply str (map char (take len (drop off (seq buf)))))))\n"
+        "(defn .getChars [s from end buf off]   ; String.getChars(srcBegin srcEnd dst[] dstBegin)\n"
+        "  (dotimes [i (- end from)]\n"
+        "    (aset buf (+ off i) (int (.charAt s (+ from i)))))\n"
+        "  nil)\n"
+        "(defn Long/valueOf [s] (or (parse-long s) (throw (ex-info (str \"bad long: \" s) {}))))\n"
+        "(defn Integer/toHexString [n] (format \"%x\" n))\n"
+        "(defn Long/toHexString [n] (format \"%x\" n))\n"
+        "(defn Double/valueOf [s] (or (parse-double s) (throw (ex-info (str \"bad double: \" s) {}))))\n"
+        "(defn EOFException. [msg] (ex-info msg {:type :eof}))\n"
+        "(defn .isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
+        "(defn .isNaN [x] (cljc/nan?* x))\n"
+        "(defn .doubleValue [x] (double x))\n"
+        "(defn .longValue [x] (long x))\n"
+        "(defn .intValue [x] (int x))\n"
         /* Clojure signature: (defmulti name docstring? attr-map? dispatch-fn
            & options). Skip a leading docstring/attr-map; the next form is the
            dispatch fn; remaining key-vals are options (we honour :default). */
@@ -13624,7 +13726,7 @@ static void bw_cstr(FILE *f, const char *s) { bw_str(f, s, strlen(s)); }
 static void bw_kv(FILE *f, const char *k, const char *v) { bw_cstr(f, k); bw_cstr(f, v); }
 
 /* ── bencode reading: pull out the string fields we care about ── */
-typedef struct { char *op, *code, *id, *session, *file; } NreplMsg;
+typedef struct { char *op, *code, *id, *session, *file, *prefix, *sym; } NreplMsg;
 
 static char *br_string(FILE *f, int first) {
     size_t n = (size_t)(first - '0');
@@ -13674,6 +13776,9 @@ static bool nrepl_read(FILE *f, NreplMsg *m) {
             else if (!strcmp(key, "id"))      m->id = val;
             else if (!strcmp(key, "session")) m->session = val;
             else if (!strcmp(key, "file"))    m->file = val;
+            else if (!strcmp(key, "prefix"))  m->prefix = val;
+            else if (!strcmp(key, "sym"))     m->sym = val;
+            else if (!strcmp(key, "symbol") && !m->sym) m->sym = val;  /* older clients */
             else free(val);
         } else if (!br_skip(f, c)) { free(key); return false; }
         free(key);
@@ -13682,6 +13787,7 @@ static bool nrepl_read(FILE *f, NreplMsg *m) {
 
 static void nrepl_free(NreplMsg *m) {
     free(m->op); free(m->code); free(m->id); free(m->session); free(m->file);
+    free(m->prefix); free(m->sym);
 }
 
 /* ── responses: every reply echoes id + session ── */
@@ -13712,6 +13818,84 @@ static void resp_field(FILE *f, NreplMsg *m, const char *key, const char *val, s
     bw_cstr(f, key); bw_str(f, val, n);
     fputc('e', f);
     fflush(f);
+}
+
+/* nREPL 0.8 "completions" (and cider-style "complete"): candidates from the
+ * flat root bindings — a qualified prefix like "str/jo" matches naturally. */
+static void nrepl_completions(FILE *out, NreplMsg *m, CljcEnv *env, const char *prefix) {
+    resp_head(out, m);
+    bw_cstr(out, "completions");
+    fputc('l', out);
+    size_t plen = strlen(prefix);
+    int shown = 0;
+    for (Binding *b = env_root(env)->bindings; b && shown < 200; b = b->next) {
+        if (strncmp(b->name, prefix, plen)) continue;
+        if (strstr(b->name, "**") || !strncmp(b->name, "cljc/", 5)) continue;
+        Cljc *v = b->value;
+        const char *ty = "var";
+        if (v != NIL && v->tag == CLJC_FN) ty = v->as.fn.is_macro ? "macro" : "function";
+        else if (v != NIL && v->tag == CLJC_NATIVE) ty = "function";
+        fputc('d', out);
+        bw_kv(out, "candidate", b->name);
+        bw_kv(out, "type", ty);
+        fputc('e', out);
+        shown++;
+    }
+    fputc('e', out);
+    bw_cstr(out, "status");
+    fputc('l', out); bw_cstr(out, "done"); fputc('e', out);
+    fputc('e', out);
+    fflush(out);
+}
+
+/* nREPL 0.8 "lookup" (nested info dict) and cider-style "info" (flat keys):
+ * name/doc/arglists from the doc registry + fn arities. */
+static void nrepl_lookup(FILE *out, NreplMsg *m, CljcEnv *env, const char *symname,
+                         bool nested) {
+    /* core docstrings live in docs.clj, lazily loaded; run the loader under a
+     * handler frame so a broken docs file can't longjmp past the server loop */
+    Cljc *volatile info = NIL;
+    ErrFrame fr;
+    fr.prev = err_top; fr.vsp_save = vsp; fr.esp_save = eval_sp;
+    fr.vm_tsp_save = vm_tsp; fr.rd_line_save = rd_line;
+    fr.rd_start_save = rd_line_start; fr.rd_file_save = rd_file_cell;
+    err_top = &fr;
+    if (setjmp(fr.jb) == 0) {
+        Binding *ed = root_find(env_root(env), intern("cljc/ensure-docs!", 17), NULL, false);
+        if (ed && ed->value != NIL) apply(env_root(env), ed->value, NULL, 0);
+        Cljc *a1[1] = { mk_sym(intern(symname, strlen(symname))) };
+        info = prim_doc_info(env_root(env), a1, 1);
+        err_top = fr.prev;
+    } else {
+        err_top = fr.prev;
+        vsp = fr.vsp_save; eval_sp = fr.esp_save; vm_tsp = fr.vm_tsp_save;
+        rd_line = fr.rd_line_save; rd_line_start = fr.rd_start_save;
+        rd_file_cell = fr.rd_file_save;
+        info = NIL;
+    }
+    resp_head(out, m);
+    if (info != NIL && info->tag == CLJC_MAP) {
+        if (nested) { bw_cstr(out, "info"); fputc('d', out); }
+        Cljc *v;
+        if (map_find(info, mk_kw(intern("name", 4)), &v) && v->tag == CLJC_STRING)
+            bw_kv(out, "name", v->as.str);
+        if (map_find(info, mk_kw(intern("doc", 3)), &v) && v != NIL && v->tag == CLJC_STRING)
+            bw_kv(out, "doc", v->as.str);
+        if (map_find(info, mk_kw(intern("arglists", 8)), &v) && v != NIL && v->tag == CLJC_LIST) {
+            SBuf sb = {0};
+            print_to(&sb, v, true);
+            bw_cstr(out, "arglists-str");
+            bw_str(out, sb.data ? sb.data : "", sb.len);
+            free(sb.data);
+        }
+        if (nested) fputc('e', out);
+    }
+    bw_cstr(out, "status");
+    fputc('l', out); bw_cstr(out, "done");
+    if (info == NIL) bw_cstr(out, "no-info");
+    fputc('e', out);
+    fputc('e', out);
+    fflush(out);
 }
 
 static void nrepl_eval(FILE *out, NreplMsg *m, CljcEnv *env, const char *code) {
@@ -13761,7 +13945,8 @@ static void nrepl_serve_client(int fd, CljcEnv *env) {
             bw_cstr(out, "ops");
             fputc('d', out);
             const char *ops[] = {"clone","describe","eval","load-file","close",
-                                 "ls-sessions","interrupt", NULL};
+                                 "ls-sessions","interrupt","completions","complete",
+                                 "lookup","info", NULL};
             for (int i = 0; ops[i]; i++) { bw_cstr(out, ops[i]); fputs("de", out); }
             fputc('e', out);
             bw_cstr(out, "versions");
@@ -13778,6 +13963,10 @@ static void nrepl_serve_client(int fd, CljcEnv *env) {
             nrepl_eval(out, &m, env, m.code);
         } else if (!strcmp(op, "load-file") && m.file) {
             nrepl_eval(out, &m, env, m.file);
+        } else if ((!strcmp(op, "completions") || !strcmp(op, "complete")) && m.prefix) {
+            nrepl_completions(out, &m, env, m.prefix);
+        } else if ((!strcmp(op, "lookup") || !strcmp(op, "info")) && m.sym) {
+            nrepl_lookup(out, &m, env, m.sym, !strcmp(op, "lookup"));
         } else if (!strcmp(op, "close") || !strcmp(op, "ls-sessions")
                    || !strcmp(op, "interrupt")) {
             resp_status(out, &m, "done");
@@ -14110,10 +14299,13 @@ int main(int argc, char **argv) {
         return run_subprogram(env, "(load-file \"clerk.clj\") (clerk/main)", false);
     }
     if (!strcmp(cmd, "vendor")) {
-        /* cljc vendor <git-url | github-user/repo> — shallow-clone a
-         * pure-Clojure library and copy its source tree into ./vendor/,
-         * which is on *load-path*. Needs git on PATH. */
-        if (argc < 3) { fputs("usage: cljc vendor <git-url | github-user/repo>\n", stderr); return 1; }
+        /* cljc vendor <source> — fetch a pure-Clojure library into ./vendor/
+         * (already on *load-path*) and report which namespaces load.
+         *   group/artifact  -> Clojars latest release jar (curl + unzip/bsdtar),
+         *                      falling back to a GitHub shallow clone (git)
+         *   https://...jar  -> that jar
+         *   any other URL   -> git shallow clone */
+        if (argc < 3) { fputs("usage: cljc vendor <group/artifact | git-url | jar-url>\n", stderr); return 1; }
         set_args(env, argc, argv, 2);
         return run_subprogram(env,
             "(require 'fs) (require 'process)\n"
@@ -14121,26 +14313,59 @@ int main(int argc, char **argv) {
             "  (mapcat (fn [n] (let [p (str d \"/\" n)]\n"
             "                    (if (fs/directory? p) (cljc/vendor-walk* p) [p])))\n"
             "          (fs/list-dir d)))\n"
-            "(let [src (first *args*)\n"
-            "      gh? (re-matches #\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\" src)\n"
-            "      url (if gh? (str \"https://github.com/\" src) src)\n"
-            "      nm  (str/replace (last (str/split url \"/\")) #\"\\.git$\" \"\")\n"
-            "      tmp (str (fs/temp-dir) \"/cljc-vendor-\" nm)]\n"
-            "  (process/sh \"rm\" \"-rf\" tmp)\n"
+            "(defn cljc/vendor-unjar* [jar dir]\n"
+            "  (fs/create-dir dir)\n"
+            "  (or (zero? (:exit (process/sh \"unzip\" \"-q\" \"-o\" jar \"-d\" dir)))\n"
+            "      (zero? (:exit (process/sh \"bsdtar\" \"-xf\" jar \"-C\" dir)))\n"
+            "      (throw (ex-info \"cannot extract jar: need unzip or bsdtar on PATH\" {}))))\n"
+            "(defn cljc/vendor-clojars* [coord tmp]\n"
+            "  ;; nil when the coord isn't on Clojars; else the extracted source root\n"
+            "  (let [[g a] (str/split coord \"/\")\n"
+            "        base (str \"https://repo.clojars.org/\" (str/replace g \".\" \"/\") \"/\" a)\n"
+            "        meta (:out (process/sh \"curl\" \"-fsSL\" (str base \"/maven-metadata.xml\")))\n"
+            "        ver  (and meta (or (second (re-find #\"<release>([^<]+)</release>\" meta))\n"
+            "                           (last (map second (re-seq #\"<version>([^<]+)</version>\" meta)))))]\n"
+            "    (when ver\n"
+            "      (let [jar (str tmp \".jar\")\n"
+            "            url (str base \"/\" ver \"/\" a \"-\" ver \".jar\")]\n"
+            "        (println (str \"Fetching Clojars \" coord \" \" ver \" ...\"))\n"
+            "        (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" url \"-o\" jar)))\n"
+            "          (throw (ex-info (str \"download failed: \" url) {})))\n"
+            "        (cljc/vendor-unjar* jar tmp)\n"
+            "        (process/sh \"rm\" \"-f\" jar)\n"
+            "        tmp))))\n"
+            "(defn cljc/vendor-git* [url tmp]\n"
             "  (println (str \"Cloning \" url \" ...\"))\n"
             "  (let [r (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--quiet\" url tmp)]\n"
             "    (when-not (zero? (:exit r))\n"
             "      (println (:err r))\n"
             "      (throw (ex-info (str \"git clone failed for \" url) {}))))\n"
-            "  (let [root (cond (fs/directory? (str tmp \"/src/main/clojure\")) (str tmp \"/src/main/clojure\")\n"
-            "                   (fs/directory? (str tmp \"/src\"))              (str tmp \"/src\")\n"
-            "                   :else tmp)\n"
+            "  (cond (fs/directory? (str tmp \"/src/main/clojure\")) (str tmp \"/src/main/clojure\")\n"
+            "        (fs/directory? (str tmp \"/src\"))              (str tmp \"/src\")\n"
+            "        :else tmp))\n"
+            "(let [src (first *args*)\n"
+            "      coord? (re-matches #\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\" src)\n"
+            "      nm  (str/replace (last (str/split src \"/\")) #\"\\.(git|jar)$\" \"\")\n"
+            "      tmp (str (fs/temp-dir) \"/cljc-vendor-\" nm)]\n"
+            "  (process/sh \"rm\" \"-rf\" tmp)\n"
+            "  (let [root (cond\n"
+            "               (re-find #\"\\.jar$\" src)\n"
+            "               (do (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" src \"-o\" (str tmp \".jar\"))))\n"
+            "                     (throw (ex-info (str \"download failed: \" src) {})))\n"
+            "                   (cljc/vendor-unjar* (str tmp \".jar\") tmp)\n"
+            "                   (process/sh \"rm\" \"-f\" (str tmp \".jar\"))\n"
+            "                   tmp)\n"
+            "               coord?\n"
+            "               (or (cljc/vendor-clojars* src tmp)\n"
+            "                   (cljc/vendor-git* (str \"https://github.com/\" src) tmp))\n"
+            "               :else (cljc/vendor-git* src tmp))\n"
             "        rels (->> (cljc/vendor-walk* root)\n"
             "                  (map (fn [p] (subs p (inc (count root)))))\n"
             "                  (filter (fn [rel]\n"
             "                    (and (re-find #\"\\.cljc?$\" rel)\n"
+            "                         (not (re-find #\"^(META-INF|test|tests|dev|examples?|perf|bench)/\" rel))\n"
             "                         (not (re-find #\"(^|/)(test|tests|dev|examples?|perf|bench)/\" rel))\n"
-            "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj)$\" rel))))))]\n"
+            "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj|deps\\.cljs|data_readers\\.cljc?)$\" rel))))))]\n"
             "    (when (empty? rels)\n"
             "      (throw (ex-info (str \"no .clj/.cljc sources found under \" root) {})))\n"
             "    (doseq [rel rels]\n"

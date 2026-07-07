@@ -2306,4 +2306,23 @@
 (assert= "𝄞𝄞" (re-find #"𝄞+" "𝄞𝄞x"))                    ; astral literal + quantifier
 (assert= '("1" "22" "333") (re-seq #"\d+" "a1 b22 c333")) ; ASCII path untouched
 
+; ── REPL-survival round: value-naming errors, capped lazy print, trace-vars ──
+(assert= true (clojure.string/includes?
+               (ex-message (try (+ 1 :kw) (catch Exception e e))) ":kw"))
+(assert= true (clojure.string/includes?
+               (ex-message (try (inc "41") (catch Exception e e))) "\"41\""))
+(def *print-length* 3)
+(assert= "(0 1 2 ...)" (pr-str (range)))          ; infinite seq prints capped, not forever
+(assert= "(0 1 2 ...)" (pr-str (iterate inc 0)))
+(def *print-length* nil)
+(defn traced-fact [n] (if (zero? n) 1 (* n (traced-fact (dec n)))))
+(trace-vars traced-fact)
+(let [out (with-out-str (assert= 6 (traced-fact 3)))]
+  (assert= true (clojure.string/includes? out "TRACE (traced-fact 3)"))
+  (assert= true (clojure.string/includes? out "|  |  (traced-fact 1)"))  ; depth indent
+  (assert= true (clojure.string/includes? out "=> 6")))
+(untrace-vars traced-fact)
+(assert= "" (with-out-str (traced-fact 3)))        ; untraced: silent again
+(assert= true (fn? vendor!))                       ; vendor! callable from the REPL
+
 (println "tests complete")

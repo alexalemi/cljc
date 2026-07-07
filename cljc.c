@@ -484,6 +484,19 @@ static int rd_line;                 /* 1-based; 0 = no tracking */
 static const char *rd_line_start;   /* for column computation */
 static char err_trace[1536];
 static char err_file[160];         /* :file of the innermost located frame ("" = none) */
+/* Ctrl-C during a REPL evaluation: the SIGINT handler sets this; eval() and
+ * VOP_CALL raise a catchable "interrupted" error at the next call boundary.
+ * Only the REPL installs the handler — scripts keep default-die semantics
+ * (cljc watch relies on WIFSIGNALED to stop its loop). */
+static volatile sig_atomic_t g_interrupt;
+static void cljc_on_sigint(int sig) { (void)sig; g_interrupt = 1; }
+#ifdef _WIN32
+static BOOL WINAPI cljc_ctrl_handler(DWORD t) {
+    /* 1/0, not TRUE/FALSE: those names are cljc's boolean singletons here */
+    if (t == CTRL_C_EVENT) { g_interrupt = 1; return 1; }
+    return 0;   /* CTRL_BREAK etc: default handling */
+}
+#endif
 static const char *err_src_text;   /* retained main-script source */
 static const char *err_src_name;   /* its display name */
 static long long err_line = -1;    /* innermost located frame at raise */
@@ -606,6 +619,37 @@ static const char *val_type_name(Cljc *v) {
         case CLJC_IARRAY:  return "an int-array";
         default:           return "a value";
     }
+}
+
+/* Like val_type_name but names the VALUE too when it's a scalar:
+ * "a keyword: :foo" answers the question a bare type name only raises.
+ * Two rotating buffers so one message can describe two values. */
+static const char *val_desc(Cljc *v) {
+    static char bufs[2][96];
+    static int which;
+    if (v == NIL || v == NULL) return "nil";
+    char *b = bufs[which ^= 1];
+    const char *t = val_type_name(v);
+    switch (v->tag) {
+        case CLJC_INT:     snprintf(b, 96, "%s: %lld", t, (long long)v->as.i); break;
+        case CLJC_DOUBLE:  snprintf(b, 96, "%s: %g", t, v->as.d); break;
+        case CLJC_KEYWORD: snprintf(b, 96, "%s: :%.60s", t, v->as.kw); break;
+        case CLJC_SYMBOL:  snprintf(b, 96, "%s: %.60s", t, v->as.sym); break;
+        case CLJC_BOOL:    snprintf(b, 96, "%s: %s", t, v->as.b ? "true" : "false"); break;
+        case CLJC_CHAR:
+            if (v->as.chr >= 33 && v->as.chr < 127)
+                snprintf(b, 96, "%s: \\%c", t, (char)v->as.chr);
+            else return t;
+            break;
+        case CLJC_STRING:
+            if (v->as.strx.nbytes > 40)
+                snprintf(b, 96, "%s: \"%.40s...\"", t, v->as.str);
+            else
+                snprintf(b, 96, "%s: \"%s\"", t, v->as.str);
+            break;
+        default: return t;   /* collections/fns: the type name says enough */
+    }
+    return b;
 }
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -2234,7 +2278,7 @@ static Cljc *peel_meta_sym(Cljc *v) { return peel_meta_sym_doc(v, NULL, NULL); }
 
 static int64_t as_int(Cljc *v, const char *what) {
     if (v == NULL || v->tag != CLJC_INT)
-        cljc_error("%s: expected a number, got %s", what, val_type_name(v));
+        cljc_error("%s: expected a number, got %s", what, val_desc(v));
     return v->as.i;
 }
 
@@ -3905,6 +3949,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                     vsp -= n + 1;
                     r = eval(env, K[a >> 8]);
                 } else {
+                    if (g_interrupt) { g_interrupt = 0; cljc_error("interrupted"); }
                     /* mark the in-flight call for error traces. Deliberately
                      * never cleared: a raise at a non-recording op (unresolved
                      * sym, destructure) then shows the body's previous call —
@@ -4245,7 +4290,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
         if (a0 != NIL && a0->tag == CLJC_MAP && map_find(a0, fn, &out)) return out;
         return a1;
     }
-    cljc_error("%s is not callable as a function", val_type_name(fn));
+    cljc_error("%s is not callable as a function", val_desc(fn));
     return NIL;
 }
 
@@ -4468,6 +4513,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form);
 /* eval wrapper: maintains the form stack that error traces snapshot.
  * longjmp unwinds restore eval_sp from ErrFrames / top-level handlers. */
 static Cljc *eval(CljcEnv *env, Cljc *form) {
+    if (g_interrupt) { g_interrupt = 0; cljc_error("interrupted"); }
     if (form == NULL || form == NIL) return NIL;
     if (form->tag != CLJC_LIST) return eval_inner(env, form);
     if (eval_sp < EVAL_STACK_MAX) {
@@ -5524,7 +5570,8 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             print_to(sb, v->as.atom.value, readably);
             sb_putc(sb, ']');
             break;
-        case CLJC_LAZY: { Cljc *s = to_seq(v);   /* realizes! empty seq prints () */
+        case CLJC_LAZY: { Cljc *s = seq1(v);   /* ONE level: the list loop steps
+            lazily and honors *print-length*, so infinite seqs print capped */
             print_to(sb, s == NIL ? EMPTY : s, readably); break; }
         case CLJC_RECUR:  sb_puts(sb, "#<recur>"); break;
         case CLJC_CHUNK:  sb_puts(sb, "#<chunk>"); break;
@@ -5609,6 +5656,7 @@ static void pp_to(SBuf *sb, Cljc *v, int col, int width, int depth) {
             Cljc *e = NIL; size_t vn = 0, vi = 0;
             if (is_vec) vn = vec_len(v);
             else if (v->tag == CLJC_SORTED) e = sorted_entry_list(v);
+            else if (v->tag == CLJC_LAZY) { e = seq1(v); if (e == NIL) return; }
             else { e = to_seq(v); if (e == NIL) return; }
             sb->len = start;
             sb_puts(sb, is_set ? "#{" : is_vec ? "[" : "(");
@@ -5646,7 +5694,13 @@ static void pp_to(SBuf *sb, Cljc *v, int col, int width, int depth) {
 
 /* Width of the attached terminal, for the REPL's break-or-fit decision. */
 static int term_width(void) {
-#ifndef _WIN32
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        int w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        if (w > 20) return w;
+    }
+#else
     struct winsize ws;
     if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20) return ws.ws_col;
 #endif
@@ -6040,7 +6094,7 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         if (v->tag == CLJC_DOUBLE) is_float = true;
         else if (v->tag == CLJC_BIGINT) is_big = true;
         else if (v->tag == CLJC_RATIO) is_ratio = true;
-        else if (v->tag != CLJC_INT) cljc_error("expected a number, got %s", val_type_name(v));
+        else if (v->tag != CLJC_INT) cljc_error("expected a number, got %s", val_desc(v));
     }
     if (n == 0) {
         if (op == OP_ADD) return mk_int(0);
@@ -6312,7 +6366,7 @@ static double as_num(Cljc *v) {
     if (v->tag == CLJC_DOUBLE) return v->as.d;
     if (v->tag == CLJC_BIGINT) return big_to_double(v);
     if (v->tag == CLJC_RATIO) return ratio_to_double(v);
-    cljc_error("expected a number, got %s", val_type_name(v));
+    cljc_error("expected a number, got %s", val_desc(v));
     return 0;
 }
 
@@ -6323,7 +6377,7 @@ static int num_cmp(Cljc *a, Cljc *b) {
     int ta = a->tag, tb = b->tag;
 #define CLJC_ISNUM(t) ((t) == CLJC_INT || (t) == CLJC_DOUBLE || (t) == CLJC_BIGINT || (t) == CLJC_RATIO)
     if (!CLJC_ISNUM(ta) || !CLJC_ISNUM(tb))
-        cljc_error("can't compare numerically: got %s", val_type_name(!CLJC_ISNUM(ta) ? a : b));
+        cljc_error("can't compare numerically: got %s", val_desc(!CLJC_ISNUM(ta) ? a : b));
     if (ta == CLJC_DOUBLE || tb == CLJC_DOUBLE) {
         double x = as_num(a), y = as_num(b); return x < y ? -1 : (x > y ? 1 : 0);
     }
@@ -6458,7 +6512,7 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
     if (tag == CLJC_SORTED)
         return mk_int((int64_t)sorted_count(argv[0]));
     if (tag == CLJC_STRING) return mk_int((int64_t)str_cp_count(argv[0]));
-    cljc_error("count: %s is not countable", val_type_name(argv[0]));
+    cljc_error("count: %s is not countable", val_desc(argv[0]));
     return NIL;
 }
 
@@ -6554,7 +6608,7 @@ static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
                     r = map_assoc(r, s->as.cons.head, s->as.cons.tail->as.cons.head);
                 else cljc_error("conj on map: expected a [k v] entry or a map");
             } else cljc_error("conj on map: expected a [k v] entry or a map");
-        } else cljc_error("conj: can't add to %s", val_type_name(r));
+        } else cljc_error("conj: can't add to %s", val_desc(r));
     }
     return r;
 }
@@ -6655,7 +6709,7 @@ static Cljc *prim_empty_p(CljcEnv *env, Cljc **argv, int nargs) {
     }
     if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
     if (v->tag == CLJC_SORTED) return mk_bool(sorted_count(v) == 0);
-    cljc_error("empty?: %s is not a collection", val_type_name(v));
+    cljc_error("empty?: %s is not a collection", val_desc(v));
     return NIL;
 }
 
@@ -6820,11 +6874,11 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
         }
         else if (r->tag == CLJC_VECTOR) {
             if (k->tag != CLJC_INT)
-                cljc_error("assoc: vector index must be an integer, got %s", val_type_name(k));
+                cljc_error("assoc: vector index must be an integer, got %s", val_desc(k));
             if (k->as.i < 0)
                 cljc_error("assoc: index %lld out of bounds for length %zu", (long long)k->as.i, vec_len(r));
             r = vec_assoc_idx(r, (size_t)k->as.i, v);  /* assoc at len appends */
-        } else cljc_error("assoc: %s is not associative", val_type_name(r));
+        } else cljc_error("assoc: %s is not associative", val_desc(r));
     }
     return r;
 }
@@ -6836,7 +6890,7 @@ static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs) {
         for (int i = 1; i < nargs; i++) m = sorted_remove(env, m, argv[i]);
         return m;
     }
-    if (m->tag != CLJC_MAP) cljc_error("dissoc: expected a map, got %s", val_type_name(m));
+    if (m->tag != CLJC_MAP) cljc_error("dissoc: expected a map, got %s", val_desc(m));
     for (int i = 1; i < nargs; i++)
         m = map_dissoc_one(m, argv[i]);
     return m;
@@ -6863,7 +6917,7 @@ static Cljc *prim_keys(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("keys: expected a map, got %s", val_type_name(m));
+    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("keys: expected a map, got %s", val_desc(m));
     return map_kv_list(m, 0);
 }
 
@@ -6871,7 +6925,7 @@ static Cljc *prim_vals(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("vals: expected a map, got %s", val_type_name(m));
+    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("vals: expected a map, got %s", val_desc(m));
     return map_kv_list(m, 1);
 }
 
@@ -6884,7 +6938,7 @@ static Cljc *prim_contains_p(CljcEnv *env, Cljc **argv, int nargs) {
     if (coll->tag == CLJC_SORTED) return mk_bool(sorted_contains(env, coll, k));
     if (coll->tag == CLJC_VECTOR)  /* contains? checks INDEX presence on vectors */
         return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
-    cljc_error("contains?: %s is not associative", val_type_name(coll));
+    cljc_error("contains?: %s is not associative", val_desc(coll));
     return NIL;
 }
 
@@ -6893,7 +6947,7 @@ static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Cljc *m = argv[ai_];
         if (m == NIL) continue;
-        if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("merge: %s is not a map", val_type_name(m));
+        if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("merge: %s is not a map", val_desc(m));
         if (r == NIL) { r = m; continue; }
         /* preserve the first map's type (a sorted map merges into a sorted map) */
         if (m->tag == CLJC_SORTED) {
@@ -7113,7 +7167,7 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
-    cljc_error("don't know how to make a seq from %s", val_type_name(v));
+    cljc_error("don't know how to make a seq from %s", val_desc(v));
     return NIL;
 }
 
@@ -8708,7 +8762,7 @@ static Cljc *prim_ex_data(CljcEnv *env, Cljc **argv, int nargs) {
 /* ── Atoms ── */
 
 static Cljc *as_atom(Cljc *v, const char *what) {
-    if (v == NIL || v->tag != CLJC_ATOM) cljc_error("%s: expected an atom, got %s", what, val_type_name(v));
+    if (v == NIL || v->tag != CLJC_ATOM) cljc_error("%s: expected an atom, got %s", what, val_desc(v));
     return v;
 }
 
@@ -8822,7 +8876,7 @@ static int cmp_values(Cljc *a, Cljc *b) {
     bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE || a->tag == CLJC_BIGINT || a->tag == CLJC_RATIO;
     bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE || b->tag == CLJC_BIGINT || b->tag == CLJC_RATIO;
     if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
-    if (a->tag != b->tag) cljc_error("compare: %s and %s are not comparable", val_type_name(a), val_type_name(b));
+    if (a->tag != b->tag) cljc_error("compare: %s and %s are not comparable", val_desc(a), val_desc(b));
     switch (a->tag) {
         case CLJC_STRING:  return strcmp(a->as.str, b->as.str);
         case CLJC_CHAR:    return a->as.chr - b->as.chr;
@@ -8838,7 +8892,7 @@ static int cmp_values(Cljc *a, Cljc *b) {
             }
             return sa != NIL ? 1 : sb != NIL ? -1 : 0;  /* shorter sorts first */
         }
-        default: cljc_error("compare: %s is not comparable", val_type_name(a));
+        default: cljc_error("compare: %s is not comparable", val_desc(a));
     }
     return 0;
 }
@@ -9307,7 +9361,7 @@ static char *strval_or_char(Cljc *v, char buf[5], const char *what) {
 
 static Cljc *prim_index_of(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    if (argv[0] != NIL && argv[0]->tag != CLJC_STRING) cljc_error("str/index-of: expected a string, got %s", val_type_name(argv[0]));
+    if (argv[0] != NIL && argv[0]->tag != CLJC_STRING) cljc_error("str/index-of: expected a string, got %s", val_desc(argv[0]));
     char *s = as_str(argv[0], "str/index-of");
     char cb[5];
     char *sub = strval_or_char(argv[1], cb, "str/index-of");
@@ -10248,7 +10302,7 @@ static Cljc *prim_peek(CljcEnv *env, Cljc **argv, int nargs) {
     if (v->tag == CLJC_LIST) return v->as.cons.head;          /* list: first */
     if (v->tag == CLJC_VECTOR)                                 /* vector: last */
         return vec_len(v) ? vec_nth(v, vec_len(v) - 1) : NIL;
-    cljc_error("peek: %s is not a list or vector", val_type_name(v));
+    cljc_error("peek: %s is not a list or vector", val_desc(v));
     return NIL;
 }
 
@@ -10267,7 +10321,7 @@ static Cljc *prim_pop(CljcEnv *env, Cljc **argv, int nargs) {
         for (size_t i = 0; i + 1 < cnt; i++) nv = vec_conj1(nv, vec_nth(v, i));
         return nv;
     }
-    cljc_error("pop: %s is not a list or vector", val_type_name(v));
+    cljc_error("pop: %s is not a list or vector", val_desc(v));
     return NIL;
 }
 
@@ -12433,6 +12487,128 @@ CljcEnv *cljc_new_env(void) {
         "    (list 'let [v expr]\n"
         "          (list 'println (str \"#dbg \" loc (pr-str expr) \" =>\") (list 'pr-str v))\n"
         "          v)))\n"
+            "(defn cljc/vendor-walk* [d]\n"
+            "  (mapcat (fn [n] (let [p (str d \"/\" n)]\n"
+            "                    (if (fs/directory? p) (cljc/vendor-walk* p) [p])))\n"
+            "          (fs/list-dir d)))\n"
+            "(defn cljc/vendor-unjar* [jar dir]\n"
+            "  (fs/create-dir dir)\n"
+            "  (or (zero? (:exit (process/sh \"unzip\" \"-q\" \"-o\" jar \"-d\" dir)))\n"
+            "      (zero? (:exit (process/sh \"bsdtar\" \"-xf\" jar \"-C\" dir)))\n"
+            "      (throw (ex-info \"cannot extract jar: need unzip or bsdtar on PATH\" {}))))\n"
+            "(defn cljc/vendor-clojars* [coord tmp]\n"
+            "  ;; nil when the coord isn't on Clojars; else the extracted source root\n"
+            "  (let [[g a] (str/split coord \"/\")\n"
+            "        base (str \"https://repo.clojars.org/\" (str/replace g \".\" \"/\") \"/\" a)\n"
+            "        meta (:out (process/sh \"curl\" \"-fsSL\" (str base \"/maven-metadata.xml\")))\n"
+            "        ver  (and meta (or (second (re-find #\"<release>([^<]+)</release>\" meta))\n"
+            "                           (last (map second (re-seq #\"<version>([^<]+)</version>\" meta)))))]\n"
+            "    (when ver\n"
+            "      (let [jar (str tmp \".jar\")\n"
+            "            url (str base \"/\" ver \"/\" a \"-\" ver \".jar\")]\n"
+            "        (println (str \"Fetching Clojars \" coord \" \" ver \" ...\"))\n"
+            "        (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" url \"-o\" jar)))\n"
+            "          (throw (ex-info (str \"download failed: \" url) {})))\n"
+            "        (cljc/vendor-unjar* jar tmp)\n"
+            "        (process/sh \"rm\" \"-f\" jar)\n"
+            "        tmp))))\n"
+            "(defn cljc/vendor-git* [url tmp]\n"
+            "  (println (str \"Cloning \" url \" ...\"))\n"
+            "  (let [r (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--quiet\" url tmp)]\n"
+            "    (when-not (zero? (:exit r))\n"
+            "      (println (:err r))\n"
+            "      (throw (ex-info (str \"git clone failed for \" url) {}))))\n"
+            "  (cond (fs/directory? (str tmp \"/src/main/clojure\")) (str tmp \"/src/main/clojure\")\n"
+            "        (fs/directory? (str tmp \"/src\"))              (str tmp \"/src\")\n"
+            "        :else tmp))\n"
+            "(defn cljc/vendor!\n"
+            "  \"Fetch a pure-Clojure library into ./vendor/ and report which of its\n"
+            "  namespaces load. Accepts Clojars group/artifact or GitHub user/repo\n"
+            "  coordinates, a git URL, or a .jar URL.\"\n"
+            "  [src]\n"
+            "  (require 'fs) (require 'process)\n"
+            "  (let [src (str src)\n"
+            "      coord? (re-matches #\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\" src)\n"
+            "      nm  (str/replace (last (str/split src \"/\")) #\"\\.(git|jar)$\" \"\")\n"
+            "      tmp (str (fs/temp-dir) \"/cljc-vendor-\" nm)]\n"
+            "  (process/sh \"rm\" \"-rf\" tmp)\n"
+            "  (let [root (cond\n"
+            "               (re-find #\"\\.jar$\" src)\n"
+            "               (do (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" src \"-o\" (str tmp \".jar\"))))\n"
+            "                     (throw (ex-info (str \"download failed: \" src) {})))\n"
+            "                   (cljc/vendor-unjar* (str tmp \".jar\") tmp)\n"
+            "                   (process/sh \"rm\" \"-f\" (str tmp \".jar\"))\n"
+            "                   tmp)\n"
+            "               coord?\n"
+            "               (or (cljc/vendor-clojars* src tmp)\n"
+            "                   (cljc/vendor-git* (str \"https://github.com/\" src) tmp))\n"
+            "               :else (cljc/vendor-git* src tmp))\n"
+            "        rels (->> (cljc/vendor-walk* root)\n"
+            "                  (map (fn [p] (subs p (inc (count root)))))\n"
+            "                  (filter (fn [rel]\n"
+            "                    (and (re-find #\"\\.cljc?$\" rel)\n"
+            "                         (not (re-find #\"^(META-INF|test|tests|dev|examples?|perf|bench)/\" rel))\n"
+            "                         (not (re-find #\"(^|/)(test|tests|dev|examples?|perf|bench)/\" rel))\n"
+            "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj|deps\\.cljs|data_readers\\.cljc?)$\" rel))))))]\n"
+            "    (when (empty? rels)\n"
+            "      (throw (ex-info (str \"no .clj/.cljc sources found under \" root) {})))\n"
+            "    (doseq [rel rels]\n"
+            "      (let [dst (str \"vendor/\" rel)]\n"
+            "        (when-let [dir (fs/parent dst)] (fs/create-dir dir))\n"
+            "        (spit dst (slurp (str root \"/\" rel)))))\n"
+            "    (process/sh \"rm\" \"-rf\" tmp)\n"
+            "    (println (str \"Vendored \" (count rels) \" file(s) into vendor/.\"))\n"
+            "    (doseq [rel (sort rels)]\n"
+            "      (let [nsname (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
+            "                           (str/replace \"/\" \".\")\n"
+            "                           (str/replace \"_\" \"-\"))\n"
+            "            r (try (require (symbol nsname)) :ok\n"
+            "                   (catch Exception e (or (ex-message e) \"load failed\")))]\n"
+            "        (if (= r :ok)\n"
+            "          (println (str \"  (require '\" nsname \")   ; loads OK\"))\n"
+            "          (println (str \"  (require '\" nsname \")   ; FAILS: \" r\n"
+            "                        \" — JVM-interop-heavy libraries may need porting\")))))\n"
+            "    true)))"
+            "(def vendor! cljc/vendor!)\n"
+        "(def cljc/trace-depth* (atom 0))\n"
+        "(def cljc/traced* (atom {}))\n"
+        "(defn cljc/trace-wrap* [nm f]\n"
+        "  (fn [& args]\n"
+        "    (let [pad (apply str (repeat (deref cljc/trace-depth*) \"|  \"))]\n"
+        "      (println (str \"TRACE \" pad \"(\" nm\n"
+        "                    (apply str (map (fn [a] (str \" \" (pr-str a))) args)) \")\"))\n"
+        "      (swap! cljc/trace-depth* inc)\n"
+        "      (try\n"
+        "        (let [r (apply f args)]\n"
+        "          (println (str \"TRACE \" pad \"=> \" (pr-str r)))\n"
+        "          r)\n"
+        "        (finally (swap! cljc/trace-depth* dec))))))\n"
+        "(defn cljc/trace-var* [sym]\n"
+        "  (let [v (resolve sym)]\n"
+        "    (cond (nil? v) (println (str \"trace-vars: no var named \" sym))\n"
+        "          (contains? (deref cljc/traced*) sym) nil\n"
+        "          :else (let [orig (deref v)]\n"
+        "                  (if (fn? orig)\n"
+        "                    (do (swap! cljc/traced* assoc sym orig)\n"
+        "                        (alter-var-root v (fn [_] (cljc/trace-wrap* sym orig))))\n"
+        "                    (println (str \"trace-vars: \" sym \" is not a fn\"))))))\n"
+        "  sym)\n"
+        "(defn cljc/untrace-var* [sym]\n"
+        "  (when-let [orig (get (deref cljc/traced*) sym)]\n"
+        "    (alter-var-root (resolve sym) (fn [_] orig))\n"
+        "    (swap! cljc/traced* dissoc sym))\n"
+        "  sym)\n"
+        "(defmacro trace-vars\n"
+        "  \"Wraps the named fns to print depth-indented call/return lines.\n"
+        "  Undo with untrace-vars. (trace-vars f g)\"\n"
+        "  [& syms]\n"
+        "  (cons 'do (map (fn [s] (list 'cljc/trace-var* (list 'quote s))) syms)))\n"
+        "(defmacro untrace-vars\n"
+        "  \"Restores fns wrapped by trace-vars. With no args, untraces everything.\"\n"
+        "  [& syms]\n"
+        "  (if (seq syms)\n"
+        "    (cons 'do (map (fn [s] (list 'cljc/untrace-var* (list 'quote s))) syms))\n"
+        "    (list 'run! 'cljc/untrace-var* (list 'keys (list 'deref 'cljc/traced*)))))\n"
         "(defn cljc/repeatedly* [f n]\n"   /* lazy + chunked, like repeat */
         "  (lazy-seq\n"
         "    (when (or (nil? n) (pos? n))\n"
@@ -13545,25 +13721,54 @@ static void rl_complete(char *buf, size_t *len, size_t *pos, const char *prompt)
 }
 
 /* Read one edited line; returns false on EOF (ctrl-d on empty). */
-static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
+/* Raw-mode enter/exit, one implementation per platform. On Windows the
+ * console is switched to VT input (arrow keys arrive as ESC [ sequences,
+ * exactly what the shared editing loop parses) + VT output (the ANSI
+ * colors/redraws render); Windows 10+ only — older consoles fall back to
+ * plain line input. */
 #ifdef _WIN32
-    /* No termios on Windows: plain line input, no in-line editing/history. */
-    fputs(prompt, stdout); fflush(stdout);
-    if (!fgets(buf, (int)bufcap, stdin)) return false;
-    buf[strcspn(buf, "\n")] = 0;
+typedef struct { DWORD in0, out0; } RlTermState;
+static bool rl_raw_enter(RlTermState *st) {
+    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE), hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!GetConsoleMode(hin, &st->in0) || !GetConsoleMode(hout, &st->out0))
+        return false;                                  /* redirected: not a console */
+    if (!SetConsoleMode(hin, (st->in0 & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+                                          ENABLE_PROCESSED_INPUT))
+                             | ENABLE_VIRTUAL_TERMINAL_INPUT)) {
+        return false;                                  /* pre-VT console */
+    }
+    if (!SetConsoleMode(hout, st->out0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        SetConsoleMode(hin, st->in0);
+        return false;
+    }
     return true;
+}
+static void rl_raw_exit(RlTermState *st) {
+    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), st->in0);
+    SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), st->out0);
+}
 #else
-    struct termios orig, raw;
-    if (tcgetattr(0, &orig) == -1) {            /* not a tty after all */
+typedef struct { struct termios orig; } RlTermState;
+static bool rl_raw_enter(RlTermState *st) {
+    if (tcgetattr(0, &st->orig) == -1) return false;   /* not a tty */
+    struct termios raw = st->orig;
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSAFLUSH, &raw);
+    return true;
+}
+static void rl_raw_exit(RlTermState *st) { tcsetattr(0, TCSAFLUSH, &st->orig); }
+#endif
+
+static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
+    RlTermState st;
+    if (!rl_raw_enter(&st)) {   /* not a capable console: plain line input */
+        fputs(prompt, stdout); fflush(stdout);
         if (!fgets(buf, (int)bufcap, stdin)) return false;
         buf[strcspn(buf, "\n")] = 0;
         return true;
     }
-    raw = orig;
-    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON);
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(0, TCSAFLUSH, &raw);
     size_t len = 0, pos = 0;
     int hidx = rl_hist_n;
     char saved[RL_MAX] = "";
@@ -13572,13 +13777,13 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
     for (;;) {
         int c = getchar();
         if (c == EOF || (c == 4 && len == 0)) {           /* ctrl-d */
-            tcsetattr(0, TCSAFLUSH, &orig);
+            rl_raw_exit(&st);
             printf("\r\n");
             return false;
         }
         if (c == '\r' || c == '\n') {
             rl_refresh_opt(prompt, buf, len, false);  /* clear match highlight */
-            tcsetattr(0, TCSAFLUSH, &orig);
+            rl_raw_exit(&st);
             printf("\r\n");
             return true;
         }
@@ -13629,7 +13834,7 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
                     break;
                 } else if (k == '\r' || k == '\n') {      /* accept + run */
                     rl_refresh_opt(prompt, buf, len, false);
-                    tcsetattr(0, TCSAFLUSH, &orig);
+                    rl_raw_exit(&st);
                     printf("\r\n");
                     return true;
                 } else {                                  /* any other key: edit the match */
@@ -13679,7 +13884,6 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
         }
         rl_refresh(prompt, buf, pos);
     }
-#endif  /* _WIN32 */
 }
 
 static bool balanced(const char *s) {
@@ -13742,6 +13946,15 @@ static void repl_record(CljcEnv *env, Cljc *result) {
 
 static int run_repl(CljcEnv *env) {
     hist_load();
+#ifdef _WIN32
+    SetConsoleCtrlHandler(cljc_ctrl_handler, 1);
+#else
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = cljc_on_sigint;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+#endif
     printf("cljc %s — tab completes, (doc x) (source x) (dir ns) (dbg x), ↑/^R history, *1 *2 *3 / (*results* n) hold results, !cmd shells out\n",
            CLJC_VERSION);
     char form[RL_MAX * 4];
@@ -13797,6 +14010,7 @@ static int run_repl(CljcEnv *env) {
             continue;
         }
         const char *p = form;
+        g_interrupt = 0;    /* a ^C typed at the prompt must not kill this eval */
         while (*p) {
             skip_ws(&p);
             if (!*p) break;
@@ -13805,11 +14019,18 @@ static int run_repl(CljcEnv *env) {
             Cljc *result = eval(env, f);
             repl_record(env, result);
             printf("\x1b[2m[%d]\x1b[0m ", out_n);
-            {   /* wide results pretty-print instead of wrapping mid-token */
+            {   /* wide results pretty-print instead of wrapping mid-token;
+                 * *print-length* defaults to 100 for THIS print only, so an
+                 * infinite seq shows (0 1 ... 99 ...) instead of hanging */
+                Binding *plb = root_find(env_root(env), intern("*print-length*", 14), NULL, false);
+                Cljc *saved_pl = plb ? plb->value : NULL;
+                bool guard = plb && (saved_pl == NULL || saved_pl == NIL);
+                if (guard) plb->value = mk_int(100);
                 SBuf sb = {0};
                 int tw = term_width();
                 print_to(&sb, result, true);
                 if ((int)sb.len > tw - 8) { sb.len = 0; pp_to(&sb, result, 0, tw - 8, 0); }
+                if (guard) plb->value = saved_pl;
                 if (sb.data) fwrite(sb.data, 1, sb.len, stdout);
                 free(sb.data);
             }
@@ -14410,92 +14631,11 @@ int main(int argc, char **argv) {
         return run_subprogram(env, "(load-file \"clerk.clj\") (clerk/main)", false);
     }
     if (!strcmp(cmd, "vendor")) {
-        /* cljc vendor <source> — fetch a pure-Clojure library into ./vendor/
-         * (already on *load-path*) and report which namespaces load.
-         *   group/artifact  -> Clojars latest release jar (curl + unzip/bsdtar),
-         *                      falling back to a GitHub shallow clone (git)
-         *   https://...jar  -> that jar
-         *   any other URL   -> git shallow clone */
+        /* cljc vendor <source> — thin CLI over (cljc/vendor! src), which is
+         * also callable from the REPL as (vendor! "user/repo"). */
         if (argc < 3) { fputs("usage: cljc vendor <group/artifact | git-url | jar-url>\n", stderr); return 1; }
         set_args(env, argc, argv, 2);
-        return run_subprogram(env,
-            "(require 'fs) (require 'process)\n"
-            "(defn cljc/vendor-walk* [d]\n"
-            "  (mapcat (fn [n] (let [p (str d \"/\" n)]\n"
-            "                    (if (fs/directory? p) (cljc/vendor-walk* p) [p])))\n"
-            "          (fs/list-dir d)))\n"
-            "(defn cljc/vendor-unjar* [jar dir]\n"
-            "  (fs/create-dir dir)\n"
-            "  (or (zero? (:exit (process/sh \"unzip\" \"-q\" \"-o\" jar \"-d\" dir)))\n"
-            "      (zero? (:exit (process/sh \"bsdtar\" \"-xf\" jar \"-C\" dir)))\n"
-            "      (throw (ex-info \"cannot extract jar: need unzip or bsdtar on PATH\" {}))))\n"
-            "(defn cljc/vendor-clojars* [coord tmp]\n"
-            "  ;; nil when the coord isn't on Clojars; else the extracted source root\n"
-            "  (let [[g a] (str/split coord \"/\")\n"
-            "        base (str \"https://repo.clojars.org/\" (str/replace g \".\" \"/\") \"/\" a)\n"
-            "        meta (:out (process/sh \"curl\" \"-fsSL\" (str base \"/maven-metadata.xml\")))\n"
-            "        ver  (and meta (or (second (re-find #\"<release>([^<]+)</release>\" meta))\n"
-            "                           (last (map second (re-seq #\"<version>([^<]+)</version>\" meta)))))]\n"
-            "    (when ver\n"
-            "      (let [jar (str tmp \".jar\")\n"
-            "            url (str base \"/\" ver \"/\" a \"-\" ver \".jar\")]\n"
-            "        (println (str \"Fetching Clojars \" coord \" \" ver \" ...\"))\n"
-            "        (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" url \"-o\" jar)))\n"
-            "          (throw (ex-info (str \"download failed: \" url) {})))\n"
-            "        (cljc/vendor-unjar* jar tmp)\n"
-            "        (process/sh \"rm\" \"-f\" jar)\n"
-            "        tmp))))\n"
-            "(defn cljc/vendor-git* [url tmp]\n"
-            "  (println (str \"Cloning \" url \" ...\"))\n"
-            "  (let [r (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--quiet\" url tmp)]\n"
-            "    (when-not (zero? (:exit r))\n"
-            "      (println (:err r))\n"
-            "      (throw (ex-info (str \"git clone failed for \" url) {}))))\n"
-            "  (cond (fs/directory? (str tmp \"/src/main/clojure\")) (str tmp \"/src/main/clojure\")\n"
-            "        (fs/directory? (str tmp \"/src\"))              (str tmp \"/src\")\n"
-            "        :else tmp))\n"
-            "(let [src (first *args*)\n"
-            "      coord? (re-matches #\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\" src)\n"
-            "      nm  (str/replace (last (str/split src \"/\")) #\"\\.(git|jar)$\" \"\")\n"
-            "      tmp (str (fs/temp-dir) \"/cljc-vendor-\" nm)]\n"
-            "  (process/sh \"rm\" \"-rf\" tmp)\n"
-            "  (let [root (cond\n"
-            "               (re-find #\"\\.jar$\" src)\n"
-            "               (do (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" src \"-o\" (str tmp \".jar\"))))\n"
-            "                     (throw (ex-info (str \"download failed: \" src) {})))\n"
-            "                   (cljc/vendor-unjar* (str tmp \".jar\") tmp)\n"
-            "                   (process/sh \"rm\" \"-f\" (str tmp \".jar\"))\n"
-            "                   tmp)\n"
-            "               coord?\n"
-            "               (or (cljc/vendor-clojars* src tmp)\n"
-            "                   (cljc/vendor-git* (str \"https://github.com/\" src) tmp))\n"
-            "               :else (cljc/vendor-git* src tmp))\n"
-            "        rels (->> (cljc/vendor-walk* root)\n"
-            "                  (map (fn [p] (subs p (inc (count root)))))\n"
-            "                  (filter (fn [rel]\n"
-            "                    (and (re-find #\"\\.cljc?$\" rel)\n"
-            "                         (not (re-find #\"^(META-INF|test|tests|dev|examples?|perf|bench)/\" rel))\n"
-            "                         (not (re-find #\"(^|/)(test|tests|dev|examples?|perf|bench)/\" rel))\n"
-            "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj|deps\\.cljs|data_readers\\.cljc?)$\" rel))))))]\n"
-            "    (when (empty? rels)\n"
-            "      (throw (ex-info (str \"no .clj/.cljc sources found under \" root) {})))\n"
-            "    (doseq [rel rels]\n"
-            "      (let [dst (str \"vendor/\" rel)]\n"
-            "        (when-let [dir (fs/parent dst)] (fs/create-dir dir))\n"
-            "        (spit dst (slurp (str root \"/\" rel)))))\n"
-            "    (process/sh \"rm\" \"-rf\" tmp)\n"
-            "    (println (str \"Vendored \" (count rels) \" file(s) into vendor/.\"))\n"
-            "    (doseq [rel (sort rels)]\n"
-            "      (let [nsname (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
-            "                           (str/replace \"/\" \".\")\n"
-            "                           (str/replace \"_\" \"-\"))\n"
-            "            r (try (require (symbol nsname)) :ok\n"
-            "                   (catch Exception e (or (ex-message e) \"load failed\")))]\n"
-            "        (if (= r :ok)\n"
-            "          (println (str \"  (require '\" nsname \")   ; loads OK\"))\n"
-            "          (println (str \"  (require '\" nsname \")   ; FAILS: \" r\n"
-            "                        \" — JVM-interop-heavy libraries may need porting\")))))\n"
-            "    true))", true);
+        return run_subprogram(env, "(cljc/vendor! (first *args*))", true);
     }
     if (!strcmp(cmd, "test")) {
         set_args(env, argc, argv, 2);

@@ -96,7 +96,7 @@ CI builds and runs the full suite (normal + GC-stress) on every push:
 |---|---|
 | Linux | full — the reference platform (plus an ASan/UBSan job) |
 | macOS arm64 + x86_64 | full, including coroutines/csp (ucontext) |
-| Windows (mingw-w64) | core language, collections, lazy seqs, regex, sockets; **no** coroutines/`csp`/`core.async`/nREPL, plain-line REPL |
+| Windows (mingw-w64) | core language, collections, lazy seqs, regex, sockets, full line-editing REPL (Windows 10+ VT console; plain-line fallback); **no** coroutines/`csp`/`core.async`/nREPL |
 
 The test suite probes capabilities at startup (`cljc-test-unix?`,
 `cljc-test-coro?` in `tests.clj`) and self-skips what a platform lacks, so the

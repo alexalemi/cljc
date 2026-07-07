@@ -7347,13 +7347,16 @@ enum { RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL, RX_STAR, RX_LOOP,
        RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA, RX_BACKREF, RX_WB };
 
 typedef struct Rx Rx;
+#define RX_MAX_URANGES 4
 struct Rx {
     uint8_t type;
     bool lazy;
     bool neg;
-    char ch;
+    int32_t cp;                /* RX_CHAR: the literal codepoint */
     int group;
-    uint8_t bits[32];          /* 256-bit set for classes */
+    uint8_t bits[32];          /* class member set for codepoints < 256 */
+    int32_t ur[RX_MAX_URANGES * 2];  /* class: unicode [lo,hi] pairs */
+    uint8_t nur;
     Rx *next, *child, *alt, *owner;
     const char *last;          /* star: last entry position (cycle guard) */
 };
@@ -7379,8 +7382,16 @@ static Rx *rx_node(RxC *c, int type) {
 }
 
 static void rx_bit(Rx *r, unsigned char ch) { r->bits[ch >> 3] |= (uint8_t)(1u << (ch & 7)); }
-static bool rx_bit_test(const Rx *r, unsigned char ch) {
-    bool in = (r->bits[ch >> 3] >> (ch & 7)) & 1;
+static void rx_urange(Rx *r, int32_t lo, int32_t hi) {
+    if (r->nur >= RX_MAX_URANGES) cljc_error("regex: too many non-ASCII chars in one class");
+    r->ur[r->nur * 2] = lo;
+    r->ur[r->nur * 2 + 1] = hi;
+    r->nur++;
+}
+static bool rx_class_match(const Rx *r, int32_t cp) {
+    bool in = cp < 256 && ((r->bits[cp >> 3] >> (cp & 7)) & 1);
+    for (int i = 0; !in && i < r->nur; i++)
+        in = cp >= r->ur[i * 2] && cp <= r->ur[i * 2 + 1];
     return r->neg ? !in : in;
 }
 
@@ -7450,12 +7461,15 @@ static RxChain rx_parse_atom(RxC *c) {
                 else rx_bit(r, (unsigned char)e);
                 continue;
             }
-            unsigned char lo = (unsigned char)*c->p++;
+            int32_t lo = utf8_next(&c->p);
             if (*c->p == '-' && c->p[1] && c->p[1] != ']') {
-                unsigned char hi = (unsigned char)c->p[1];
-                c->p += 2;
-                for (unsigned i = lo; i <= hi; i++) rx_bit(r, (unsigned char)i);
-            } else rx_bit(r, lo);
+                c->p++;                              /* consume '-' */
+                int32_t hi = utf8_next(&c->p);
+                if (hi < 256) {
+                    for (int32_t i = lo; i <= hi; i++) rx_bit(r, (unsigned char)i);
+                } else rx_urange(r, lo, hi);
+            } else if (lo < 256) rx_bit(r, (unsigned char)lo);
+            else rx_urange(r, lo, lo);
         }
         if (*c->p != ']') cljc_error("regex: missing ]");
         c->p++;
@@ -7477,17 +7491,21 @@ static RxChain rx_parse_atom(RxC *c) {
             r = rx_node(c, RX_WB); r->neg = (e == 'B');
         } else {
             r = rx_node(c, RX_CHAR);
-            r->ch = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
+            if ((unsigned char)e >= 0x80) {          /* \é etc: whole codepoint */
+                c->p -= 1;
+                r->cp = utf8_next(&c->p);
+            } else {
+                r->cp = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
+            }
         }
         ch.h = ch.t = r;
         return ch;
     }
-    c->p++;
     Rx *r;
-    if (c0 == '.') r = rx_node(c, RX_ANY);
-    else if (c0 == '^') r = rx_node(c, RX_BOL);
-    else if (c0 == '$') r = rx_node(c, RX_EOL);
-    else { r = rx_node(c, RX_CHAR); r->ch = c0; }
+    if (c0 == '.') { c->p++; r = rx_node(c, RX_ANY); }
+    else if (c0 == '^') { c->p++; r = rx_node(c, RX_BOL); }
+    else if (c0 == '$') { c->p++; r = rx_node(c, RX_EOL); }
+    else { r = rx_node(c, RX_CHAR); r->cp = utf8_next(&c->p); }
     ch.h = ch.t = r;
     return ch;
 }
@@ -7640,9 +7658,21 @@ static bool rx_m(Rx *r, const char *s) {
         cljc_error("regex: too much backtracking");
     if (!r) { rx_match_end = s; return true; }
     switch (r->type) {
-        case RX_CHAR:  return *s == r->ch && rx_m(r->next, s + 1);
-        case RX_ANY:   return *s && (rx_dotall || *s != '\n') && rx_m(r->next, s + 1);
-        case RX_CLASS: return *s && rx_bit_test(r, (unsigned char)*s) && rx_m(r->next, s + 1);
+        case RX_CHAR:
+            if (r->cp < 0x80) return *s == (char)r->cp && rx_m(r->next, s + 1);
+            { const char *p = s; return *s && utf8_next(&p) == r->cp && rx_m(r->next, p); }
+        case RX_ANY: {
+            if (!*s || (!rx_dotall && *s == '\n')) return false;
+            const char *p = s;
+            utf8_next(&p);                 /* one CODEPOINT, not one byte */
+            return rx_m(r->next, p);
+        }
+        case RX_CLASS: {
+            if (!*s) return false;
+            const char *p = s;
+            int32_t cp = utf8_next(&p);
+            return rx_class_match(r, cp) && rx_m(r->next, p);
+        }
         case RX_BOL:   return s == rx_str_begin && rx_m(r->next, s);
         case RX_EOL:   return *s == '\0' && rx_m(r->next, s);
         case RX_WB: {  /* \b boundary / \B non-boundary (\w = [A-Za-z0-9_]) */
@@ -7805,7 +7835,7 @@ static Cljc *prim_re_find(CljcEnv *env, Cljc **argv, int nargs) {
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
     rx_str_begin = s;
-    for (const char *start = s; ; start++) {
+    for (const char *start = s; ; ) {
         rx_reset_caps();
         if (rx_m(prog, start)) {
             Cljc *r = rx_result(start, ngroups);
@@ -7813,6 +7843,7 @@ static Cljc *prim_re_find(CljcEnv *env, Cljc **argv, int nargs) {
             return r;
         }
         if (!*start) break;
+        utf8_next(&start);         /* next CODEPOINT: never try mid-char */
     }
     free(pool);
     return NIL;
@@ -7864,10 +7895,11 @@ static Cljc *prim_re_seq(CljcEnv *env, Cljc **argv, int nargs) {
         /* Find the next match at or after pos. */
         const char *start = pos;
         bool found = false;
-        for (;; start++) {
+        for (;; ) {
             rx_reset_caps();
             if (rx_m(prog, start)) { found = true; break; }
             if (!*start) break;
+            utf8_next(&start);        /* next CODEPOINT */
         }
         if (!found) break;
         *t = mk_cons(rx_result(start, ngroups), NIL);
@@ -7876,7 +7908,8 @@ static Cljc *prim_re_seq(CljcEnv *env, Cljc **argv, int nargs) {
             pos = rx_match_end;       /* continue after the match */
         } else {
             if (!*start) break;       /* empty match at end: done */
-            pos = start + 1;          /* empty match: advance one char */
+            pos = start;              /* empty match: advance one codepoint */
+            utf8_next(&pos);
         }
     }
     free(pool);
@@ -9872,12 +9905,11 @@ static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
                 rx_str_begin = s;                     /* restore after the call */
             } else rx_subst(&out, repl);
             if (mend > p) { p = mend; continue; }
-            /* empty match: emit one char and advance to avoid looping */
-            sb_putc(&out, *p);
+            /* empty match: emit one codepoint and advance to avoid looping */
+            { const char *q = p; utf8_next(&q); while (p < q) sb_putc(&out, *p++); }
         } else {
-            sb_putc(&out, *p);
+            const char *q = p; utf8_next(&q); while (p < q) sb_putc(&out, *p++);
         }
-        p++;
     }
     /* A trailing empty match at end-of-string still substitutes
      * ((re-replace "ab" "x*" "-") => "-a-b-", as in Clojure). */
@@ -9921,12 +9953,12 @@ static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs) {
             if (mend > p) {                                /* non-empty match */
                 *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL); t = &(*t)->as.cons.tail; nsegs++;
                 p = mend; seg = p;
-            } else if (p == s) { p++; }                    /* zero-width at index 0: skip */
+            } else if (p == s) { utf8_next(&p); }          /* zero-width at index 0: skip */
             else {                                         /* zero-width between chars */
                 *t = mk_cons(mk_str(seg, (size_t)(p - seg)), NIL); t = &(*t)->as.cons.tail; nsegs++;
-                seg = p; p++;
+                seg = p; utf8_next(&p);
             }
-        } else p++;
+        } else utf8_next(&p);
     }
     *t = mk_cons(mk_str(seg, (size_t)(end - seg)), NIL); nsegs++;   /* final segment */
     free(pool);

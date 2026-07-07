@@ -2294,4 +2294,16 @@
 (assert= \a (nth "plain ascii" 6))
 (assert= 2 (count (str \é \𝄞)))               ; str of wide chars re-encodes correctly
 
+; ── codepoint-aware regex ──
+(assert= '("h" "é" "ā") (re-seq #"." "héā"))            ; . = one codepoint
+(assert= ["hél" "é"] (re-find #"h(.)l" "héllo"))        ; group captures a whole char
+(assert= "ééé" (re-matches #"é+" "ééé"))                ; quantifier binds the full literal
+(assert= '("é" "ā" "→") (re-seq #"[éā→]" "a é b ā c →")) ; unicode class members
+(assert= "λ" (re-find #"[α-ω]+" "abc λόγος xyz"))        ; unicode range (ό = U+03CC is outside)
+(assert= '("a" "b") (re-seq #"[^é]" "aéb"))              ; negated class consumes codepoints
+(assert= ["h" "é" "l" "l" "o"] (str/split "héllo" #"")) ; empty split → per char
+(assert= "*****" (str/replace "héllo" #"." "*"))
+(assert= "𝄞𝄞" (re-find #"𝄞+" "𝄞𝄞x"))                    ; astral literal + quantifier
+(assert= '("1" "22" "333") (re-seq #"\d+" "a1 b22 c333")) ; ASCII path untouched
+
 (println "tests complete")

@@ -1110,8 +1110,14 @@ static CljcEnv *env_freelist;      /* linked through ->parent */
  * sets are collection-bound: at 64k this was thousands of collections on
  * AoC hot loops (~38% of runtime). ~1M cells ≈ tens of MB of slack. */
 #define GC_MIN_THRESHOLD (1u << 20)
-#define GC_CHURN_CAP (4u << 20)   /* adaptive floor ceiling: ~8M cells (~320MB)
-                                   * of garbage between collections, max */
+#define GC_CHURN_CAP (16u << 20)  /* adaptive floor ceiling. Raised 4M->16M
+                                   * (2026-07): on an 8M-element lazy pipeline
+                                   * this cut wall time 25% AND peak RSS 23% —
+                                   * conservative-scan pinning keeps consumed
+                                   * chain prefixes live through a collection,
+                                   * so sparser collections mark/sweep that
+                                   * same pinned set fewer times; the 50M
+                                   * stress case was neutral on both axes. */
 static size_t gc_allocs, gc_threshold = GC_MIN_THRESHOLD;
 static size_t churn_floor = GC_MIN_THRESHOLD;   /* adaptive collection floor */
 static size_t gc_freed_last;
@@ -9161,6 +9167,14 @@ static Cljc *prim_sort(CljcEnv *env, Cljc **argv, int nargs) {
         coll = argv[1];
     } else coll = argv[0];
     Cljc *s = to_seq(coll);
+    /* volatile: `arr` is malloc'd — INVISIBLE to the conservative scan — and
+     * for maps/sets to_seq builds a FRESH entry chain reachable only through
+     * this local. A cljc comparator allocates on every qsort comparison; if
+     * -O2 dead-codes `s` after the fill loop, a mid-sort collection frees the
+     * entries still sitting in arr (2016-AoC-p04: sort-by over frequencies —
+     * the long-standing "-O2-only" crash). The old comment claimed the
+     * elements stayed rooted via coll; for non-list colls that was false. */
+    Cljc * volatile s_keep = s;
     size_t n = list_len(s);
     Cljc **arr = xmalloc(sizeof(Cljc *) * (n ? n : 1));
     size_t i = 0;
@@ -9168,8 +9182,9 @@ static Cljc *prim_sort(CljcEnv *env, Cljc **argv, int nargs) {
     CljcEnv *saved_env = g_sort_env;     /* re-entrancy: we may BE the nested sort */
     Cljc *saved_fn = g_sort_fn;
     g_sort_env = env; g_sort_fn = fn;
-    qsort(arr, n, sizeof(Cljc *), sort_adapter);  /* elements stay rooted via coll */
+    qsort(arr, n, sizeof(Cljc *), sort_adapter);
     g_sort_env = saved_env; g_sort_fn = saved_fn;
+    (void)s_keep;                        /* pins the chain through the sort */
     Cljc *out = n == 0 ? EMPTY : NIL;   /* (sort []) => () */
     for (size_t j = n; j > 0; j--) out = mk_cons(arr[j - 1], out);
     free(arr);

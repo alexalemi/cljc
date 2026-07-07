@@ -1,5 +1,7 @@
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
+# -falign-*: stabilizes performance across otherwise-neutral code changes
+# (±5% swings on hot interpreter loops were pure layout luck without it)
+CFLAGS  ?= -O2 -falign-functions=64 -falign-loops=32 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
 PREFIX  ?= /usr/local
 DESTDIR ?=
 SHAREDIR = $(PREFIX)/share/cljc

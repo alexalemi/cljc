@@ -2336,4 +2336,11 @@
 (assert= 3 (with-open [r {:cljc/type :NopCloseable}] 3))  ; with-open runs + closes
 (in-ns 'user)
 
+; ── prim_sort GC pinning: sorting a MAP's entries with an allocating
+;    comparator used to crash — the entry chain was reachable only through a
+;    dead local while the elements sat in a malloc'd array the GC can't see
+(assert= 26 (count (sort-by val > (frequencies
+                                   (apply str (repeat 200 "abcdefghijklmnopqrstuvwxyz"))))))
+(assert= [\a \b \c] (map key (take 3 (sort-by key (frequencies "cabcabcab")))))
+
 (println "tests complete")

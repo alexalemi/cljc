@@ -2343,4 +2343,42 @@
                                    (apply str (repeat 200 "abcdefghijklmnopqrstuvwxyz"))))))
 (assert= [\a \b \c] (map key (take 3 (sort-by key (frequencies "cabcabcab")))))
 
+; ── library bring-up round (core.match / markdown-clj / meander) ──
+;; metadata in binding positions binds the symbol (core.match's ocr- bindings)
+(assert= 5 (let [^{:tag :x} mb 5] mb))
+(assert= 7 (loop [^{:m 1} lb 7] lb))
+(assert= [3 4] (let [[^{:m 1} da ^{:m 2} db] [3 4]] [da db]))
+;; declare never clobbers a bound var (core.match forward-declares after defn)
+(defn decl-victim [] :alive)
+(declare decl-victim)
+(assert= :alive (decl-victim))
+;; deftype methods: quasiquote templates aren't macroexpanded/field-rewritten,
+;; but unquote payloads are; quoted forms stay quoted
+(defprotocol QQP (qq-emit [this]) (qq-quote [this]))
+(defrecord QQR [bindings]
+  QQP
+  (qq-emit [this] `(let [~@bindings] :body))
+  (qq-quote [this] 'bindings))
+(assert= '(let [q 5] :body) (qq-emit (QQR. '(q 5))))
+(assert= 'bindings (qq-quote (QQR. :whatever)))
+;; keys/vals accept sequences of map entries (Clojure parity; meander needs it)
+(assert= [1 2] (vec (sort (vals (sort-by key {:a 1 :b 2})))))
+(assert= [:a :b] (vec (sort (keys (seq {:a 1 :b 2})))))
+;; syntax-quote resolves ALIAS-qualified symbols to the full ns
+(cljc/eval-forms* "(ns sq.provider) (defn pfn [] :from-provider)
+(ns sq.consumer (:require [sq.provider :as sqp]))
+(defmacro emit-call [] `(sqp/pfn))" "sqtest")
+(in-ns 'user)
+(assert= 'sq.provider/pfn (first (macroexpand-1 '(sq.consumer/emit-call))))
+(assert= :from-provider (eval (list 'sq.consumer/emit-call)))
+;; macroexpand (full) exists
+(assert= '(if (not true) 1 2) (macroexpand '(if-not true 1 2)))
+;; line-reader shims: BufferedReader./.readLine/line-seq over strings
+(let [r (java.io.BufferedReader. (StringReader. "a\nb\nc"))]
+  (assert= "a" (.readLine r))
+  (assert= ["b" "c"] (vec (line-seq r)))
+  (assert= nil (.readLine r)))
+(assert= 3 (with-open [r (java.io.BufferedReader. (StringReader. "x\ny\nz"))]
+             (count (line-seq r))))
+
 (println "tests complete")

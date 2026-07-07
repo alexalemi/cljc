@@ -2916,6 +2916,11 @@ static const char *sym_amp(void) {
  * :or defaults are forms, evaluated in `scope` when the key is missing. */
 static Cljc *kvseq_to_map(Cljc *s);
 static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
+    /* ^{..}sym in a binding position arrives as the deferred (with-meta sym m)
+     * form — bind the symbol, drop the meta (Clojure keeps only type hints
+     * there, which cljc discards anyway). core.match's generated matchers tag
+     * every occurrence binding this way. */
+    pattern = peel_meta_sym(pattern);
     if (pattern != NIL && pattern->tag == CLJC_SYMBOL) {
         env_define(scope, pattern->as.sym, value);
         return;
@@ -4505,6 +4510,26 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
         for (Cljc *e = set_element_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
             s = set_conj(s, qq_expand(env, e->as.cons.head));
         return s;
+    }
+    /* Alias resolution in templates, like Clojure's syntax-quote: `r.syntax/x
+     * written under (:require [meander.syntax.epsilon :as r.syntax]) expands
+     * to the FULL ns-qualified symbol, so the emitted code is resolvable in
+     * namespaces that don't share the alias (meander's defsyntax operators
+     * were emitted alias-qualified and unresolvable at the use site). */
+    if (form->tag == CLJC_SYMBOL && form->as.symc.home_ns) {
+        const char *slash = strchr(form->as.symc.name, '/');
+        if (slash && slash != form->as.symc.name && slash[1]) {
+            size_t plen = (size_t)(slash - form->as.symc.name);
+            if (plen < 128) {
+                const char *full = alias_lookup(intern(form->as.symc.name, plen),
+                                                form->as.symc.home_ns);
+                if (full && strncmp(full, form->as.symc.name, plen) != 0) {
+                    char buf[256];
+                    snprintf(buf, sizeof buf, "%s/%s", full, slash + 1);
+                    return mk_sym(intern(buf, strlen(buf)));
+                }
+            }
+        }
     }
     /* Syntax-quote qualification (Clojure-faithful-ish): a bare template
      * symbol whose home ns defines it expands to the qualified symbol, so
@@ -6928,10 +6953,33 @@ static Cljc *map_kv_list(Cljc *m, int kv) {
     return out;
 }
 
+/* Like Clojure, keys/vals also accept a SEQUENCE of map entries —
+ * (vals (sort-by f a-map)) is the canonical producer (meander does this). */
+static Cljc *entry_side_list(Cljc *m, int side, const char *what) {
+    Cljc *out = NIL, **t = &out;
+    for (Cljc *l = to_seq(m); l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+        Cljc *e = l->as.cons.head;
+        Cljc *v;
+        if (e != NIL && e->tag == CLJC_VECTOR && vec_len(e) == 2)
+            v = vec_nth(e, (size_t)side);
+        else if (e != NIL && e->tag == CLJC_LIST && e->as.cons.tail != NIL)
+            v = side == 0 ? e->as.cons.head : e->as.cons.tail->as.cons.head;
+        else {
+            cljc_error("%s: expected map entries, got %s", what, val_desc(e));
+            return NIL;
+        }
+        *t = mk_cons(v, NIL);
+        t = &(*t)->as.cons.tail;
+    }
+    return out;
+}
+
 static Cljc *prim_keys(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
+    if (m->tag == CLJC_LIST || m->tag == CLJC_LAZY || m->tag == CLJC_EMPTY)
+        return entry_side_list(m, 0, "keys");
     if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("keys: expected a map, got %s", val_desc(m));
     return map_kv_list(m, 0);
 }
@@ -6940,6 +6988,8 @@ static Cljc *prim_vals(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs;
     Cljc *m = argv[0];
     if (m == NIL) return NIL;
+    if (m->tag == CLJC_LIST || m->tag == CLJC_LAZY || m->tag == CLJC_EMPTY)
+        return entry_side_list(m, 1, "vals");
     if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("vals: expected a map, got %s", val_desc(m));
     return map_kv_list(m, 1);
 }
@@ -8658,6 +8708,8 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_LAZY: n = "lazy-seq"; break;
         case CLJC_VECTOR: n = "vector"; break;
         case CLJC_SET: n = "set"; break;
+        case CLJC_SORTED: n = v->as.sorted.is_map ? "sorted-map" : "sorted-set"; break;
+        case CLJC_IARRAY: n = "int-array"; break;
         case CLJC_ATOM: n = "atom"; break;
         case CLJC_FN: case CLJC_NATIVE: n = "fn"; break;
         case CLJC_CORO: n = "coroutine"; break;
@@ -11071,6 +11123,22 @@ static const char *PRELUDE =
     "        (map? pat) (into (set (concat (:keys pat) (when (symbol? (:as pat)) [(:as pat)])))\n"
     "                         (mapcat cljc/binding-syms (filter (complement keyword?) (keys pat))))\n"
     "        :else #{}))\n"
+    "(defn cljc/deftype-walk-qq [form fset mset this]\n"
+    /* inside a quasiquote TEMPLATE: everything is data except the payloads of
+       unquote / unquote-splicing — only those are live code to rewrite.
+       Macroexpanding or field-substituting the template itself mangles it
+       (core.match's BindNode method emits \`(let [~@bindings] ..) — the
+       template let got macroexpanded and its binding vector emptied). */
+    "  (cond\n"
+    "    (and (list? form) (symbol? (first form))\n"
+    "         (contains? #{'unquote 'clojure.core/unquote\n"
+    "                      'unquote-splicing 'clojure.core/unquote-splicing} (first form)))\n"
+    "      (list (first form) (cljc/deftype-walk (second form) fset mset this))\n"
+    "    (list? form)   (apply list (map (fn [x] (cljc/deftype-walk-qq x fset mset this)) form))\n"
+    "    (vector? form) (mapv (fn [x] (cljc/deftype-walk-qq x fset mset this)) form)\n"
+    "    (map? form)    (into {} (map (fn [kv] [(cljc/deftype-walk-qq (first kv) fset mset this)\n"
+    "                                           (cljc/deftype-walk-qq (second kv) fset mset this)]) form))\n"
+    "    :else form))\n"
     "(defn cljc/deftype-walk [form fset mset this]\n"
     /* macroexpand this node so macros that GENERATE field reads or (set! field
        ..) (e.g. tools.reader's update!) are rewritten too — but STOP at a set!
@@ -11096,6 +11164,9 @@ static const char *PRELUDE =
     "                        {:fs fset :bs []} (partition 2 (second form)))]\n"
     "        (apply list (first form) (vec (:bs acc))\n"
     "               (map (fn [x] (cljc/deftype-walk x (:fs acc) mset this)) (drop 2 form))))\n"
+    "    (and (list? form) (= 'quote (first form))) form\n"
+    "    (and (list? form) (= 'quasiquote (first form)))\n"
+    "      (list 'quasiquote (cljc/deftype-walk-qq (second form) fset mset this))\n"
     "    (list? form)   (apply list (map (fn [x] (cljc/deftype-walk x fset mset this)) form))\n"
     "    (vector? form) (mapv (fn [x] (cljc/deftype-walk x fset mset this)) form)\n"
     "    (map? form)    (into {} (map (fn [kv] [(cljc/deftype-walk (first kv) fset mset this)\n"
@@ -11414,7 +11485,13 @@ static const char *PRELUDE =
     "(defn add-watch [r _ _] r) (defn remove-watch [r _] r)\n"
     /* promise/deliver/future are real (fiber-scheduler-backed, blocking deref)
        — defined in Tier 3.5 after deftype exists. */
-    "(defn line-seq [rdr] (seq (str/split-lines (str rdr))))\n"
+    "(defn line-seq [rdr]\n"
+    "  (if (and (map? rdr) (= :LineReader (get rdr :cljc/type)))\n"
+    "    (let [ls (deref (get rdr :lines))]\n"
+    "      (reset! (get rdr :lines) ())\n"
+    "      (seq ls))\n"
+    "    (let [s (str rdr)]\n"
+    "      (seq (str/split-lines (or (cljc/slurp-maybe s) s))))))\n"
     "(defn iterator-seq [x] (seq x)) (defn enumeration-seq [x] (seq x))\n"
     "(defn array-seq [x] (seq x)) (defn xml-seq [x] (seq x))\n"
     "(defn re-matcher [pat s] (.matcher pat s))\n"
@@ -11858,7 +11935,10 @@ static const char *PRELUDE =
     "              specs)\n"
     "       nil))\n"
     "(defmacro declare [& names]\n"
-    "  `(do ~@(map (fn [n] `(def ~n nil)) names)))\n"
+    /* defonce, NOT def: Clojure's declare never overwrites a bound var —
+       core.match forward-declares vector-pattern AFTER defining it, and a
+       plain (def n nil) silently clobbered the fn. */
+    "  `(do ~@(map (fn [n] `(defonce ~n nil)) names)))\n"
     "(defn boolean [x] (if x true false))\n"
     "(defn true? [x] (= x true))\n"
     "(defn false? [x] (= x false))\n"
@@ -12950,6 +13030,32 @@ CljcEnv *cljc_new_env(void) {
         "(def java.math.BigInteger :bigint) (def clojure.lang.BigInt :bigint)\n"
         "(def java.math.BigDecimal :BigDecimal)\n"
         "(def clojure.lang.Ratio :ratio)\n"
+        "(defn class? [x] (keyword? x))   ; classes are type keywords here\n"
+        "(defn macroexpand [form]\n"
+        "  (let [e (macroexpand-1 form)]\n"
+        "    (if (= e form) form (recur e))))\n"
+        /* IPersistentMap instance methods — meander's compiled matchers call
+           these directly */
+        "(defn .without [m k] (dissoc m k))\n"
+        "(defn .entryAt [m k] (find m k))\n"
+        "(defn cljc/reader-content* [x]\n"
+        "  (cond (string? x) x\n"
+        "        (and (map? x) (= :java.io.Reader (:cljc/type x))) (:s (deref (:rdr x)))\n"
+        "        (and (map? x) (= :LineReader (:cljc/type x))) (str/join \"\\n\" (deref (:lines x)))\n"
+        "        (and (map? x) (= :StringBuilder (:cljc/type x))) (str x)\n"
+        "        :else (str x)))\n"
+        "(defn java.io.BufferedReader. [x]\n"
+        "  {:cljc/type :LineReader :lines (atom (str/split-lines (cljc/reader-content* x)))})\n"
+        "(def BufferedReader. java.io.BufferedReader.)\n"
+        "(cljc/reg-method! 'readLine :LineReader\n"
+        "  (fn [this]\n"
+        "    (let [ls (deref (:lines this))]\n"
+        "      (when (seq ls)\n"
+        "        (swap! (:lines this) rest)\n"
+        "        (first ls)))))\n"
+        "(def clojure.lang.ILookup :cljc/ILookup)\n"
+        "(derive :map :cljc/ILookup) (derive :vector :cljc/ILookup)\n"
+        "(derive :set :cljc/ILookup) (derive :sorted-map :cljc/ILookup)\n"
         "(def java.util.Collection :java.util.Collection)\n"
         "(derive :vector :java.util.Collection) (derive :list :java.util.Collection)\n"
         "(derive :set :java.util.Collection) (derive :lazy-seq :java.util.Collection)\n"

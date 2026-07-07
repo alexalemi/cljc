@@ -27,14 +27,20 @@ stuartsierra/component, weavejester/dependency, rewrite-clj (all namespaces
 load; zip API untested), org.clojure/tools.reader, riddley,
 borkdude/deflet.
 
+## Works — verified functionally (bring-up round, 2026-07-07)
+
+| Library | Verified |
+|---|---|
+| org.clojure/core.match | wildcards, multi-column, nested vectors, maps, seq patterns, `:or`, `:guard`, `:as`, rest patterns, clause ordering (13/13 battery) |
+| markdown-clj | `md-to-html-string`: headings, emphasis, lists, links, code blocks, tables, YAML front-matter metadata |
+| meander/epsilon | `match`/`search`/`find`: logic + memory vars, maps (nested/multi-key), `scan`, `pred`, `or`, `app` (9/9 battery). `m/rewrite` not yet |
+
 ## Partial
 
 | Library | Status |
 |---|---|
-| org.clojure/core.match | loads; the `match` macro fails at expansion (`vector-pattern` internals) — needs bring-up |
+| meander `m/rewrite` | its self-hosted clause analyzer reports non-exhaustive — match/search/find are fine |
 | com.rpl/specter | loads with riddley vendored; `defnav`-generated vars missing at use — its macro layer needs bring-up |
-| markdown-clj | parser namespaces load; `md-to-html-string` needs `java.io` BufferedReader/Writer shims — needs bring-up |
-| meander | scalar/vector/logic-var matching works; map patterns WIP |
 
 ## Won't work (JVM-native by design)
 

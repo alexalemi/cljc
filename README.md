@@ -84,9 +84,9 @@ namespace* and reports which load cleanly. Common JVM interop is shimmed —
 `java.time.Instant`/`DateTimeFormatter` (epoch-backed, real ISO-8601),
 `java.util.UUID` (real v4 `random-uuid`), boxed-number methods, class keys for
 `(extend Cls …)` — enough that e.g. `clojure.data.json` vendors and round-trips
-unmodified (byte-oriented strings mean non-ASCII content in *its* escaping path
-can mangle; cljc's own `json.clj` battery handles UTF-8 natively). Heavier
-interop may still need porting.
+unmodified, including non-ASCII text (astral chars in its `\uXXXX` escaping
+assume UTF-16 surrogates — pass `:escape-unicode false` for those, or use the
+UTF-8-native `json.clj` battery). Heavier interop may still need porting.
 
 ## Platforms
 
@@ -342,6 +342,11 @@ embeddability matter; use bb/JVM where throughput does.
 
 ## Deliberate divergences from Clojure
 
+- **Strings index by codepoint, not UTF-16 code unit.** `count`/`nth`/`subs`/
+  `seq`/`str/index-of` agree with what a human sees: `(count "héllo")` is 5 and
+  `(count "𝄞")` is 1 (Clojure says 2 — a surrogate pair). Storage is UTF-8;
+  pure-ASCII strings keep O(1) indexing. A slurped binary file still indexes
+  byte-per-byte (invalid sequences fall back to one byte = one char)
 - `catch` is untyped — the class in `(catch Exception e …)` is ignored; the
   first `catch` wins
 - Plain integer arithmetic wraps on int64 overflow (Clojure's `*`/`+` throw);

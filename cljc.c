@@ -197,6 +197,9 @@ struct Cljc {
                                        * call head — skip the dispatch cascade */
         const char *kw;
         char *str;
+        /* aliases .str — nbytes: buffer length from mk_str; ncp: cached
+         * codepoint count (STR_NCP_UNKNOWN until first asked for) */
+        struct { char *data; uint32_t nbytes; uint32_t ncp; } strx;
         struct { Cljc *head; Cljc *tail; } cons;
         /* Persistent vector: 32-way position trie + tail of the last ≤32
          * elements. tail is owned by THIS cell (copied per derived vector);
@@ -749,13 +752,78 @@ static size_t gc_extra_bytes;   /* string buffer bytes since last GC —
                                  * string churn must trigger by bytes too
                                  * (a 17GB runaway found the gap) */
 
+#define STR_NCP_UNKNOWN 0xFFFFFFFFu
+
 static Cljc *mk_str(const char *s, size_t n) {
     Cljc *v = alloc(CLJC_STRING);
     gc_extra_bytes += n;
     v->as.str = xmalloc(n + 1);
     memcpy(v->as.str, s, n);
     v->as.str[n] = '\0';
+    v->as.strx.nbytes = (uint32_t)n;
+    v->as.strx.ncp = STR_NCP_UNKNOWN;
     return v;
+}
+
+/* ── codepoint-indexed strings ──────────────────────────────────────────
+ * Storage stays UTF-8 bytes (C interop, printing, and the regex engine are
+ * untouched), but count/nth/get/seq/subs/index-of speak CODEPOINTS. A
+ * pure-ASCII string (ncp == nbytes) keeps O(1) indexing; multibyte strings
+ * scan — they are short in practice, and ncp is computed once and cached.
+ * Invalid bytes decode as themselves (latin-1 fallback), so a slurped
+ * binary file still counts/indexes without crashing, one byte = one "char".
+ * (Divergence from the JVM: Clojure indexes UTF-16 code units, so astral
+ * chars count as 2 there and 1 here.) */
+static int32_t utf8_next(const char **p) {
+    const unsigned char *s = (const unsigned char *)*p;
+    unsigned char b = s[0];
+    if (b < 0x80) { *p += 1; return b; }
+    if ((b & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+        *p += 2;
+        return ((b & 0x1F) << 6) | (s[1] & 0x3F);
+    }
+    if ((b & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
+        *p += 3;
+        return ((b & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    }
+    if ((b & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 &&
+        (s[3] & 0xC0) == 0x80) {
+        *p += 4;
+        return ((b & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
+               ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+    }
+    *p += 1;
+    return b;                                /* invalid byte: latin-1 fallback */
+}
+
+static size_t str_cp_count(Cljc *v) {
+    if (v->as.strx.ncp != STR_NCP_UNKNOWN) return v->as.strx.ncp;
+    size_t n = 0;
+    const char *p = v->as.str, *end = v->as.str + v->as.strx.nbytes;
+    while (p < end) { utf8_next(&p); n++; }
+    v->as.strx.ncp = (uint32_t)n;            /* idempotent cache; one thread */
+    return n;
+}
+static bool str_ascii(Cljc *v) { return str_cp_count(v) == v->as.strx.nbytes; }
+
+static size_t str_cp_to_byte(Cljc *v, size_t i) {  /* i <= ncp */
+    if (str_ascii(v)) return i;
+    const char *p = v->as.str;
+    while (i--) utf8_next(&p);
+    return (size_t)(p - v->as.str);
+}
+static int32_t str_cp_at(Cljc *v, size_t i) {      /* i < ncp */
+    if (str_ascii(v)) return (unsigned char)v->as.str[i];
+    const char *p = v->as.str;
+    while (i--) utf8_next(&p);
+    return utf8_next(&p);
+}
+static size_t str_byte_to_cp(Cljc *v, size_t off) {  /* off on a cp boundary */
+    if (str_ascii(v)) return off;
+    size_t n = 0;
+    const char *p = v->as.str;
+    while ((size_t)(p - v->as.str) < off) { utf8_next(&p); n++; }
+    return n;
 }
 static Cljc *mk_cons(Cljc *h, Cljc *t) {
     Cljc *v = alloc(CLJC_LIST);
@@ -5217,6 +5285,24 @@ static int print_var_int(Binding **cache, const char *nm, size_t n) {
 /* at a collection: true if we're too deep to print it (render "#" instead) */
 static bool print_too_deep(void) { int l = PRINT_LEVEL(); return l >= 0 && g_print_depth >= l; }
 
+/* UTF-8-encode one codepoint (1–4 bytes) into the buffer. */
+static void sb_put_utf8(SBuf *sb, int32_t cp) {
+    if (cp < 0x80) sb_putc(sb, (char)cp);
+    else if (cp < 0x800) {
+        sb_putc(sb, (char)(0xC0 | (cp >> 6)));
+        sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        sb_putc(sb, (char)(0xE0 | (cp >> 12)));
+        sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+    } else {
+        sb_putc(sb, (char)(0xF0 | (cp >> 18)));
+        sb_putc(sb, (char)(0x80 | ((cp >> 12) & 0x3F)));
+        sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+    }
+}
+
 /* readably=true  → pr semantics: strings get quotes (read-back form)
  * readably=false → str/print semantics: strings render raw */
 static void print_to(SBuf *sb, Cljc *v, bool readably) {
@@ -5275,27 +5361,12 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                         if (cp >= 33 && cp < 127) { sb_putc(sb, '\\'); sb_putc(sb, (char)cp); }
                         else if (cp >= 127) {       /* printable non-ASCII: \<utf8>, like Clojure */
                             sb_putc(sb, '\\');
-                            if (cp < 0x800) {
-                                sb_putc(sb, (char)(0xC0 | (cp >> 6)));
-                                sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
-                            } else {
-                                sb_putc(sb, (char)(0xE0 | (cp >> 12)));
-                                sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
-                                sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
-                            }
+                            sb_put_utf8(sb, cp);
                         }
                         else { char tmp[8]; snprintf(tmp, sizeof tmp, "\\u%04X", cp); sb_puts(sb, tmp); }
                 }
             } else {                       /* (str \a) => "a": UTF-8 encode */
-                if (cp < 0x80) sb_putc(sb, (char)cp);
-                else if (cp < 0x800) {
-                    sb_putc(sb, (char)(0xC0 | (cp >> 6)));
-                    sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
-                } else {
-                    sb_putc(sb, (char)(0xE0 | (cp >> 12)));
-                    sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
-                    sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
-                }
+                sb_put_utf8(sb, cp);
             }
             break;
         }
@@ -6386,7 +6457,7 @@ static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
         return mk_int((int64_t)argv[0]->as.map.count);
     if (tag == CLJC_SORTED)
         return mk_int((int64_t)sorted_count(argv[0]));
-    if (tag == CLJC_STRING) return mk_int((int64_t)strlen(argv[0]->as.str));
+    if (tag == CLJC_STRING) return mk_int((int64_t)str_cp_count(argv[0]));
     cljc_error("count: %s is not countable", val_type_name(argv[0]));
     return NIL;
 }
@@ -6420,10 +6491,11 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
         if (not_found) return not_found;
         cljc_error("nth: index %lld out of bounds for length %zu", (long long)orig_idx, vec_len(coll));
     } else if (coll && coll->tag == CLJC_STRING) {
-        if (n >= 0 && (size_t)n < strlen(coll->as.str))
-            return mk_char((unsigned char)coll->as.str[n]);   /* (nth "abc" 1) => \b */
+        size_t ncp = str_cp_count(coll);
+        if (n >= 0 && (size_t)n < ncp)
+            return mk_char(str_cp_at(coll, (size_t)n));   /* (nth "abc" 1) => \b */
         if (not_found) return not_found;
-        cljc_error("nth: index %lld out of bounds for length %zu", (long long)orig_idx, strlen(coll->as.str));
+        cljc_error("nth: index %lld out of bounds for length %zu", (long long)orig_idx, ncp);
     } else if (coll && (coll->tag == CLJC_LIST || coll->tag == CLJC_LAZY)) {
         /* advance argv[0] so a deep index into a lazy seq stays O(1) live */
         for (Cljc *l = seq1_slot(&argv[0]); l && l->tag == CLJC_LIST;
@@ -6721,9 +6793,9 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
             return vec_nth(coll, (size_t)k->as.i);
     } else if (coll != NIL && coll->tag == CLJC_STRING && k->tag == CLJC_INT) {
-        size_t len = strlen(coll->as.str);   /* (get s i) => char */
+        size_t len = str_cp_count(coll);     /* (get s i) => char */
         if (k->as.i >= 0 && (size_t)k->as.i < len)
-            return mk_char((unsigned char)coll->as.str[k->as.i]);
+            return mk_char(str_cp_at(coll, (size_t)k->as.i));
     }
     return dflt;
 }
@@ -7012,10 +7084,11 @@ static Cljc *to_seq(Cljc *v) {
         return out;
     }
     if (v->tag == CLJC_STRING) {
-        /* Strings seq into chars (one per byte, matching byte-oriented count). */
+        /* Strings seq into chars by CODEPOINT (UTF-8 decoded). */
         Cljc *out = NIL, **t = &out;
-        for (const char *c = v->as.str; *c; c++) {
-            *t = mk_cons(mk_char((unsigned char)*c), NIL);
+        const char *p = v->as.str, *end = v->as.str + v->as.strx.nbytes;
+        while (p < end) {
+            *t = mk_cons(mk_char(utf8_next(&p)), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
@@ -8309,6 +8382,8 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
         size_t n = strlen(v->as.str);
         c->as.str = xmalloc(n + 1);
         memcpy(c->as.str, v->as.str, n + 1);
+        c->as.strx.nbytes = (uint32_t)n;
+        c->as.strx.ncp = STR_NCP_UNKNOWN;
     }
     c->meta = m == NIL ? NULL : m;
     return c;
@@ -9107,15 +9182,18 @@ static char *as_str(Cljc *v, const char *what) {
 
 static Cljc *prim_subs(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
-    char *s = as_str(argv[0], "subs");
-    size_t len = strlen(s);
+    as_str(argv[0], "subs");                 /* type check */
+    Cljc *sv = argv[0];
+    size_t len = str_cp_count(sv);           /* codepoint indices, like count */
     int64_t start = as_int(argv[1], "subs");
     int64_t end = nargs > 2
         ? as_int(argv[2], "subs") : (int64_t)len;
     if (start < 0 || end < start || (size_t)end > len)
         cljc_error("subs: start %lld, end %lld out of bounds for length %zu",
                    (long long)start, (long long)end, len);
-    return mk_str(s + start, (size_t)(end - start));
+    size_t b0 = str_cp_to_byte(sv, (size_t)start);
+    size_t b1 = str_cp_to_byte(sv, (size_t)end);
+    return mk_str(sv->as.str + b0, b1 - b0);
 }
 
 #define STR_MAP_FN(NAME, XFORM) \
@@ -9200,11 +9278,12 @@ static Cljc *prim_index_of(CljcEnv *env, Cljc **argv, int nargs) {
     char *s = as_str(argv[0], "str/index-of");
     char cb[5];
     char *sub = strval_or_char(argv[1], cb, "str/index-of");
-    size_t sl = strlen(s);
-    size_t from = nargs > 2 ? (size_t)as_int(argv[2], "str/index-of") : 0;
-    if (from > sl) return NIL;
-    char *hit = strstr(s + from, sub);
-    return hit ? mk_int((int64_t)(hit - s)) : NIL;
+    size_t ncp = str_cp_count(argv[0]);
+    int64_t fromi = nargs > 2 ? as_int(argv[2], "str/index-of") : 0;
+    if (fromi < 0) fromi = 0;
+    if ((size_t)fromi > ncp) return NIL;
+    char *hit = strstr(s + str_cp_to_byte(argv[0], (size_t)fromi), sub);
+    return hit ? mk_int((int64_t)str_byte_to_cp(argv[0], (size_t)(hit - s))) : NIL;
 }
 
 static Cljc *prim_blank_p(CljcEnv *env, Cljc **argv, int nargs) {

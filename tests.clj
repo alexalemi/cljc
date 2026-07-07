@@ -2269,4 +2269,29 @@
 (assert= :boolean java.lang.Boolean)                             ; class keys resolve for (extend ...)
 (assert= :Instant java.time.Instant)
 
+; ── codepoint-indexed strings (storage stays UTF-8 bytes) ──
+(let [s "héllo → ∞"]
+  (assert= 9 (count s))                       ; codepoints, not bytes (13)
+  (assert= \é (nth s 1))
+  (assert= \→ (nth s 6))
+  (assert= \é (get s 1))
+  (assert= "héllo" (subs s 0 5))
+  (assert= "→ ∞" (subs s 6))
+  (assert= 6 (str/index-of s "→"))            ; index agrees with subs
+  (assert= "→ ∞" (subs s (str/index-of s "→")))
+  (assert= 3 (str/last-index-of s "l"))
+  (assert= "∞ → olléh" (str/reverse s))
+  (assert= [\h \é \l] (vec (take 3 s)))
+  (assert= \∞ (last s))
+  (assert= 9 (.length s))
+  (assert= \é (.charAt s 1)))
+(let [s "𝄞clef"]                              ; astral plane: 1 char, not 2 (JVM counts UTF-16 units)
+  (assert= 5 (count s))
+  (assert= \𝄞 (first s))
+  (assert= "clef" (subs s 1))
+  (assert= \𝄞 (read-string (pr-str \𝄞))))     ; 4-byte chars survive print/read
+(assert= 11 (count "plain ascii"))            ; ASCII fast path intact
+(assert= \a (nth "plain ascii" 6))
+(assert= 2 (count (str \é \𝄞)))               ; str of wide chars re-encodes correctly
+
 (println "tests complete")

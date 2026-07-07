@@ -4,11 +4,13 @@ Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
 (`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test` (runs the
 suite twice — normal and `CLJC_GC_STRESS=1`).
 
-## Status (as of 2026-07-02)
+## Status (as of 2026-07-07, v0.2.0)
 
-~13,000 lines, zero warnings, 1244 assertions in `tests.clj`, ASan/UBSan clean
+~14,700 lines, zero warnings, ~1350 assertions in `tests.clj`, ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
-required by conservative stack scanning, same as Boehm GC).
+required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan),
+macOS arm64 + x86_64/Rosetta, Windows (MSYS2 mingw64) — suite runs normal +
+GC-stress on every push; tagged releases publish portable binaries.
 
 ### Done
 - **Reader**: lists/vectors/maps/strings (with escapes), keywords, comments,
@@ -908,6 +910,56 @@ required by conservative stack scanning, same as Boehm GC).
     a deep C stack also made every GC collection O(depth) via the
     conservative scan (the arm64 suite burned 10 CPU-minutes before the
     fix; expect normal times after).
+
+## 2026-07 arc: perf campaign, usability, unicode, tooling (summary)
+
+Compressed log of the July push (details in git history, commits 6b964f7..):
+
+- **Perf campaign** (07-01): primitive int64 arrays (CLJC_IARRAY),
+  real O(log n) priority-map + O(log n) `(first sorted)`, top-level
+  form VM compilation (TAILCALL sentinel trampoline), chunked
+  range/repeat/repeatedly. AoC corpus (262 days, local-only advent/)
+  605s total. Measurement gotcha: ±5% wall-clock can be pure code
+  alignment — A/B with -falign-functions=64 -falign-loops=32 on BOTH.
+- **Error UX**: traces reach inside VM-compiled bodies (vm_trace shadow
+  stack; NOT address-linked stack locals — publishing &local deopts the
+  dispatch loop ~4%), tail calls REPLACE their frame (g_tc_form handoff),
+  frames carry file:line (:file meta via rd_file_cell, ErrFrames
+  save/restore reader state), caret suppressed for other-file frames,
+  did-you-mean + "(require 'the.ns) first" hints, val_desc names scalar
+  values in type errors, stack overflow hints loop/recur.
+- **Discovery/REPL**: docs.clj battery (~240 entries incl. special forms,
+  arglists for natives), (source f), (dir ns), (dbg expr)/#p (real &form
+  binding at all 3 macro-expansion sites), *e/(pst), trace-vars, Ctrl-R
+  search, paren-depth continuation indent, pretty-printed wide results
+  (pp_to fill layout), *print-length* REPL default + seq1 lazy printing
+  (to_seq in print paths was the infinite-print hang), Ctrl-C interrupts
+  eval (g_interrupt in eval()/VOP_CALL), named #<fn f [x]> printing.
+- **Tooling**: cljc watch (mtime rerun), cljc doctor (load-path triage),
+  cljc vendor / (vendor! "src") — Clojars release jar or GitHub clone →
+  ./vendor/ + try-require report; nREPL completions/lookup (+cider
+  aliases); exe-dir on *load-path* (repo builds work from any cwd).
+- **Interop shims**: epoch-ms java.time.Instant (+ISO-8601 via Hinnant
+  civil_from_days), DateTimeFormatter/ISO_INSTANT, real v4 random-uuid,
+  String./getChars/char-arrays, Long|Double/valueOf, class-name→type-
+  keyword defs + derives so (extend Cls Proto ..) dispatches. Acceptance:
+  vendored clojure.data.json round-trips unmodified.
+- **Unicode**: strings index by CODEPOINT (UTF-8 storage; strx {nbytes,
+  lazily cached ncp} union view; ASCII O(1) fast path; latin-1 fallback
+  for invalid bytes) and the regex engine matches codepoints (int32
+  literals, unicode class ranges, all scan loops step by codepoint).
+  Divergence: astral = 1 char (JVM: 2 UTF-16 units). Differentially
+  fuzzed vs babashka: 1200 BMP string/regex exprs, 0 divergences;
+  self-consistency invariants hold under GC stress (fuzz/ in repo).
+- **Windows parity**: the real line editor (SetConsoleMode raw + VT
+  in/out driving the same loop; fgets fallback), console width, Ctrl-C
+  via SetConsoleCtrlHandler. windows.h TRUE/FALSE are #undef'd — Win32
+  callbacks return 1/0.
+- **Battery bugs found by the tooling**: (require 'process) self-capture
+  infinite tail-loop (bare `sh` inside ns process = process/sh itself —
+  now clojure.core/sh), mkdir-p was single-level, bigint("123") returned
+  the first char's codepoint, Double/isNaN could not work ((= x x) is
+  identity-true; num_cmp treats NaN equal-to-all → cljc/nan?* native).
 
 ## Known divergences from Clojure (deliberate)
 - `catch` is untyped; hash maps/sets iterate in hash order; plain int64

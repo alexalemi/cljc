@@ -2325,4 +2325,15 @@
 (assert= "" (with-out-str (traced-fact 3)))        ; untraced: silent again
 (assert= true (fn? vendor!))                       ; vendor! callable from the REPL
 
+; ── ecosystem-sweep round: #^ metadata, regex escape pairs, new, with-open ──
+(cljc/eval-forms* "(ns #^{:author \"a\"} sweep.metans2) (def in-ns-val 7)")
+(assert= true (some? (find-ns 'sweep.metans2)))       ; ns registers despite name meta
+(assert= 7 sweep.metans2/in-ns-val)
+(assert= "aQb" (str/replace "a\\b" #"\\" "Q"))       ; #"\\" = one literal backslash...
+(assert= "Q" (str/replace "\\\\" #"\\\\" "Q"))      ; ...#"\\\\" = two (escape PAIRS)
+(assert= "x" (re-find #"\"|x" "axb"))                 ; \" inside a pattern
+(assert= "ok" (str (new StringBuilder) "ok"))         ; (new Cls args*) sugar
+(assert= 3 (with-open [r {:cljc/type :NopCloseable}] 3))  ; with-open runs + closes
+(in-ns 'user)
+
 (println "tests complete")

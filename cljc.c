@@ -2560,6 +2560,7 @@ static Cljc *read_form(const char **p) {
             v = vec_conj1(v, l->as.cons.head);
         return v;
     }
+    if (c == '#' && (*p)[1] == '^') { (*p)++; c = '^'; }  /* #^ = archaic ^ metadata */
     if (c == '^') {
         /* ^{...} and ^:kw compile to (with-meta form m), evaluated at
          * runtime like Clojure; ^Tag type hints are discarded. */
@@ -2763,12 +2764,20 @@ static Cljc *read_form(const char **p) {
                        mk_cons(params, mk_cons(body, NIL)));
     }
     if (c == '#' && (*p)[1] == '"') {
-        /* Raw string for regex patterns: backslashes pass through verbatim;
-         * \" is the only escape (yields a quote char in the pattern). */
+        /* Raw string for regex patterns, Clojure rule: a backslash and its
+         * following char pass through as a PAIR — so #"\\\\" is two literal
+         * backslashes and the trailing \\ of a pattern can never eat the
+         * closing quote (markdown-clj's escape table hit exactly that). \"
+         * stays in the pattern; the engine treats it as a literal quote. */
         *p += 2;
         SBuf sb = {0};
         while (**p && **p != '"') {
-            if (**p == '\\' && (*p)[1] == '"') { sb_putc(&sb, '"'); *p += 2; continue; }
+            if (**p == '\\' && (*p)[1]) {
+                sb_putc(&sb, **p);
+                sb_putc(&sb, (*p)[1]);
+                *p += 2;
+                continue;
+            }
             sb_putc(&sb, **p);
             (*p)++;
         }
@@ -12496,22 +12505,25 @@ CljcEnv *cljc_new_env(void) {
             "  (or (zero? (:exit (process/sh \"unzip\" \"-q\" \"-o\" jar \"-d\" dir)))\n"
             "      (zero? (:exit (process/sh \"bsdtar\" \"-xf\" jar \"-C\" dir)))\n"
             "      (throw (ex-info \"cannot extract jar: need unzip or bsdtar on PATH\" {}))))\n"
-            "(defn cljc/vendor-clojars* [coord tmp]\n"
-            "  ;; nil when the coord isn't on Clojars; else the extracted source root\n"
+            "(defn cljc/vendor-maven* [repo repo-name coord tmp]\n"
+            "  ;; nil when the coord isn't in this maven repo; else the extracted root\n"
             "  (let [[g a] (str/split coord \"/\")\n"
-            "        base (str \"https://repo.clojars.org/\" (str/replace g \".\" \"/\") \"/\" a)\n"
+            "        base (str repo (str/replace g \".\" \"/\") \"/\" a)\n"
             "        meta (:out (process/sh \"curl\" \"-fsSL\" (str base \"/maven-metadata.xml\")))\n"
             "        ver  (and meta (or (second (re-find #\"<release>([^<]+)</release>\" meta))\n"
             "                           (last (map second (re-seq #\"<version>([^<]+)</version>\" meta)))))]\n"
             "    (when ver\n"
             "      (let [jar (str tmp \".jar\")\n"
             "            url (str base \"/\" ver \"/\" a \"-\" ver \".jar\")]\n"
-            "        (println (str \"Fetching Clojars \" coord \" \" ver \" ...\"))\n"
+            "        (println (str \"Fetching \" repo-name \" \" coord \" \" ver \" ...\"))\n"
             "        (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" url \"-o\" jar)))\n"
             "          (throw (ex-info (str \"download failed: \" url) {})))\n"
             "        (cljc/vendor-unjar* jar tmp)\n"
             "        (process/sh \"rm\" \"-f\" jar)\n"
             "        tmp))))\n"
+            "(defn cljc/vendor-clojars* [coord tmp]\n"
+            "  (or (cljc/vendor-maven* \"https://repo.clojars.org/\" \"Clojars\" coord tmp)\n"
+            "      (cljc/vendor-maven* \"https://repo1.maven.org/maven2/\" \"Maven Central\" coord tmp)))\n"
             "(defn cljc/vendor-git* [url tmp]\n"
             "  (println (str \"Cloning \" url \" ...\"))\n"
             "  (let [r (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--quiet\" url tmp)]\n"
@@ -12547,8 +12559,9 @@ CljcEnv *cljc_new_env(void) {
             "                  (map (fn [p] (subs p (inc (count root)))))\n"
             "                  (filter (fn [rel]\n"
             "                    (and (re-find #\"\\.cljc?$\" rel)\n"
+            "                         ;; only TOP-LEVEL test/dev dirs: a mid-path segment like\n"
+            "                         ;; clojure/test/check.cljc is a package name, not a test dir\n"
             "                         (not (re-find #\"^(META-INF|test|tests|dev|examples?|perf|bench)/\" rel))\n"
-            "                         (not (re-find #\"(^|/)(test|tests|dev|examples?|perf|bench)/\" rel))\n"
             "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj|deps\\.cljs|data_readers\\.cljc?)$\" rel))))))]\n"
             "    (when (empty? rels)\n"
             "      (throw (ex-info (str \"no .clj/.cljc sources found under \" root) {})))\n"
@@ -12558,15 +12571,21 @@ CljcEnv *cljc_new_env(void) {
             "        (spit dst (slurp (str root \"/\" rel)))))\n"
             "    (process/sh \"rm\" \"-rf\" tmp)\n"
             "    (println (str \"Vendored \" (count rels) \" file(s) into vendor/.\"))\n"
-            "    (doseq [rel (sort rels)]\n"
-            "      (let [nsname (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
-            "                           (str/replace \"/\" \".\")\n"
-            "                           (str/replace \"_\" \"-\"))\n"
-            "            r (try (require (symbol nsname)) :ok\n"
-            "                   (catch Exception e (or (ex-message e) \"load failed\")))]\n"
+            "    (let [nss (map (fn [rel] (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
+            "                                     (str/replace \"/\" \".\")\n"
+            "                                     (str/replace \"_\" \"-\")))\n"
+            "                   (sort rels))\n"
+            "          try-ns (fn [n] (try (require (symbol n)) :ok\n"
+            "                              (catch Exception e (or (ex-message e) \"load failed\"))))\n"
+            "          pass1 (map (fn [n] [n (try-ns n)]) nss)\n"
+            "          ;; second chance: alphabetical order can try a ns before the\n"
+            "          ;; sibling it requires; a retry after everything else loaded\n"
+            "          ;; clears those ordering artifacts\n"
+            "          final (map (fn [[n r]] [n (if (= r :ok) :ok (try-ns n))]) pass1)]\n"
+            "      (doseq [[n r] final]\n"
             "        (if (= r :ok)\n"
-            "          (println (str \"  (require '\" nsname \")   ; loads OK\"))\n"
-            "          (println (str \"  (require '\" nsname \")   ; FAILS: \" r\n"
+            "          (println (str \"  (require '\" n \")   ; loads OK\"))\n"
+            "          (println (str \"  (require '\" n \")   ; FAILS: \" r\n"
             "                        \" — JVM-interop-heavy libraries may need porting\")))))\n"
             "    true)))"
             "(def vendor! cljc/vendor!)\n"
@@ -12938,6 +12957,28 @@ CljcEnv *cljc_new_env(void) {
         "(defn Long/toHexString [n] (format \"%x\" n))\n"
         "(defn Double/valueOf [s] (or (parse-double s) (throw (ex-info (str \"bad double: \" s) {}))))\n"
         "(defn EOFException. [msg] (ex-info msg {:type :eof}))\n"
+        "(def cljc/compiler-specials*\n"
+        "  ;; the JVM compiler's special-form table (riddley walks against it):\n"
+        "  ;; a map of special symbols -> truthy is all consumers look for\n"
+        "  (zipmap '[def loop* recur if case* let* letfn* do fn* quote var\n"
+        "            clojure.core/import* . set! deftype* reify* try throw\n"
+        "            monitor-enter monitor-exit catch finally new &]\n"
+        "          (repeat true)))\n"
+        "(defn clojure.lang.Compiler/specials [] cljc/compiler-specials*)\n"
+        "(defn .close [o] (if-let [m (cljc/dt-method 'close o)] (m o) nil))\n"
+        "(defmacro with-open\n"
+        "  \"Binds, evaluates body, .closes the bindings in reverse order (finally).\"\n"
+        "  [bindings & body]\n"
+        "  (if (empty? bindings)\n"
+        "    (cons 'do body)\n"
+        "    (list 'let (vec (take 2 bindings))\n"
+        "          (list 'try\n"
+        "                (cons 'with-open (cons (vec (drop 2 bindings)) body))\n"
+        "                (list 'finally (list '.close (first bindings)))))))\n"
+        "(defmacro new\n"
+        "  \"(new Cls args*) => (Cls. args*) — cljc constructors are dot-suffixed fns.\"\n"
+        "  [cls & args]\n"
+        "  (cons (symbol (str cls \".\")) args))\n"
         "(defn .isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
         "(defn .isNaN [x] (cljc/nan?* x))\n"
         "(defn .doubleValue [x] (double x))\n"

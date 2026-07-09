@@ -332,16 +332,26 @@ GC-stress on every push; tagged releases publish portable binaries.
     files transitively, still one arity error from green — PARTIAL
     (next session: chase the 2-arg arity miss in its split path).
     clojure.data: upstream URL 404'd, untried.
-26. KNOWN BUG to hunt (found 2026-06-11, reify was the reproducer):
-    macros whose expansions are built from LAZY seq compositions
-    (`~@(map ...)` chains, (cons 'do (concat lazy ...))) misbehave in
-    some shapes — symptoms ranged from arity errors to wrong dispatch
-    values; an eagerly-constructed expansion of the same shape works.
-    Suspect: interaction between chunked-lazy realization inside
-    qq_expand splicing / eval-of-lazy-as-form and macro-time
-    environments. reify now builds its expansion eagerly (loop/concat
-    of realized lists) as the workaround. Reproduce from git history:
-    the reify version at commit 0ac1817. Hunt with fresh context.
+26. ~~KNOWN BUG: lazy macro expansions~~ ✅ CLOSED 2026-07-09 (verified
+    fixed, regression-pinned). Hunt findings: rebuilt the 0ac1817 binary
+    and reproduced both historical symptoms — (cons '+ (concat lazy ...))
+    as an expansion SILENTLY returned 0 (lazy cell in form position
+    dropped its args → (+)), and the lazy reify splice threw "no matching
+    arity for 2 args". On today's binary every shape passes, normal +
+    GC-stress + ASan: lazy-seq-as-form, ~@ splices across chunk
+    boundaries (100 args), mapcat splices in VM-compiled fns evaluated
+    repeatedly (splice-once semantics: side effects realize exactly once),
+    nested lazy splices, 40-method defmethod generation, macro-defining-
+    macros, lazy param-vector splices (35 params), macro-time throws.
+    Fixed en route by item 14's eval-of-lazy-as-form + the item-36 VM
+    bughunt (macro resolution). All shapes now pinned in tests.clj (the
+    i26-* block). NOT item 26 but found while hunting: (a) the multimethod-
+    based reify EMULATION pattern (defmethod per clause) has last-closure-
+    wins semantics per call site — the CURRENT builtin reify is immune
+    (per-instance :cljc/impls closures); (b) tests.clj's "refer shadows
+    reduce" test was marked must-stay-LAST but ~500 lines had been
+    appended after it — defused by re-referring clojure.core/reduce
+    (re-refer restores, now asserted).
 27. ~~Namespaces-lite (require isolation)~~ ✅ done 2026-06-11 — the
     flat-global collision fix. Design: symbol cells carry a home_ns
     stamped by the reader during library loads (cljc/in-ns* set/

@@ -1856,13 +1856,14 @@
   (assert= true (>= (- (cljc/now-ms*) t0) 25)))
 
 ; ── refer of a core-shadowing name is a per-ns (user) alias, NOT a global clobber ──
-; (must stay LAST: it shadows `reduce` in the user ns for forms that follow)
 (assert= 6 (clojure.core/reduce + [1 2 3]))            ; core reduce intact before
 (require '[clojure.core.async :refer [reduce]])        ; shadows reduce in `user`
 (assert= 6 (clojure.core/reduce + [1 2 3]))            ; core reduce STILL intact
 (assert= 24 (clojure.core/reduce * [1 2 3 4]))         ; and other core fns (frequencies etc.)
 (assert= {:a 2 :b 1} (frequencies [:a :a :b]))         ; frequencies uses reduce internally
 (assert= 10 (async/<!! (reduce + 0 (async/to-chan! [1 2 3 4]))))  ; referred reduce = async/reduce
+(require '[clojure.core :refer [reduce]])              ; re-refer RESTORES core reduce
+(assert= 6 (reduce + [1 2 3]))                         ; 2-arity works again for tests below
 ) ; end when-coro
 
 ; ── namespaced :keys destructuring binds the BARE local (Clojure semantics) ──
@@ -2380,5 +2381,58 @@
   (assert= nil (.readLine r)))
 (assert= 3 (with-open [r (java.io.BufferedReader. (StringReader. "x\ny\nz"))]
              (count (line-seq r))))
+
+;; PLAN item 26 (closed 2026-07-09): macros whose expansions are built from
+;; LAZY seq compositions. Historically (0ac1817) a lazy seq in form position
+;; dropped its args ((cons '+ (concat lazy ...)) => 0) and lazy reify-style
+;; splices threw arity errors. Fixed en route (lazy-as-form + VM bughunt);
+;; these assertions pin every shape so it can't regress silently.
+;; expansion IS a lazy seq (cons onto concat) — the silent-0 shape
+(defmacro i26-sum [& xs]
+  (cons '+ (concat (map (fn [x] (* 2 x)) xs) '(1000))))
+(assert= 1012 (i26-sum 1 2 3))
+;; ~@ splice across chunk boundaries (>32 elements)
+(defmacro i26-big [& xs] `(+ ~@(map (fn [x] `(inc ~x)) xs)))
+(assert= (+ (reduce + (range 100)) 100) (eval (cons 'i26-big (range 100))))
+;; lazy mapcat splice inside a VM-compiled fn, call site evaluated repeatedly
+(defmacro i26-pairs [& xs]
+  `(vector ~@(mapcat (fn [x] [`(quote ~x) `(str '~x)]) xs)))
+(defn i26-use-pairs [] (i26-pairs a b c))
+(dotimes [_ 3] (assert= '[a "a" b "b" c "c"] (i26-use-pairs)))
+;; splice-side effects realize exactly once despite repeated call-site eval
+(def i26-count (atom 0))
+(defmacro i26-counted [& xs]
+  `(list ~@(map (fn [x] (swap! i26-count inc) x) xs)))
+(defn i26-caller [] (i26-counted 10 20 30))
+(dotimes [_ 5] (assert= '(10 20 30) (i26-caller)))
+(assert= 3 @i26-count)
+;; the original reproducer: reify-shaped defmethod generation via lazy splice
+(defmulti i26-area (fn [s] (type s)))
+(defmacro i26-reify [& clauses]
+  (let [t (keyword (str (gensym)))
+        impls (filter list? clauses)]
+    `(do ~@(map (fn [[m params & body]]
+                  `(defmethod ~m ~t ~(vec params) ~@body))
+                impls)
+         {:cljc/type ~t})))
+(def i26-a (i26-reify (i26-area [s] 25)))
+(def i26-b (i26-reify (i26-area [s] 49)))
+(assert= 25 (i26-area i26-a))
+(assert= 49 (i26-area i26-b))
+;; macro-defining-macro through a lazy splice
+(defmacro i26-getters [rec & fields]
+  `(do ~@(map (fn [f]
+                `(defmacro ~(symbol (str rec "-" f)) [m#]
+                   (list 'get m# ~(keyword (str f)))))
+              fields)))
+(i26-getters i26pt x y z)
+(assert= 1 (i26pt-x {:x 1 :y 2 :z 3}))
+(assert= 3 (i26pt-z {:x 1 :y 2 :z 3}))
+;; lazy splice building fn PARAMS (the arity-error symptom class)
+(defmacro i26-defn-n [name n & body]
+  (let [params (map (fn [i] (symbol (str "i26a" i))) (range n))]
+    `(defn ~name [~@params] ~@body)))
+(i26-defn-n i26-add35 35 (+ i26a0 i26a34))
+(assert= 36 (apply i26-add35 (map inc (range 35))))
 
 (println "tests complete")

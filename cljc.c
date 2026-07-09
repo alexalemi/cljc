@@ -1,5 +1,9 @@
 /* cljc.c — a small Clojure-in-C, single-file embeddable interpreter.
  *
+ * Copyright (c) 2026 Alex Alemi and contributors.
+ * SPDX-License-Identifier: EPL-1.0
+ * Distributed under the Eclipse Public License 1.0 (see LICENSE).
+ *
  * Build REPL:   cc -O2 -Wall -o cljc cljc.c
  * Embed:        compile with -DCLJC_NO_MAIN and link cljc.o into your program;
  *               see the public API block below.

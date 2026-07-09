@@ -378,3 +378,11 @@ ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 /tmp/cljc-asan tests
 ```
 
 Every bug fix lands with a regression assertion in `tests.clj`.
+
+## License
+
+[Eclipse Public License 1.0](LICENSE) — the same license as Clojure itself.
+You can embed cljc in any program, including closed-source ones; only
+modifications to cljc's own code must be shared under the EPL if distributed.
+Vendored libraries under `vendor/` retain their upstream licenses (EPL-1.0,
+notices preserved in each file).

@@ -121,13 +121,14 @@
       (str "#define CLJC_NO_MAIN\n"
            "#include \"cljc.c\"\n"
            "static const unsigned char script[] = {"
-           (str/join "," (map int (seq code)))
+           ;; raw UTF-8 bytes, not codepoints — non-ASCII must round-trip
+           (str/join "," (cljc/str-bytes* code))
            ",0};\n"
            ;; embedded dependency files, each a NUL-terminated byte array
            (str/join "" (map-indexed
                           (fn [i [_ content]]
                             (str "static const unsigned char dep" i "[] = {"
-                                 (str/join "," (map int (seq content))) ",0};\n"))
+                                 (str/join "," (cljc/str-bytes* content)) ",0};\n"))
                           dep-list))
            "static const CljcEmbeddedFile bundled[] = {\n"
            (str/join "" (map-indexed

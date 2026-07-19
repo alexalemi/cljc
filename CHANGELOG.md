@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Memory safety**: int-array bounds checks truncated 64-bit indices to 32
+  bits (`(aget a 4294967296)` read/wrote out of bounds — segfault or heap
+  corruption); printing bigints over ~280 digits overflowed a heap buffer
+  (`(str (apply *' (range 1 201)))`); a source file ending right after `^`
+  crashed the reader (NULL deref)
+- `binding` now installs in parallel like Clojure (inits can't see earlier
+  new values) and no longer permanently leaks earlier bindings when a later
+  init throws or a var fails to resolve
+- Deftype method dispatch for `.length`/`.charAt`/`.subSequence`/`.close` was
+  dead — a `cljc/dt-method` redefinition had swapped its parameters, so e.g.
+  `with-open` never called a deftype's own `close`; unified into one
+  definition reading `cljc/deftype-methods`
+- `record?` no longer returns true for deftype instances (consults the
+  `cljc/record-types` registry the rest of the file already maintains)
+- Regex: `(?i)`/`(?m)`/`(?u)` now raise "unsupported flag" instead of being
+  silently stripped (wrong matches); a nested regex inside a `str/replace`
+  replacement fn no longer clobbers the outer pattern's `(?s)` flag;
+  `str/split`/`replace`/`replace-first` only treat a string as a pattern when
+  it carries the `:regex` meta tag, not any metadata
+- `read-line` no longer silently splits lines longer than 4095 bytes
+- `(keyword nil "a")` returns `:a` (was an error), matching `symbol`
+- `(int-array 4294967296)` errors instead of silently making a 0-length array
+- Under-arity native calls (`(atom)`, `(mod 5)`, `(subseq ss)`, …) raise
+  "wrong number of args" instead of reading stale stack slots
+- `.contains` works on the `HashSet.`/`HashMap.` atom shims again (a later
+  string-oriented redefinition had dropped the atom branch)
+- `cljc watch`: `$`/`` ` `` in file names no longer shell-expand
+- bundle: non-ASCII scripts embed as UTF-8 bytes, not codepoints (bundled
+  binaries with unicode literals were corrupted); new `cljc/str-bytes*` /
+  `cljc/str-nbytes*` natives expose byte-level string access
+- http.clj: `Content-Length` is now a byte count (non-ASCII bodies were
+  mis-framed/truncated on both server and client side)
+- json.clj: `\uXXXX` escapes decode fully, including surrogate pairs (were
+  always replaced with `?`)
+- jit.clj: `(- x)` compiled to identity (dropped the negation); chained
+  comparisons `(< a b c)` compiled to C's `t1 < t2 < t3` instead of
+  pairwise-AND
+- `csp/merge` with no input channels closes its output immediately
+- Removed nine dead duplicate prelude definitions (later defn silently won);
+  fixed `process/sh`, `process/shell`, `fs/list-dir`, `http/serve`,
+  `http/run-server`, `json/parse` docstrings that described behavior the
+  code doesn't have
+
 ## v0.2.0 — 2026-07-07
 
 First tagged release. Everything below shipped since the version string was

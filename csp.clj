@@ -244,6 +244,7 @@
   ([chs buf]
    (let [out (chan buf)
          left (atom (count chs))]
+     (when (zero? @left) (close! out))   ; no inputs: close immediately
      (doseq [c chs]
        (go-loop []
          (let [v (<! c)]

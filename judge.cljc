@@ -89,8 +89,7 @@
           (cond
             instr
             (cond (= c "\\") (recur (+ i 2) els start depth true)
-                  (= c "\"") (recur (inc i) (if (and start (zero? depth)) els els)
-                                    start depth false)
+                  (= c "\"") (recur (inc i) els start depth false)
                   :else (recur (inc i) els start depth true))
             (= c ";")
             (let [j (or (str/index-of text "\n" i) (dec n))]

@@ -44,10 +44,27 @@
                                  (cljc/jit-emit (str "long long " t ";"))
                                  (cljc/jit-expr a t locals self)
                                  t))
-                       args)]
-          (cljc/jit-emit (str dst " = "
-                              (str/join (str " " (get cljc/jit-binops op) " ") (seq ts))
-                              ";")))
+                       args)
+              cop (get cljc/jit-binops op)
+              cmp? (contains? #{'< '> '<= '>= '= 'not=} op)
+              ;; chained comparisons are pairwise-AND, C's t1<t2<t3 is not
+              pairwise (fn [c] (str/join " && " (map (fn [a b] (str a " " c " " b))
+                                                     (butlast ts) (rest ts))))]
+          (cond
+            (empty? ts)
+            (throw (ex-info (str "jit: (" op ") needs arguments") {}))
+            (= 1 (count ts))
+            (case op
+              -          (cljc/jit-emit (str dst " = -" (first ts) ";"))
+              (+ *)      (cljc/jit-emit (str dst " = " (first ts) ";"))
+              (quot rem) (throw (ex-info (str "jit: (" op " x) needs two arguments") {}))
+              (cljc/jit-emit (str dst " = 1;")))   ; unary comparison: always true
+            (and cmp? (> (count ts) 2))
+            (if (= op 'not=)
+              (cljc/jit-emit (str dst " = !(" (pairwise "==") ");"))
+              (cljc/jit-emit (str dst " = " (pairwise cop) ";")))
+            :else
+            (cljc/jit-emit (str dst " = " (str/join (str " " cop " ") (seq ts)) ";"))))
         (= op 'if)
         (let [tc (cljc/jit-tmpvar)]
           (cljc/jit-emit (str "long long " tc ";"))

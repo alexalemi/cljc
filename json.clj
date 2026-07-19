@@ -5,8 +5,8 @@
 ;;   (json/parse s {:keywords? true})              => keyword keys
 ;;   (json/write {:a [1 nil "x"]})                 => "{\"a\":[1,null,\"x\"]}"
 ;;
-;; Notes: \uXXXX escapes decode to the char for codepoints < 128, else "?"
-;; (no unicode type). Numbers parse as int64 or double.
+;; Notes: \uXXXX escapes decode fully (surrogate pairs combine into the astral
+;; codepoint; a lone surrogate becomes "?"). Numbers parse as int64 or double.
 
 ;; ── parser: (pv s i) conventions — each step returns [value next-index] ──
 
@@ -34,7 +34,17 @@
             "\"" (recur (+ i 2) (str acc "\""))
             "\\" (recur (+ i 2) (str acc "\\"))
             "/" (recur (+ i 2) (str acc "/"))
-            "u" (recur (+ i 6) (str acc "?"))   ; \uXXXX: placeholder (no unicode type)
+            "u" (let [h (Integer/parseInt (subs s (+ i 2) (+ i 6)) 16)]
+                  (if (and (<= 0xD800 h 0xDBFF)                        ; high surrogate:
+                           (<= (+ i 12) (count s))                     ; pair with the low
+                           (= "\\u" (subs s (+ i 6) (+ i 8))))
+                    (let [lo (Integer/parseInt (subs s (+ i 8) (+ i 12)) 16)]
+                      (if (<= 0xDC00 lo 0xDFFF)
+                        (recur (+ i 12)
+                               (str acc (char (+ 0x10000 (* 0x400 (- h 0xD800)) (- lo 0xDC00)))))
+                        (recur (+ i 6) (str acc "?"))))                ; broken pair
+                    (recur (+ i 6)
+                           (str acc (if (<= 0xD800 h 0xDFFF) "?" (char h))))))
             (throw (ex-info (str "json: bad escape \\" e) {:at i}))))
         :else (recur (inc i) (str acc c))))))
 

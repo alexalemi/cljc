@@ -918,6 +918,38 @@
 (jit/defn jit-no [s] (str s "!"))                   ; outside the subset
 (assert= :unsupported (try (jit/compile! 'jit-no) (catch Exception e :unsupported)))
 (assert= "still works!" (jit-no "still works"))     ; interpreted version intact
+; ^long/^double hints: unboxed doubles, hinted params and return
+(assert= {:tag 'double} (meta '^double x))          ; reader keeps hints on symbols
+(jit/defn ^double jit-dist [^double x ^double y] (Math/sqrt (+ (* x x) (* y y))))
+(def jit-dist-interp (jit-dist 3.0 4.0))
+(jit/compile! 'jit-dist)
+(assert= jit-dist-interp (jit-dist 3.0 4.0))        ; identical semantics
+(assert= 5.0 (jit-dist 3 4))                        ; int args coerce to double params
+(jit/defn ^double jit-harm [^long n]                ; mixed loop: long counter, double acc
+  (loop [i 1 acc 0.0] (if (> i n) acc (recur (inc i) (+ acc (/ 1.0 i))))))
+(def jit-harm-interp (jit-harm 50))
+(jit/compile! 'jit-harm)
+(assert= jit-harm-interp (jit-harm 50))
+(jit/defn jit-avg [^double a ^double b] (/ (+ a b) 2.0))
+(def jit-avg-interp (jit-avg 1.0 2.0))              ; no ret hint: return type inferred
+(jit/compile! 'jit-avg)
+(assert= jit-avg-interp (jit-avg 1.0 2.0))
+(jit/defn jit-geo [^double q ^long n] (if (zero? n) 1.0 (* q (jit-geo q (dec n)))))
+(def jit-geo-interp (jit-geo 0.5 10))               ; inference through self-recursion
+(jit/compile! 'jit-geo)
+(assert= jit-geo-interp (jit-geo 0.5 10))
+(jit/defn ^long jit-truncr [^double x] (+ x 1))     ; explicit ^long ret truncates
+(jit/compile! 'jit-truncr)
+(assert= 3 (jit-truncr 2.5))
+(jit/defn jit-negl [^double x] (long (- x)))        ; casts + unary minus
+(jit/compile! 'jit-negl)
+(assert= -3 (jit-negl 3.7))
+(jit/defn jit-fbad [^float x] x)                    ; only ^long/^double allowed
+(assert= :badhint (try (jit/compile! 'jit-fbad) (catch Exception e :badhint)))
+(jit/defn jit-idiv [a b] (/ a b))                   ; / needs a double operand
+(assert= :intdiv (try (jit/compile! 'jit-idiv) (catch Exception e :intdiv)))
+(jit/defn jit-drem [^double a] (rem a 2))           ; rem/quot/mod stay integer-only
+(assert= :drem (try (jit/compile! 'jit-drem) (catch Exception e :drem)))
 ) ; end when-unix
 
 ; ── library survey: upstream clojure.set via loading require ──

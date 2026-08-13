@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **JIT type hints + doubles**: the reader now keeps `^Tag` hints as
+  `{:tag Tag}` metadata on symbols (read-time, like Clojure; still discarded
+  on non-symbol forms), and `jit.clj` honors JVM-style `^long`/`^double`
+  hints on params and the fn name — hinted functions compile to unboxed
+  `double`/`long long` machine ops, with the return type inferred from the
+  body when unhinted. Also new in the JIT subset: `/` (double division),
+  `Math/sqrt`, `(double x)`/`(long x)` casts, unary minus.
+
 ## v0.2.0 — 2026-07-07
 
 First tagged release. Everything below shipped since the version string was

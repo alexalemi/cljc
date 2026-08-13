@@ -161,10 +161,21 @@ set).
 (fib 32)               ; 1.24 s interpreted → 6 ms native (faster than bb/JVM)
 ```
 
-`jit.clj` (~180 lines of cljc) compiles a numeric subset — `if`, `let`,
-`loop`/`recur`, self-recursion, integer arithmetic/comparisons — to unboxed
-`long long` C through the same generate→`cc`→`dlopen`→rebind pipeline as the
-FFI. Compiled modules are content-cached, so warm compiles are a `dlopen`.
+`jit.clj` (~250 lines of cljc) compiles a numeric subset — `if`, `let`,
+`loop`/`recur`, self-recursion, arithmetic/comparisons, `Math/sqrt`, casts —
+to unboxed C through the same generate→`cc`→`dlopen`→rebind pipeline as the
+FFI. Types default to `long long`; JVM-style `^long`/`^double` hints on
+params (and optionally the fn name, for the return type — otherwise it's
+inferred from the body) pick unboxed `double`, and types flow through
+arithmetic like C promotion:
+
+```clojure
+(jit/defn ^double dist [^double x ^double y]
+  (Math/sqrt (+ (* x x) (* y y))))
+(jit/compile! 'dist)   ; unboxed double machine ops throughout
+```
+
+Compiled modules are content-cached, so warm compiles are a `dlopen`.
 Outside the subset, `jit/compile!` errors cleanly and the interpreted
 version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
 630 ms — it's real machine code.

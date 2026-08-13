@@ -2573,7 +2573,10 @@ static Cljc *read_form(const char **p) {
     if (c == '#' && (*p)[1] == '^') { (*p)++; c = '^'; }  /* #^ = archaic ^ metadata */
     if (c == '^') {
         /* ^{...} and ^:kw compile to (with-meta form m), evaluated at
-         * runtime like Clojure; ^Tag type hints are discarded. */
+         * runtime like Clojure; a ^Tag type hint on a symbol attaches
+         * {:tag Tag} to the (fresh, per-read) symbol cell at read time, so
+         * (meta '^double x) => {:tag double} and jit.clj can honor hints.
+         * Hints on non-symbol forms are discarded as before. */
         (*p)++;
         Cljc *m = read_form(p);
         Cljc *form = read_form(p);
@@ -2581,7 +2584,12 @@ static Cljc *read_form(const char **p) {
             Cljc *mm = mk_map();
             m = map_assoc(mm, m, TRUE);
         }
-        if (m == NIL || m->tag != CLJC_MAP) return form;  /* type hint */
+        if (m == NIL || m->tag != CLJC_MAP) {  /* ^Tag type hint */
+            if (m != NIL && m->tag == CLJC_SYMBOL &&
+                form != NIL && form->tag == CLJC_SYMBOL)
+                form->meta = map_assoc(mk_map(), mk_kw(intern("tag", 3)), m);
+            return form;
+        }
         return mk_cons(mk_sym(intern("with-meta", 9)),
                        mk_cons(form, mk_cons(m, NIL)));
     }

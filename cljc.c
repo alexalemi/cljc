@@ -7303,32 +7303,43 @@ static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_range(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     size_t n = (size_t)nargs;
-    bool flt = false;                       /* float range if any arg is a double */
-    for (size_t i = 0; i < n && i < 3; i++)
-        if (argv[i] != NIL && argv[i]->tag == CLJC_DOUBLE) flt = true;
+    /* Element type follows start/step promotion only (JVM Range adds per
+     * element): a double end just bounds an integer range, and an integer
+     * start stays an integer as the first element of a double-step range. */
+    Cljc *sv = n >= 2 ? argv[0] : NIL, *stv = n >= 3 ? argv[2] : NIL;
+    bool flt = (sv != NIL && sv->tag == CLJC_DOUBLE) ||
+               (stv != NIL && stv->tag == CLJC_DOUBLE);
     if (flt) {
-        double start = 0, end = 0, step = 1;
-        if (n == 1) end = as_num(argv[0]);
-        else { start = as_num(argv[0]); end = as_num(argv[1]); if (n >= 3) step = as_num(argv[2]); }
+        double start = as_num(argv[0]), end = as_num(argv[1]);
+        double step = n >= 3 ? as_num(argv[2]) : 1;
         if (step == 0) cljc_error("range: step must be nonzero");
         Cljc *out = NIL, **t = &out;
+        bool first = true;
         for (double i = start; step > 0 ? i < end : i > end; i += step) {
-            *t = mk_cons(mk_double(i), NIL); t = &(*t)->as.cons.tail;
+            Cljc *e = (first && sv->tag != CLJC_DOUBLE) ? sv : mk_double(i);
+            first = false;
+            *t = mk_cons(e, NIL); t = &(*t)->as.cons.tail;
         }
         return out;
     }
-    int64_t start = 0, end = 0, step = 1;
-    if (n == 1) end = as_int(argv[0], "range");
-    else if (n >= 2) {
+    int64_t start = 0, step = 1;
+    Cljc *ev = n == 1 ? argv[0] : argv[1];
+    if (n >= 2) {
         start = as_int(argv[0], "range");
-        end = as_int(argv[1], "range");
         if (n >= 3) step = as_int(argv[2], "range");
     }
     if (step == 0) cljc_error("range: step must be nonzero");
     Cljc *out = NIL, **t = &out;
-    for (int64_t i = start; step > 0 ? i < end : i > end; i += step) {
-        *t = mk_cons(mk_int(i), NIL);
-        t = &(*t)->as.cons.tail;
+    if (ev != NIL && ev->tag == CLJC_DOUBLE) {   /* double end only bounds */
+        double end = ev->as.d;
+        for (int64_t i = start; step > 0 ? (double)i < end : (double)i > end; i += step) {
+            *t = mk_cons(mk_int(i), NIL); t = &(*t)->as.cons.tail;
+        }
+    } else {
+        int64_t end = as_int(ev, "range");
+        for (int64_t i = start; step > 0 ? i < end : i > end; i += step) {
+            *t = mk_cons(mk_int(i), NIL); t = &(*t)->as.cons.tail;
+        }
     }
     return out;
 }
@@ -7342,16 +7353,30 @@ static Cljc *prim_range_chunk(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *sv = argv[0], *ev = argv[1], *stv = argv[2];
     int64_t cnt = as_int(argv[3], "range");
     bool inf = (ev == NIL);
-    bool flt = sv->tag == CLJC_DOUBLE || stv->tag == CLJC_DOUBLE ||
-               (!inf && ev->tag == CLJC_DOUBLE);
+    /* Element type follows start/step promotion only (JVM Range adds per
+     * element): a double end just bounds an integer range, and an integer
+     * start stays an integer as the first element of a double-step range
+     * (the carried next-start is a double from then on). */
+    bool flt = sv->tag == CLJC_DOUBLE || stv->tag == CLJC_DOUBLE;
     Cljc *out = NIL, **t = &out, *next;
     if (flt) {
         double i = as_num(sv), end = inf ? 0 : as_num(ev), step = as_num(stv);
         if (step == 0) cljc_error("range: step must be nonzero");
+        bool first = true;
         for (; cnt > 0 && (inf || (step > 0 ? i < end : i > end)); cnt--, i += step) {
-            *t = mk_cons(mk_double(i), NIL); t = &(*t)->as.cons.tail;
+            Cljc *e = (first && sv->tag != CLJC_DOUBLE) ? sv : mk_double(i);
+            first = false;
+            *t = mk_cons(e, NIL); t = &(*t)->as.cons.tail;
         }
         next = mk_double(i);
+    } else if (!inf && ev->tag == CLJC_DOUBLE) {
+        int64_t i = as_int(sv, "range"), step = as_int(stv, "range");
+        double end = ev->as.d;
+        if (step == 0) cljc_error("range: step must be nonzero");
+        for (; cnt > 0 && (step > 0 ? (double)i < end : (double)i > end); cnt--, i += step) {
+            *t = mk_cons(mk_int(i), NIL); t = &(*t)->as.cons.tail;
+        }
+        next = mk_int(i);
     } else {
         int64_t i = as_int(sv, "range"), end = inf ? 0 : as_int(ev, "range"), step = as_int(stv, "range");
         if (step == 0) cljc_error("range: step must be nonzero");
@@ -11379,6 +11404,8 @@ static const char *PRELUDE =
     "    (str s)))\n"
     "(defn .length [o] (if-let [m (cljc/dt-method 'length o)] (m o) (count (cljc/sb-str o))))\n"
     "(defn .charAt [o i] (if-let [m (cljc/dt-method 'charAt o)] (m o i) (nth (cljc/sb-str o) i)))\n"
+    "(defn .toUpperCase [o] (str/upper-case (cljc/sb-str o)))\n"
+    "(defn .toLowerCase [o] (str/lower-case (cljc/sb-str o)))\n"
     "(defn .deleteCharAt [sb i]\n"
     "  (let [s (deref (:v sb))] (reset! (:v sb) (str (subs s 0 i) (subs s (inc i))))) sb)\n"
     "(defn .setLength [sb n] (reset! (:v sb) (subs (deref (:v sb)) 0 n)) sb)\n"
@@ -11467,7 +11494,26 @@ static const char *PRELUDE =
     "(defn num [x] x) (defn bigdec [x] (if (string? x) (or (parse-double x) x) x))\n"
     "(defn bigint [x] (if (string? x) (read-string (str x \"N\")) (int x)))\n"
     "(defn biginteger [x] (bigint x))\n"
-    "(defn rationalize [x] x)\n"   /* numerator/denominator are real natives now */
+    /* rationalize: exact ratio from a double's shortest decimal repr (str x
+     * matches Java's Double.toString, so this tracks JVM semantics:
+     * (rationalize 0.1) => 1/10). Integral results demote to int64 where the
+     * JVM keeps BigInt — the documented bigness divergence. */
+    "(defn rationalize [x]\n"
+    "  (if (double? x)\n"
+    "    (let [s (str x)\n"
+    "          [mant expo] (str/split s \"E\")\n"
+    "          e (if expo (parse-long expo) 0)\n"
+    "          neg (str/starts-with? mant \"-\")\n"
+    "          mant (if neg (subs mant 1) mant)\n"
+    "          [ip fp] (str/split mant \".\")\n"
+    "          fp (or fp \"\")\n"
+    "          n (parse-long (str ip fp))\n"
+    "          n (if neg (- n) n)\n"
+    "          k (- (count fp) e)]\n"
+    "      (if (pos? k)\n"
+    "        (/ n (reduce *' (repeat k 10)))\n"
+    "        (* n (reduce *' (repeat (- k) 10)))))\n"
+    "    x))\n"
     "(defn double [x] (* 1.0 x)) (defn float [x] (* 1.0 x))\n"
     /* unchecked math == checked in cljc */
     "(def unchecked-add +) (def unchecked-subtract -) (def unchecked-multiply *)\n"
@@ -12612,25 +12658,32 @@ CljcEnv *cljc_new_env(void) {
             "  (or (zero? (:exit (process/sh \"unzip\" \"-q\" \"-o\" jar \"-d\" dir)))\n"
             "      (zero? (:exit (process/sh \"bsdtar\" \"-xf\" jar \"-C\" dir)))\n"
             "      (throw (ex-info \"cannot extract jar: need unzip or bsdtar on PATH\" {}))))\n"
-            "(defn cljc/vendor-maven* [repo repo-name coord tmp]\n"
-            "  ;; nil when the coord isn't in this maven repo; else the extracted root\n"
+            "(def cljc/vendor-repos*\n"
+            "  ;; [url display-name] pairs tried in order; an atom so tests (or users\n"
+            "  ;; with a mirror) can point maven resolution elsewhere, incl. file:// dirs\n"
+            "  (atom [[\"https://repo.clojars.org/\" \"Clojars\"]\n"
+            "         [\"https://repo1.maven.org/maven2/\" \"Maven Central\"]]))\n"
+            "(defn cljc/vendor-maven* [repo repo-name coord tmp ver]\n"
+            "  ;; nil when the coord (at ver, if pinned) isn't in this maven repo;\n"
+            "  ;; else the extracted root\n"
             "  (let [[g a] (str/split coord \"/\")\n"
             "        base (str repo (str/replace g \".\" \"/\") \"/\" a)\n"
-            "        meta (:out (process/sh \"curl\" \"-fsSL\" (str base \"/maven-metadata.xml\")))\n"
-            "        ver  (and meta (or (second (re-find #\"<release>([^<]+)</release>\" meta))\n"
-            "                           (last (map second (re-seq #\"<version>([^<]+)</version>\" meta)))))]\n"
+            "        ver (or ver\n"
+            "                (let [meta (:out (process/sh \"curl\" \"-fsSL\" (str base \"/maven-metadata.xml\")))]\n"
+            "                  (and meta (or (second (re-find #\"<release>([^<]+)</release>\" meta))\n"
+            "                                (last (map second (re-seq #\"<version>([^<]+)</version>\" meta)))))))]\n"
             "    (when ver\n"
             "      (let [jar (str tmp \".jar\")\n"
             "            url (str base \"/\" ver \"/\" a \"-\" ver \".jar\")]\n"
             "        (println (str \"Fetching \" repo-name \" \" coord \" \" ver \" ...\"))\n"
-            "        (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" url \"-o\" jar)))\n"
-            "          (throw (ex-info (str \"download failed: \" url) {})))\n"
-            "        (cljc/vendor-unjar* jar tmp)\n"
-            "        (process/sh \"rm\" \"-f\" jar)\n"
-            "        tmp))))\n"
-            "(defn cljc/vendor-clojars* [coord tmp]\n"
-            "  (or (cljc/vendor-maven* \"https://repo.clojars.org/\" \"Clojars\" coord tmp)\n"
-            "      (cljc/vendor-maven* \"https://repo1.maven.org/maven2/\" \"Maven Central\" coord tmp)))\n"
+            "        (if (zero? (:exit (process/sh \"curl\" \"-fsSL\" url \"-o\" jar)))\n"
+            "          (do (cljc/vendor-unjar* jar tmp)\n"
+            "              (process/sh \"rm\" \"-f\" jar)\n"
+            "              tmp)\n"
+            "          (do (process/sh \"rm\" \"-f\" jar) nil))))))\n"
+            "(defn cljc/vendor-clojars* [coord tmp & [ver]]\n"
+            "  (some (fn [[repo nm]] (cljc/vendor-maven* repo nm coord tmp ver))\n"
+            "        (deref cljc/vendor-repos*)))\n"
             "(defn cljc/vendor-git* [url tmp]\n"
             "  (println (str \"Cloning \" url \" ...\"))\n"
             "  (let [r (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--quiet\" url tmp)]\n"
@@ -12640,6 +12693,38 @@ CljcEnv *cljc_new_env(void) {
             "  (cond (fs/directory? (str tmp \"/src/main/clojure\")) (str tmp \"/src/main/clojure\")\n"
             "        (fs/directory? (str tmp \"/src\"))              (str tmp \"/src\")\n"
             "        :else tmp))\n"
+            "(defn cljc/vendor-copy* [root]\n"
+            "  ;; copy root's .clj/.cljc sources into ./vendor/, returning the rel paths\n"
+            "  (let [rels (->> (cljc/vendor-walk* root)\n"
+            "                  (map (fn [p] (subs p (inc (count root)))))\n"
+            "                  (filter (fn [rel]\n"
+            "                    (and (re-find #\"\\.cljc?$\" rel)\n"
+            "                         ;; only TOP-LEVEL test/dev dirs: a mid-path segment like\n"
+            "                         ;; clojure/test/check.cljc is a package name, not a test dir\n"
+            "                         (not (re-find #\"^(META-INF|test|tests|dev|examples?|perf|bench)/\" rel))\n"
+            "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj|deps\\.cljs|data_readers\\.cljc?)$\" rel))))))]\n"
+            "    (doseq [rel rels]\n"
+            "      (let [dst (str \"vendor/\" rel)]\n"
+            "        (when-let [dir (fs/parent dst)] (fs/create-dir dir))\n"
+            "        (spit dst (slurp (str root \"/\" rel)))))\n"
+            "    (vec rels)))\n"
+            "(defn cljc/vendor-report* [rels]\n"
+            "  (let [nss (map (fn [rel] (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
+            "                                   (str/replace \"/\" \".\")\n"
+            "                                   (str/replace \"_\" \"-\")))\n"
+            "                 (sort (distinct rels)))\n"
+            "        try-ns (fn [n] (try (require (symbol n)) :ok\n"
+            "                            (catch Exception e (or (ex-message e) \"load failed\"))))\n"
+            "        pass1 (map (fn [n] [n (try-ns n)]) nss)\n"
+            "        ;; second chance: alphabetical order can try a ns before the\n"
+            "        ;; sibling it requires; a retry after everything else loaded\n"
+            "        ;; clears those ordering artifacts\n"
+            "        final (map (fn [[n r]] [n (if (= r :ok) :ok (try-ns n))]) pass1)]\n"
+            "    (doseq [[n r] final]\n"
+            "      (if (= r :ok)\n"
+            "        (println (str \"  (require '\" n \")   ; loads OK\"))\n"
+            "        (println (str \"  (require '\" n \")   ; FAILS: \" r\n"
+            "                      \" — JVM-interop-heavy libraries may need porting\"))))))\n"
             "(defn cljc/vendor!\n"
             "  \"Fetch a pure-Clojure library into ./vendor/ and report which of its\n"
             "  namespaces load. Accepts Clojars group/artifact or GitHub user/repo\n"
@@ -12662,40 +12747,134 @@ CljcEnv *cljc_new_env(void) {
             "               (or (cljc/vendor-clojars* src tmp)\n"
             "                   (cljc/vendor-git* (str \"https://github.com/\" src) tmp))\n"
             "               :else (cljc/vendor-git* src tmp))\n"
-            "        rels (->> (cljc/vendor-walk* root)\n"
-            "                  (map (fn [p] (subs p (inc (count root)))))\n"
-            "                  (filter (fn [rel]\n"
-            "                    (and (re-find #\"\\.cljc?$\" rel)\n"
-            "                         ;; only TOP-LEVEL test/dev dirs: a mid-path segment like\n"
-            "                         ;; clojure/test/check.cljc is a package name, not a test dir\n"
-            "                         (not (re-find #\"^(META-INF|test|tests|dev|examples?|perf|bench)/\" rel))\n"
-            "                         (not (re-find #\"^(project\\.clj|build\\.clj|profiles\\.clj|deps\\.cljs|data_readers\\.cljc?)$\" rel))))))]\n"
+            "        rels (cljc/vendor-copy* root)]\n"
             "    (when (empty? rels)\n"
             "      (throw (ex-info (str \"no .clj/.cljc sources found under \" root) {})))\n"
-            "    (doseq [rel rels]\n"
-            "      (let [dst (str \"vendor/\" rel)]\n"
-            "        (when-let [dir (fs/parent dst)] (fs/create-dir dir))\n"
-            "        (spit dst (slurp (str root \"/\" rel)))))\n"
             "    (process/sh \"rm\" \"-rf\" tmp)\n"
             "    (println (str \"Vendored \" (count rels) \" file(s) into vendor/.\"))\n"
-            "    (let [nss (map (fn [rel] (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
-            "                                     (str/replace \"/\" \".\")\n"
-            "                                     (str/replace \"_\" \"-\")))\n"
-            "                   (sort rels))\n"
-            "          try-ns (fn [n] (try (require (symbol n)) :ok\n"
-            "                              (catch Exception e (or (ex-message e) \"load failed\"))))\n"
-            "          pass1 (map (fn [n] [n (try-ns n)]) nss)\n"
-            "          ;; second chance: alphabetical order can try a ns before the\n"
-            "          ;; sibling it requires; a retry after everything else loaded\n"
-            "          ;; clears those ordering artifacts\n"
-            "          final (map (fn [[n r]] [n (if (= r :ok) :ok (try-ns n))]) pass1)]\n"
-            "      (doseq [[n r] final]\n"
-            "        (if (= r :ok)\n"
-            "          (println (str \"  (require '\" n \")   ; loads OK\"))\n"
-            "          (println (str \"  (require '\" n \")   ; FAILS: \" r\n"
-            "                        \" — JVM-interop-heavy libraries may need porting\")))))\n"
+            "    (cljc/vendor-report* rels)\n"
             "    true)))"
             "(def vendor! cljc/vendor!)\n"
+            /* deps.edn mode: `cljc vendor` with no argument (or a deps.edn path)
+             * resolves :deps — :mvn/version from the maven repos (transitively,
+             * via the jars' poms), :git/url + :git/sha|:git/tag via clone
+             * (io.github and com.github lib names infer the URL), :local/root
+             * by copy; git and local deps recurse into their own deps.edn. */
+            "(defn cljc/pom-parse-deps* [xml]\n"
+            "  ;; compile/runtime-scope, non-optional, property-free deps of one pom\n"
+            "  (when-let [block (second (re-find #\"(?s)<dependencies>(.*?)</dependencies>\" xml))]\n"
+            "    (keep (fn [d]\n"
+            "            (let [tag (fn [t] (second (re-find (re-pattern (str \"(?s)<\" t \">([^<]+)</\" t \">\")) d)))\n"
+            "                  g (tag \"groupId\") a (tag \"artifactId\") v (tag \"version\")]\n"
+            "              (when (and g a v\n"
+            "                         (not (re-find #\"\\$\\{\" v))\n"
+            "                         (not (contains? #{\"test\" \"provided\"} (tag \"scope\")))\n"
+            "                         (not= (tag \"optional\") \"true\")\n"
+            "                         (not= (str g \"/\" a) \"org.clojure/clojure\"))\n"
+            "                [(symbol (str g \"/\" a)) {:mvn/version v}])))\n"
+            "          (map second (re-seq #\"(?s)<dependency>(.*?)</dependency>\" block)))))\n"
+            "(defn cljc/pom-deps* [root]\n"
+            "  (vec (mapcat (fn [p] (cljc/pom-parse-deps* (slurp p)))\n"
+            "               (filter (fn [p] (re-find #\"pom\\.xml$\" p))\n"
+            "                       (cljc/vendor-walk* root)))))\n"
+            "(defn cljc/deps-file-deps* [path]\n"
+            "  ;; [[lib coord] ...] from a deps.edn's :deps, nil if absent/unreadable\n"
+            "  (when-let [s (cljc/slurp-maybe path)]\n"
+            "    (try (seq (get (read-string s) :deps))\n"
+            "         (catch Exception e\n"
+            "           (println (str \"  warning: unreadable \" path \": \" (ex-message e)))\n"
+            "           nil))))\n"
+            "(defn cljc/vendor-git-dep* [lib coord tmp]\n"
+            "  ;; clone lib at :git/sha (or :git/tag); => [src-root project-root]\n"
+            "  (let [url (or (get coord :git/url)\n"
+            "                (let [g (namespace lib) n (name lib)]\n"
+            "                  (cond (and g (str/starts-with? g \"io.github.\"))  (str \"https://github.com/\" (subs g 10) \"/\" n)\n"
+            "                        (and g (str/starts-with? g \"com.github.\")) (str \"https://github.com/\" (subs g 11) \"/\" n)\n"
+            "                        :else nil)))\n"
+            "        sha (get coord :git/sha) tag (get coord :git/tag)]\n"
+            "    (when-not url (throw (ex-info (str \"vendor: no :git/url for \" lib) {})))\n"
+            "    (println (str \"Cloning \" url \" ...\"))\n"
+            "    (let [r (if (and tag (not sha))\n"
+            "              (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--branch\" tag \"--quiet\" url tmp)\n"
+            "              (process/sh \"git\" \"clone\" \"--quiet\" url tmp))]\n"
+            "      (when-not (zero? (:exit r))\n"
+            "        (println (:err r))\n"
+            "        (throw (ex-info (str \"git clone failed for \" url) {}))))\n"
+            "    (when sha\n"
+            "      (when-not (zero? (:exit (process/sh \"git\" \"-C\" tmp \"checkout\" \"--quiet\" sha)))\n"
+            "        (throw (ex-info (str \"vendor: git checkout \" sha \" failed for \" lib) {}))))\n"
+            "    (let [proot (if-let [sub (get coord :deps/root)] (str tmp \"/\" sub) tmp)]\n"
+            "      [(cond (fs/directory? (str proot \"/src/main/clojure\")) (str proot \"/src/main/clojure\")\n"
+            "             (fs/directory? (str proot \"/src\"))              (str proot \"/src\")\n"
+            "             :else proot)\n"
+            "       proot])))\n"
+            "(defn cljc/vendor-dep-1* [lib coord basedir]\n"
+            "  ;; vendor one dep; => [rels next-deps next-basedir]\n"
+            "  (let [tmp (str (fs/temp-dir) \"/cljc-vendor-\" (str/replace (str lib) \"/\" \"_\"))]\n"
+            "    (process/sh \"rm\" \"-rf\" tmp)\n"
+            "    (cond\n"
+            "      (get coord :local/root)\n"
+            "      (let [proot (let [r (get coord :local/root)]\n"
+            "                    (if (str/starts-with? r \"/\") r (str basedir \"/\" r)))\n"
+            "            src (cond (fs/directory? (str proot \"/src/main/clojure\")) (str proot \"/src/main/clojure\")\n"
+            "                      (fs/directory? (str proot \"/src\"))              (str proot \"/src\")\n"
+            "                      :else proot)]\n"
+            "        [(cljc/vendor-copy* src) (cljc/deps-file-deps* (str proot \"/deps.edn\")) proot])\n"
+            "      (get coord :mvn/version)\n"
+            "      (let [root (or (cljc/vendor-clojars* (str lib) tmp (get coord :mvn/version))\n"
+            "                     (throw (ex-info (str \"vendor: cannot fetch \" lib \" \"\n"
+            "                                          (get coord :mvn/version)) {})))\n"
+            "            rels (cljc/vendor-copy* root)\n"
+            "            next (cljc/pom-deps* root)]\n"
+            "        (process/sh \"rm\" \"-rf\" tmp)\n"
+            "        [rels next nil])\n"
+            "      :else\n"
+            "      (let [[src proot] (cljc/vendor-git-dep* lib coord tmp)\n"
+            "            rels (cljc/vendor-copy* src)\n"
+            "            next (vec (cljc/deps-file-deps* (str proot \"/deps.edn\")))]\n"
+            "        (process/sh \"rm\" \"-rf\" tmp)\n"
+            "        [rels next nil]))))\n"
+            "(defn cljc/vendor-deps!\n"
+            "  \"Vendor every dependency of a deps.edn (its :deps map, transitively)\n"
+            "  into ./vendor/ and report which namespaces load.\"\n"
+            "  [deps-path]\n"
+            "  (require 'fs) (require 'process)\n"
+            "  (let [deps (cljc/deps-file-deps* deps-path)]\n"
+            "    (when-not deps\n"
+            "      (throw (ex-info (str \"vendor: no :deps map found in \" deps-path) {})))\n"
+            "    (let [basedir (or (fs/parent deps-path) \".\")\n"
+            "          seen (atom {}) rels (atom [])]\n"
+            "      (loop [work (mapv (fn [[l c]] [l c basedir]) deps)]\n"
+            "        (when-let [[lib coord bdir] (first work)]\n"
+            "          (let [more (vec (rest work))]\n"
+            "            (if (contains? (deref seen) lib)\n"
+            "              (do (when (not= (get (deref seen) lib) coord)\n"
+            "                    (println (str \"  note: \" lib \" already vendored as \"\n"
+            "                                  (pr-str (get (deref seen) lib)) \"; skipping \" (pr-str coord))))\n"
+            "                  (recur more))\n"
+            "              (do (swap! seen assoc lib coord)\n"
+            "                  (println (str \"Vendoring \" lib \" \" (pr-str coord)))\n"
+            "                  (let [[rs next nbase] (cljc/vendor-dep-1* lib coord bdir)]\n"
+            "                    (when (empty? rs)\n"
+            "                      (println (str \"  (no Clojure sources in \" lib \" — a Java library?)\")))\n"
+            "                    (swap! rels into rs)\n"
+            "                    (recur (into more (mapv (fn [[l c]] [l c nbase]) (vec next))))))))))\n"
+            "      (println (str \"Vendored \" (count (distinct (deref rels))) \" file(s) into vendor/ \"\n"
+            "                    \"from \" (count (deref seen)) \" dep(s).\"))\n"
+            "      (cljc/vendor-report* (deref rels))\n"
+            "      true)))\n"
+            "(defn cljc/vendor-main! []\n"
+            "  ;; `cljc vendor` CLI entry: no arg => ./deps.edn; a deps.edn path => that\n"
+            "  ;; file; anything else => the single-library vendor! path\n"
+            "  (let [a (first *args*)]\n"
+            "    (cond\n"
+            "      (nil? a)\n"
+            "      (if (cljc/slurp-maybe \"deps.edn\")\n"
+            "        (cljc/vendor-deps! \"deps.edn\")\n"
+            "        (throw (ex-info (str \"usage: cljc vendor [deps.edn | group/artifact | git-url | jar-url]\"\n"
+            "                             \" (no deps.edn in the current directory)\") {})))\n"
+            "      (re-find #\"deps\\.edn$\" (str a)) (cljc/vendor-deps! (str a))\n"
+            "      :else (cljc/vendor! a))))\n"
         "(def cljc/trace-depth* (atom 0))\n"
         "(def cljc/traced* (atom {}))\n"
         "(defn cljc/trace-wrap* [nm f]\n"
@@ -12779,12 +12958,19 @@ CljcEnv *cljc_new_env(void) {
         "   (if (cljc/range-small? start end step)\n"
         "     (cljc/range-eager start end step)\n"
         "     (cljc/range* start end step))))\n"
-        "(defn interleave [c1 c2]\n"
-        "  (lazy-seq (let [s1 (seq c1) s2 (seq c2)]\n"
-        "              (when (and s1 s2)\n"
-        "                (cons (first s1)\n"
-        "                      (cons (first s2)\n"
-        "                            (interleave (rest s1) (rest s2))))))))\n"
+        "(defn interleave\n"
+        "  ([] (list)) ([c1] (lazy-seq c1))\n"
+        "  ([c1 c2]\n"
+        "   (lazy-seq (let [s1 (seq c1) s2 (seq c2)]\n"
+        "               (when (and s1 s2)\n"
+        "                 (cons (first s1)\n"
+        "                       (cons (first s2)\n"
+        "                             (interleave (rest s1) (rest s2))))))))\n"
+        "  ([c1 c2 & colls]\n"
+        "   (lazy-seq (let [ss (map seq (cons c1 (cons c2 colls)))]\n"
+        "               (when (every? identity ss)\n"
+        "                 (concat (map first ss)\n"
+        "                         (apply interleave (map rest ss))))))))\n"
         /* ── transducer arities ──
          * The xf builders above become the 1-arity of the seq functions,
          * Clojure-style: (map f) is a transducer. Current impls are
@@ -12903,7 +13089,9 @@ CljcEnv *cljc_new_env(void) {
         "(def cljc/interpose-impl interpose)\n"
         "(defn interpose ([sep] (interpose-xf sep)) ([sep c] (cljc/interpose-impl sep c)))\n"
         "(def cljc/partition-all-impl partition-all)\n"
-        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (cljc/partition-all-impl n c)))\n"
+        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (cljc/partition-all-impl n c))\n"
+        "  ([n step c] (lazy-seq (when-let [s (seq c)]\n"
+        "                          (cons (take n s) (partition-all n step (drop step s)))))))\n"
         "(def cljc/partition-by-impl partition-by)\n"
         "(defn partition-by ([f] (partition-by-xf f)) ([f c] (cljc/partition-by-impl f c)))\n"
         /* multi-coll transduce: step every coll in parallel, feeding the xform's
@@ -14546,7 +14734,8 @@ static void usage(FILE *f) {
         "  fmt [check] <files...>     format with cljfmt (fix in place; check only)\n"
         "  bundle <file> <out>        script + runtime → one native binary\n"
         "  watch <file> [args]        run the script, rerun whenever it changes\n"
-        "  vendor <git-url|user/repo> copy a library's .clj sources into ./vendor\n"
+        "  vendor [src|deps.edn]    copy a library's .clj sources into ./vendor;\n"
+        "                           no arg: resolve ./deps.edn's :deps transitively\n"
         "  doctor                     print resolved load path + batteries\n"
         "  version                    print version\n"
         "  help                       this text\n",
@@ -14805,11 +14994,12 @@ int main(int argc, char **argv) {
         return run_subprogram(env, "(load-file \"clerk.clj\") (clerk/main)", false);
     }
     if (!strcmp(cmd, "vendor")) {
-        /* cljc vendor <source> — thin CLI over (cljc/vendor! src), which is
-         * also callable from the REPL as (vendor! "user/repo"). */
-        if (argc < 3) { fputs("usage: cljc vendor <group/artifact | git-url | jar-url>\n", stderr); return 1; }
+        /* cljc vendor [source] — thin CLI over cljc/vendor-main!: with no
+         * argument (or a deps.edn path) it resolves ./deps.edn's :deps
+         * transitively; a coord/URL fetches that one library. Also callable
+         * from the REPL as (vendor! "user/repo"). */
         set_args(env, argc, argv, 2);
-        return run_subprogram(env, "(cljc/vendor! (first *args*))", true);
+        return run_subprogram(env, "(cljc/vendor-main!)", true);
     }
     if (!strcmp(cmd, "test")) {
         set_args(env, argc, argv, 2);
@@ -14870,7 +15060,8 @@ int main(int argc, char **argv) {
         return (last != NIL && last->tag == CLJC_INT) ? (int)last->as.i : 0;
     }
     if (!strcmp(cmd, "bundle")) {
-        if (argc != 4) { fputs("usage: cljc bundle <script.clj> <output>\n", stderr); return 1; }
+        /* >= 4: flags (--library, --static, --cc=..) ride along to bundle.clj */
+        if (argc < 4) { fputs("usage: cljc bundle [flags] <script.clj> <output>\n", stderr); return 1; }
         set_args(env, argc, argv, 2);
         return run_subprogram(env, "(load-file \"bundle.clj\")", false);
     }

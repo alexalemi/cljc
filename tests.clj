@@ -892,6 +892,27 @@
 (assert= 97 (int \a))
 (assert= 65 (int "A"))
 (assert= 3 (int 3.7))
+; conformance-corpus catches: gaps found by fuzz/conformance.txt
+(assert= '((1 2 3) (3 4 5) (5)) (partition-all 3 2 [1 2 3 4 5]))
+(assert= '(1 :a "x" 2 :b "y") (interleave [1 2] [:a :b] ["x" "y"]))
+(assert= '(1 2 3) (interleave [1 2 3]))
+(assert= [[1 2] [3]] (into [] (partition-all 2) [1 2 3]))   ; xf arity intact
+(assert= "AB" (.toUpperCase "ab"))
+(assert= "ab" (.toLowerCase "AB"))
+(assert= 1/2 (rationalize 0.5))
+(assert= 1/10 (rationalize 0.1))
+(assert= -3/4 (rationalize -0.75))
+(assert= 3/200000 (rationalize 1.5E-5))
+(assert= 2 (rationalize 2))
+(assert= 1/3 (rationalize 1/3))
+; range element types follow start/step promotion, end only bounds (JVM parity)
+(assert= '(0 1 2) (range 2.5))
+(assert= '(0 1 2) (range 0 2.5))
+(assert= '(0 0.25 0.5 0.75) (range 0 1 0.25))
+(assert= '(0.5 1.5 2.5) (range 0.5 3))
+(assert= '(0 0.5 1.0 1.5) (range 0 2 0.5))
+(assert= 0 (first (range 0 2 0.5)))                  ; int start stays an int
+(assert= 0.5 (second (range 0 2 0.5)))
 (assert= 42 (int 42))
 (assert= [] *args*)                                  ; no args to the test run
 (assert= "abc" (str/join "" (map (fn [c] c) (seq "abc"))))
@@ -951,6 +972,77 @@
 (jit/defn jit-drem [^double a] (rem a 2))           ; rem/quot/mod stay integer-only
 (assert= :drem (try (jit/compile! 'jit-drem) (catch Exception e :drem)))
 ) ; end when-unix
+
+; ── vendor: deps.edn resolution against local fixtures (no network) ──
+(def cljc-test-vendor?
+  (and cljc-test-unix?
+       (zero? (:exit (sh "command -v git && command -v zip && command -v unzip && command -v curl")))))
+(when-not cljc-test-vendor? (println "SKIP: vendor deps.edn section (needs git/zip/unzip/curl)"))
+(when cljc-test-vendor?
+(require 'fs)
+; pure pom parsing: compile+runtime kept; test/optional/property-versioned/clojure skipped
+(assert= '[[g/a {:mvn/version "1"}] [g/r {:mvn/version "2"}]]
+         (vec (cljc/pom-parse-deps* (str "<project><dependencies>"
+              "<dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>t</artifactId><version>1</version><scope>test</scope></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>o</artifactId><version>1</version><optional>true</optional></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>p</artifactId><version>${v}</version></dependency>"
+              "<dependency><groupId>org.clojure</groupId><artifactId>clojure</artifactId><version>1.12.0</version></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>r</artifactId><version>2</version><scope>runtime</scope></dependency>"
+              "</dependencies></project>"))))
+(assert= nil (cljc/pom-parse-deps* "<project></project>"))
+; end-to-end in a subprocess (so ./vendor of this repo stays untouched):
+; file:// maven repo with a pom-transitive chain, a git dep carrying its own
+; deps.edn, and a :local/root dep
+(let [T (str (fs/temp-dir) "/cljc-vendor-selftest")
+      exe (str (cljc/exe-dir*) "/cljc")]
+  (sh (str "rm -rf " (pr-str T)))
+  (fs/create-dir (str T "/build/liba/liba"))
+  (spit (str T "/build/liba/liba/core.clj")
+        "(ns liba.core) (defn greet [n] (str \"hello \" n))")
+  (fs/create-dir (str T "/build/liba/META-INF/maven/com.example/liba"))
+  (spit (str T "/build/liba/META-INF/maven/com.example/liba/pom.xml")
+        "<project><groupId>com.example</groupId><artifactId>liba</artifactId><version>1.0.0</version></project>")
+  (fs/create-dir (str T "/build/libb/libb"))
+  (spit (str T "/build/libb/libb/core.clj")
+        "(ns libb.core (:require [liba.core :as a])) (defn shout [n] (str/upper-case (a/greet n)))")
+  (fs/create-dir (str T "/build/libb/META-INF/maven/com.example/libb"))
+  (spit (str T "/build/libb/META-INF/maven/com.example/libb/pom.xml")
+        (str "<project><groupId>com.example</groupId><artifactId>libb</artifactId><version>2.0.0</version>"
+             "<dependencies><dependency><groupId>com.example</groupId><artifactId>liba</artifactId><version>1.0.0</version></dependency>"
+             "<dependency><groupId>org.clojure</groupId><artifactId>clojure</artifactId><version>1.12.0</version></dependency>"
+             "</dependencies></project>"))
+  (fs/create-dir (str T "/m2/com/example/liba/1.0.0"))
+  (fs/create-dir (str T "/m2/com/example/libb/2.0.0"))
+  (sh (str "cd " T "/build/liba && zip -qr " T "/m2/com/example/liba/1.0.0/liba-1.0.0.jar ."))
+  (sh (str "cd " T "/build/libb && zip -qr " T "/m2/com/example/libb/2.0.0/libb-2.0.0.jar ."))
+  (fs/create-dir (str T "/gitrepo/src/gitlib"))
+  (spit (str T "/gitrepo/src/gitlib/core.clj")
+        "(ns gitlib.core (:require [libb.core :as b])) (defn loud [n] (str (b/shout n) \"!\"))")
+  (spit (str T "/gitrepo/deps.edn") "{:deps {com.example/libb {:mvn/version \"2.0.0\"}}}")
+  (sh (str "cd " T "/gitrepo && git init -q && git add -A"
+           " && git -c user.email=t@t -c user.name=t commit -qm x"))
+  (let [sha (str/trim (:out (sh (str "cd " T "/gitrepo && git rev-parse HEAD"))))]
+    (fs/create-dir (str T "/localproj/src/localx"))
+    (spit (str T "/localproj/src/localx/core.clj") "(ns localx.core) (def answer 42)")
+    (fs/create-dir (str T "/proj"))
+    (spit (str T "/proj/deps.edn")
+          (str "{:deps {io.example/gitlib {:git/url \"" T "/gitrepo\" :git/sha \"" sha "\"}"
+               " local/x {:local/root \"../localproj\"}}}"))
+    (spit (str T "/proj/run.clj")
+          (str "(require 'fs) (require 'process)"
+               "(reset! cljc/vendor-repos* [[\"file://" T "/m2/\" \"local-m2\"]])"
+               "(cljc/vendor-deps! \"deps.edn\")"))
+    (let [r (sh (str "cd " T "/proj && " exe " run.clj"))]
+      (assert= 0 (:exit r))
+      (assert= true (str/includes? (:out r) "(require 'gitlib.core)   ; loads OK"))
+      (assert= true (str/includes? (:out r) "(require 'liba.core)   ; loads OK"))
+      (assert= true (str/includes? (:out r) "(require 'libb.core)   ; loads OK"))
+      (assert= true (str/includes? (:out r) "(require 'localx.core)   ; loads OK"))
+      (assert= true (fs/exists? (str T "/proj/vendor/liba/core.clj")))
+      (assert= true (fs/exists? (str T "/proj/vendor/gitlib/core.clj")))))
+  (sh (str "rm -rf " (pr-str T))))
+) ; end when cljc-test-vendor?
 
 ; ── library survey: upstream clojure.set via loading require ──
 (require '[clojure.set :refer [union intersection difference rename-keys map-invert project join select subset?]])

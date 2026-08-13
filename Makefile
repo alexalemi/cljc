@@ -22,7 +22,17 @@ test: cljc
 	@./cljc tests.clj > /dev/null
 	@CLJC_GC_STRESS=1 ./cljc tests.clj 2>&1 | grep -E 'FAIL|error' && exit 1 || true
 	@CLJC_GC_STRESS=1 ./cljc tests.clj > /dev/null
-	@echo "all tests pass (normal + GC stress)"
+	@$(MAKE) --no-print-directory conformance
+	@echo "all tests pass (normal + GC stress + conformance)"
+
+# Diff the conformance corpus against the checked-in JVM-Clojure golden file.
+# With babashka on PATH the golden is re-derived live instead.
+conformance: cljc
+	@./cljc fuzz/runner_cljc.clj fuzz/conformance.txt | diff - fuzz/conformance_expected.txt \
+	  && echo "conformance: $$(grep -cv '^;' fuzz/conformance.txt | cat) expressions, no divergences"
+	@command -v bb > /dev/null && \
+	  { bb -f fuzz/runner.clj -- fuzz/conformance.txt | diff - fuzz/conformance_expected.txt \
+	    && echo "conformance: golden verified against babashka"; } || true
 
 install: cljc
 	install -d $(DESTDIR)$(PREFIX)/bin

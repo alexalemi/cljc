@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **`cljc vendor` understands deps.edn**: `cljc vendor` with no argument (or
+  a deps.edn path) resolves the `:deps` map transitively without Java or
+  `~/.m2` — pinned `:mvn/version` jars from Clojars/Maven Central followed
+  through their poms (compile/runtime scope, property-versioned/optional/
+  `org.clojure/clojure` skipped, Java-only jars tolerated), `:git/url` +
+  `:git/sha`/`:git/tag` clones (URL inferred for `io.github.*`/`com.github.*`
+  names, `:deps/root` respected), `:local/root` copies; git/local deps
+  recurse into their own deps.edn. First coordinate wins; everything lands in
+  `./vendor/` and gets the usual try-each-namespace load report. Maven
+  mirrors (incl. `file://`) via the `cljc/vendor-repos*` atom.
+
+- **Conformance corpus**: `fuzz/conformance.txt` — 412 curated clojure.core
+  expressions whose printed value must match JVM Clojure exactly, diffed
+  against a golden file by `make conformance` (part of `make test`; verified
+  live against babashka when `bb` is on PATH). Already caught and fixed five
+  divergences: `(partition-all n step coll)`, 3-coll `interleave`,
+  `.toUpperCase`/`.toLowerCase`, `rationalize` (was identity; now derives
+  exact ratios from the shortest decimal repr), and `range` element types
+  (start/step promotion decides element type, a double end only bounds —
+  `(range 2.5)` is `(0 1 2)`, `(range 0 2 0.5)` starts with int `0`).
+
 - **JIT type hints + doubles**: the reader now keeps `^Tag` hints as
   `{:tag Tag}` metadata on symbols (read-time, like Clojure; still discarded
   on non-symbol forms), and `jit.clj` honors JVM-style `^long`/`^double`

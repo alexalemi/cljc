@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+- **`cljc bundle --library`**: build a script into a shared library
+  (`.so`/`.dylib`/`.dll`) with a C ABI instead of an executable —
+  `cljc_lib_init()` runs the embedded script, `cljc_lib_eval(src)` returns
+  `pr-str` of the last form (`NULL` on error, interpreter survives),
+  `cljc_lib_last_error()` reports; a matching `<out>.h` header is generated
+  for C/C++/Rust/Zig hosts (see `examples/libhost.c`). Also fixed the bundle
+  CLI guard that rejected every documented flag (`--static`, `--windows`,
+  `--cc=`…).
+
+- **`cljc vendor` understands deps.edn**: `cljc vendor` with no argument (or
+  a deps.edn path) resolves the `:deps` map transitively without Java or
+  `~/.m2` — pinned `:mvn/version` jars from Clojars/Maven Central followed
+  through their poms (compile/runtime scope, property-versioned/optional/
+  `org.clojure/clojure` skipped, Java-only jars tolerated), `:git/url` +
+  `:git/sha`/`:git/tag` clones (URL inferred for `io.github.*`/`com.github.*`
+  names, `:deps/root` respected), `:local/root` copies; git/local deps
+  recurse into their own deps.edn. First coordinate wins; everything lands in
+  `./vendor/` and gets the usual try-each-namespace load report. Maven
+  mirrors (incl. `file://`) via the `cljc/vendor-repos*` atom.
+
+- **Conformance corpus**: `fuzz/conformance.txt` — 412 curated clojure.core
+  expressions whose printed value must match JVM Clojure exactly, diffed
+  against a golden file by `make conformance` (part of `make test`; verified
+  live against babashka when `bb` is on PATH). Already caught and fixed five
+  divergences: `(partition-all n step coll)`, 3-coll `interleave`,
+  `.toUpperCase`/`.toLowerCase`, `rationalize` (was identity; now derives
+  exact ratios from the shortest decimal repr), and `range` element types
+  (start/step promotion decides element type, a double end only bounds —
+  `(range 2.5)` is `(0 1 2)`, `(range 0 2 0.5)` starts with int `0`).
+
+- **JIT type hints + doubles**: the reader now keeps `^Tag` hints as
+  `{:tag Tag}` metadata on symbols (read-time, like Clojure; still discarded
+  on non-symbol forms), and `jit.clj` honors JVM-style `^long`/`^double`
+  hints on params and the fn name — hinted functions compile to unboxed
+  `double`/`long long` machine ops, with the return type inferred from the
+  body when unhinted. Also new in the JIT subset: `/` (double division),
+  `Math/sqrt`, `(double x)`/`(long x)` casts, unary minus.
+
 ## v0.2.0 — 2026-07-07
 
 First tagged release. Everything below shipped since the version string was

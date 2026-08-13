@@ -74,13 +74,21 @@ the actual fix: `try (require 'clojure.set) first`. Stack overflows say
 cljc watch script.clj    # rerun on every save (fresh process each run)
 cljc vendor weavejester/medley                  # or a full git URL:
 cljc vendor https://github.com/clojure/data.json
+cljc vendor              # resolve ./deps.edn's :deps, transitively
 cljc doctor              # why isn't my require finding anything?
 ```
 
 `cljc vendor` resolves `group/artifact` against Clojars first (latest release
 jar, extracted with `unzip`/`bsdtar`), falling back to a GitHub shallow clone;
 sources land in `./vendor/` (already on the load path), then it *tries each
-namespace* and reports which load cleanly. Common JVM interop is shimmed —
+namespace* and reports which load cleanly. With no argument (or a deps.edn
+path) it reads `deps.edn` instead and resolves the whole `:deps` map,
+transitively: `:mvn/version` is fetched pinned from Clojars/Maven Central and
+followed through the jars' poms (compile/runtime scopes; `org.clojure/clojure`
+and Java-only jars are skipped gracefully), `:git/url` + `:git/sha`/`:git/tag`
+clones and checks out (`io.github.*`/`com.github.*` names infer the URL,
+`:deps/root` respected), `:local/root` copies — and git/local deps recurse
+into their own `deps.edn`. No Java, no `~/.m2`, first coordinate wins. Common JVM interop is shimmed —
 `java.time.Instant`/`DateTimeFormatter` (epoch-backed, real ISO-8601),
 `java.util.UUID` (real v4 `random-uuid`), boxed-number methods, class keys for
 `(extend Cls …)` — enough that e.g. `clojure.data.json` vendors and round-trips
@@ -161,10 +169,21 @@ set).
 (fib 32)               ; 1.24 s interpreted → 6 ms native (faster than bb/JVM)
 ```
 
-`jit.clj` (~180 lines of cljc) compiles a numeric subset — `if`, `let`,
-`loop`/`recur`, self-recursion, integer arithmetic/comparisons — to unboxed
-`long long` C through the same generate→`cc`→`dlopen`→rebind pipeline as the
-FFI. Compiled modules are content-cached, so warm compiles are a `dlopen`.
+`jit.clj` (~250 lines of cljc) compiles a numeric subset — `if`, `let`,
+`loop`/`recur`, self-recursion, arithmetic/comparisons, `Math/sqrt`, casts —
+to unboxed C through the same generate→`cc`→`dlopen`→rebind pipeline as the
+FFI. Types default to `long long`; JVM-style `^long`/`^double` hints on
+params (and optionally the fn name, for the return type — otherwise it's
+inferred from the body) pick unboxed `double`, and types flow through
+arithmetic like C promotion:
+
+```clojure
+(jit/defn ^double dist [^double x ^double y]
+  (Math/sqrt (+ (* x x) (* y y))))
+(jit/compile! 'dist)   ; unboxed double machine ops throughout
+```
+
+Compiled modules are content-cached, so warm compiles are a `dlopen`.
 Outside the subset, `jit/compile!` errors cleanly and the interpreted
 version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
 630 ms — it's real machine code.
@@ -212,6 +231,22 @@ machine. Flags steer the compiler:
 compiler directly for any other cross toolchain, e.g. `zig cc`. On Windows the
 interactive REPL drops to plain line input and the nREPL server is unavailable —
 script execution and bundles are unaffected.
+
+**Shared libraries.** `--library` builds the inverse embedding direction: your
+script as a `.so`/`.dylib`/`.dll` with a C ABI, callable from C, C++, Rust,
+Zig — anything that can link C:
+
+```sh
+cljc bundle --library greet.clj libgreet.so   # + generated libgreet.so.h
+cc -O2 examples/libhost.c ./libgreet.so -o libhost
+```
+
+The library exports `cljc_lib_init()` (runs the embedded script, idempotent),
+`cljc_lib_eval(src)` (returns `pr-str` of the last form, or `NULL` on error —
+the interpreter survives and keeps state), and `cljc_lib_last_error()`.
+Returned strings stay valid until the next call; the usual embedding rules
+apply (one interpreter per process, single-threaded). See
+`examples/libhost.c`.
 
 ## Running real libraries
 

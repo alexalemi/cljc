@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`cljc bundle --library`**: build a script into a shared library
+  (`.so`/`.dylib`/`.dll`) with a C ABI instead of an executable —
+  `cljc_lib_init()` runs the embedded script, `cljc_lib_eval(src)` returns
+  `pr-str` of the last form (`NULL` on error, interpreter survives),
+  `cljc_lib_last_error()` reports; a matching `<out>.h` header is generated
+  for C/C++/Rust/Zig hosts (see `examples/libhost.c`). Also fixed the bundle
+  CLI guard that rejected every documented flag (`--static`, `--windows`,
+  `--cc=`…).
+
 - **`cljc vendor` understands deps.edn**: `cljc vendor` with no argument (or
   a deps.edn path) resolves the `:deps` map transitively without Java or
   `~/.m2` — pinned `:mvn/version` jars from Clojars/Maven Central followed

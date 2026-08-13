@@ -1044,6 +1044,43 @@
   (sh (str "rm -rf " (pr-str T))))
 ) ; end when cljc-test-vendor?
 
+; ── bundle --library: C-ABI shared library round-trip ──
+; Compiles all of cljc.c once (-O0 keeps it quick); unix-only, needs cc and
+; the cljc.c source in cwd. CLJC_GC_STRESS is cleared for the subprocesses:
+; the generated C is a megabyte-scale string and stress-GC'ing its assembly
+; tests nothing this section is about.
+(when (and cljc-test-unix? (cljc/slurp-maybe "cljc.c"))
+(require 'fs)
+(let [T (str (fs/temp-dir) "/cljc-libtest")
+      exe (str (cljc/exe-dir*) "/cljc")]
+  (sh (str "rm -rf " (pr-str T)))
+  (fs/create-dir T)
+  (spit (str T "/greet.clj") "(defn greet [n] (str \"hello, \" n \"!\"))")
+  (spit (str T "/host.c")
+        (str "#include <stdio.h>\n"
+             "int cljc_lib_init(void);\n"
+             "const char *cljc_lib_eval(const char *src);\n"
+             "const char *cljc_lib_last_error(void);\n"
+             "int main(void) {\n"
+             "  if (cljc_lib_init() != 0) return 1;\n"
+             "  printf(\"%s\\n\", cljc_lib_eval(\"(greet \\\"lib\\\")\"));\n"
+             "  const char *bad = cljc_lib_eval(\"(nope)\");\n"
+             "  printf(\"%s\\n\", bad ? \"BAD\" : \"got-error\");\n"
+             "  printf(\"%s\\n\", cljc_lib_eval(\"(+ 1 2)\"));\n"
+             "  return 0;\n}\n"))
+  (let [rb (sh (str "env -u CLJC_GC_STRESS " exe " bundle --library --cflags=-O0 "
+                    T "/greet.clj " T "/libgreet.so"))]
+    (assert= 0 (:exit rb))
+    (assert= true (fs/exists? (str T "/libgreet.so.h")))
+    (let [rc (sh (str "cd " T " && cc -O0 host.c ./libgreet.so -o host 2>&1"))]
+      (assert= 0 (:exit rc))
+      ; subshell: cljc's sh appends 2>&1, which would override a bare
+      ; 2>/dev/null and pull the expected eval-error print into :out
+      (let [r (sh (str "(cd " T " && LD_LIBRARY_PATH=. ./host 2>/dev/null)"))]
+        (assert= 0 (:exit r))
+        (assert= "\"hello, lib!\"\ngot-error\n3\n" (:out r)))))
+  (sh (str "rm -rf " (pr-str T)))))
+
 ; ── library survey: upstream clojure.set via loading require ──
 (require '[clojure.set :refer [union intersection difference rename-keys map-invert project join select subset?]])
 (assert= #{1 2 3} (union #{1 2} #{2 3}))

@@ -1424,6 +1424,24 @@
 (assert= 0 (:exit (sh "./cljc /tmp/cljc-judge-e2e.clj")))
 (sh "rm -f /tmp/cljc-judge-e2e.clj /tmp/cljc-judge-e2e.clj.tested")
 
+; bundle e2e: flags reach bundle.clj (the C gate used to reject anything but
+; exactly 2 args), a script's -main is auto-called with argv, its int return
+; is the exit status, and -m <ns> bundles a namespace + its transitive
+; requires from *load-path*. --cflags=-O0 keeps the cc step fast AND
+; regression-tests the flag path itself.
+(sh "rm -rf /tmp/cljc-bundle-e2e && mkdir -p /tmp/cljc-bundle-e2e/src")
+(spit "/tmp/cljc-bundle-e2e/app.clj"
+      "(defn -main [& args]\n  (println \"got\" (count args))\n  (if (= (first args) \"fail\") 3 0))\n")
+(assert= 0 (:exit (sh "./cljc bundle --cflags=-O0 /tmp/cljc-bundle-e2e/app.clj /tmp/cljc-bundle-e2e/app")))
+(assert= "got 2\n" (:out (sh "/tmp/cljc-bundle-e2e/app a b")))
+(assert= 3 (:exit (sh "/tmp/cljc-bundle-e2e/app fail")))
+(spit "/tmp/cljc-bundle-e2e/src/bndl_lib.clj" "(ns bndl-lib)\n(defn shout [s] (clojure.string/upper-case s))\n")
+(spit "/tmp/cljc-bundle-e2e/src/bndl_app.clj"
+      "(ns bndl-app (:require [bndl-lib] [clojure.string :as str]))\n(defn -main [& args]\n  (println (bndl-lib/shout (str/join \"-\" args)))\n  0)\n")
+(assert= 0 (:exit (sh "CLJC_PATH=/tmp/cljc-bundle-e2e/src ./cljc bundle -m bndl-app --cflags=-O0 /tmp/cljc-bundle-e2e/bapp")))
+(assert= "X-Y\n" (:out (sh "/tmp/cljc-bundle-e2e/bapp x y")))   ; runs w/o CLJC_PATH: deps embedded
+(sh "rm -rf /tmp/cljc-bundle-e2e")
+
 ; project config: :paths from deps.edn/bb.edn feed *load-path*
 (spit "/tmp/cljc-deps-test.edn" "{:paths [\"a\" \"b\"] :deps {x {:mvn/version \"1\"}}}")
 (assert= ["a" "b"] (cljc/edn-paths "/tmp/cljc-deps-test.edn"))
@@ -1527,6 +1545,25 @@
 (assert= :threw (try (do ((fn [] (cond :x)))) (catch Exception e :threw)))  ; odd cond errors
 
 ; ── coroutines (the C primitive) + csp.clj (core.async) ──
+; ── STM basics (no fibers needed): tx isolation, ops, guards ──
+(def cljc-stm-r1 (ref 100)) (def cljc-stm-r2 (ref 0))
+(assert= 30 (dosync (alter cljc-stm-r1 - 30) (alter cljc-stm-r2 + 30)))
+(assert= [70 30] [@cljc-stm-r1 @cljc-stm-r2])
+(assert= 7 (dosync (ref-set cljc-stm-r2 7)))          ; ref-set returns the value
+(assert= 2 (let [c (ref 0)] (dosync (commute c inc) (commute c inc))))
+(assert= :threw (try (alter cljc-stm-r1 inc) (catch Exception e :threw)))  ; no tx
+(assert= :threw (try (ref-set cljc-stm-r1 0) (catch Exception e :threw)))
+(assert= :threw (try (dosync (io! :x)) (catch Exception e :threw)))  ; io! in tx
+(assert= :ok (io! :ok))
+(assert= 42 (sync nil 42))
+(assert= 2 (let [n (ref 0)] (dosync (alter n inc) (dosync (alter n inc))) @n))  ; nested joins
+; in-tx reads see in-tx writes; watches fire at commit with old and new
+(assert= [5 6] (let [r (ref 5) saw (atom nil)]
+                 (add-watch r :w (fn [k rf o n] (reset! saw [o n])))
+                 (dosync (ref-set r 6) (ensure r))
+                 @saw))
+(assert= 6 (let [r (ref 5)] (dosync (alter r inc) @r)))   ; deref inside tx = tx value
+
 (when cljc-test-coro?  ; coro through futures: all need the ucontext engine
 (def cljc-coro-g (coro/new (fn [] (coro/yield 1) (coro/yield 2) :done)))
 (assert= :new (coro/status cljc-coro-g))
@@ -1692,6 +1729,66 @@
                (cljc-a/>! in m)) (cljc-a/close! in))
   (assert= [1 3] (mapv :n (cljc-a/<!! (cljc-a/into [] ca))))
   (assert= [2]   (mapv :n (cljc-a/<!! (cljc-a/into [] da)))))
+; ── agents (Tier 3.6): serial actions on a drain fiber, error modes, watches ──
+(def cljc-ag (agent 0))
+(send cljc-ag inc) (send cljc-ag inc) (send cljc-ag + 5)
+(assert= nil (await cljc-ag))
+(assert= 7 @cljc-ag)
+(assert= true (await-for 1000 cljc-ag))
+; :fail mode (default): deref keeps last value, send throws, restart reruns held queue
+(def cljc-agf (agent 10))
+(send cljc-agf (fn [_] (throw (ex-info "boom" {}))))
+(send cljc-agf inc)                       ; queued behind the failure -> held
+(Thread/sleep 5)
+(assert= true (some? (agent-error cljc-agf)))
+(assert= 10 @cljc-agf)
+(assert= :threw (try (send cljc-agf inc) :sent (catch Exception e :threw)))
+(restart-agent cljc-agf 99)
+(await cljc-agf)
+(assert= 100 @cljc-agf)                   ; the held inc ran after restart
+(assert= nil (agent-error cljc-agf))
+; :continue via error-handler: errors reported, queue keeps going
+(def cljc-ag-errs (atom 0))
+(def cljc-agc (agent 0 :error-handler (fn [a e] (swap! cljc-ag-errs inc))))
+(send cljc-agc (fn [_] (throw (ex-info "x" {})))) (send cljc-agc + 3)
+(await cljc-agc)
+(assert= [3 1 :continue] [@cljc-agc @cljc-ag-errs (error-mode cljc-agc)])
+; watches are real on agents (fire per action, like ARef.notifyWatches)
+(def cljc-ag-log (atom []))
+(def cljc-agw (agent 1))
+(add-watch cljc-agw :w (fn [k r o n] (swap! cljc-ag-log conj [o n])))
+(send cljc-agw inc) (await cljc-agw)
+(assert= [1 2] (first @cljc-ag-log))
+; ── STM refs: real conflict detection across fiber yields ──
+; a tx that parks mid-body while the main thread commits under it RETRIES
+(def cljc-r (ref 0))
+(def cljc-tx-tries (atom 0))
+(def cljc-tx-f (future (dosync (swap! cljc-tx-tries inc)
+                               (let [v (alter cljc-r inc)] (Thread/sleep 20) v))))
+(Thread/sleep 5)
+(dosync (alter cljc-r + 100))             ; commit under the parked tx
+(assert= 101 @cljc-tx-f)                  ; retried: re-read 100, inc
+(assert= 101 @cljc-r)
+(assert= 2 @cljc-tx-tries)
+; ensure participates in conflict detection (read-only retry)
+(def cljc-er (ref 1))
+(def cljc-er-f (future (dosync (let [v (ensure cljc-er)] (Thread/sleep 20) v))))
+(Thread/sleep 5)
+(dosync (ref-set cljc-er 2))
+(assert= 2 @cljc-er-f)
+; commute never conflicts: re-applied on the latest value at commit
+(def cljc-cr (ref 0))
+(def cljc-cr-tries (atom 0))
+(def cljc-cr-f (future (dosync (swap! cljc-cr-tries inc)
+                               (commute cljc-cr inc) (Thread/sleep 20) :done)))
+(Thread/sleep 5)
+(dosync (alter cljc-cr + 100))
+(assert= [:done 101 1] [@cljc-cr-f @cljc-cr @cljc-cr-tries])
+; sends inside a transaction are held until commit
+(def cljc-ag-tx (agent 0))
+(dosync (send cljc-ag-tx + 10) (send cljc-ag-tx + 1))
+(await cljc-ag-tx)
+(assert= 11 @cljc-ag-tx)
 ; http.clj: a routed server + the client, full round-trip through the event loop
 (require '[http :as cljc-h])
 (cljc-h/serve 8093

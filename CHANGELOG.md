@@ -2,7 +2,37 @@
 
 ## Unreleased
 
+### Added
+- **Agents**: `agent`/`send`/`send-off`/`send-via`, `await`/`await-for`,
+  `agent-error`/`restart-agent` (`:clear-actions`; a failed agent holds its
+  queue), error modes (`:fail` default, `:continue` with `:error-handler`),
+  `release-pending-sends`, `shutdown-agents`. Actions run serially per agent
+  on a drain fiber (needs coroutines at runtime, like `future`).
+- **STM**: real `ref`/`dosync`/`alter`/`ref-set`/`commute`/`ensure` replacing
+  the atom-backed shims — MVCC-lite with per-ref versions: commit verifies
+  written and `ensure`d refs and retries the body on conflict (possible when
+  a transaction yields — sleep/deref/io — while another fiber commits);
+  `commute` re-applies on the latest value without conflicting; sends inside
+  a transaction are held until commit; `io!` throws inside a transaction;
+  nested `dosync` joins the outer transaction. `alter`/`ref-set`/`commute`/
+  `ensure` outside `dosync` now throw (they used to silently mutate).
+  The current transaction is fiber-local (keyed by the fiber, not a dynamic
+  var — a `binding` would leak across yields to other fibers).
+- **Watches**: `add-watch`/`remove-watch` are real on agents and refs
+  (fired per action / at commit); still no-ops on atoms.
+- `cljc bundle` entrypoint parity with `jolt build -m` / `bb -m`: the bundled
+  binary now calls the script's `-main` with the command-line args when one
+  is defined (top-level forms still run first; scripts without `-main` are
+  unchanged), and an integer return from `-main` becomes the exit status.
+  New `cljc bundle -m <ns> <out>` bundles a namespace from `*load-path*`
+  (plus its transitive requires) and entrypoints its `-main`. `cljc -m` now
+  honors the integer-exit rule too.
+
 ### Fixed
+- `cljc bundle` rejected every flag `bundle.clj` documents (`--static`,
+  `--windows`, `--cc=`, `--libs=`, `--cflags=`) — the C dispatcher demanded
+  exactly two arguments, so cross-compilation was unreachable from the CLI;
+  a bundled script that threw still exited 0 (now 1)
 - **Memory safety**: int-array bounds checks truncated 64-bit indices to 32
   bits (`(aget a 4294967296)` read/wrote out of bounds — segfault or heap
   corruption); printing bigints over ~280 digits overflowed a heap buffer

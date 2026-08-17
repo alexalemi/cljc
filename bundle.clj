@@ -1,6 +1,10 @@
 ;; bundle.clj — build a self-contained native binary from a cljc script.
 ;;
 ;; Usage: cljc bundle [flags] <script.clj> <output>
+;;        cljc bundle -m <namespace> [flags] <output>
+;;   -m <namespace>    bundle a namespace from *load-path* instead of a script;
+;;                     the binary requires it and calls its -main with argv
+;;                     (like `jolt build -m` / `bb -m`)
 ;;   --static          link statically (no glibc dependency; best for sharing)
 ;;   --windows         cross-compile a Windows .exe via mingw-w64
 ;;                     (shorthand for --cc=x86_64-w64-mingw32-gcc --libs="-lm -lws2_32")
@@ -10,7 +14,11 @@
 ;;
 ;; Embeds the script bytes — plus every .clj it transitively require's or
 ;; load-file's (batteries, vendored libs) — next to the full runtime: one
-;; executable, zero dependencies, the same ~2ms startup. Embedded files are
+;; executable, zero dependencies, the same ~2ms startup. After the top-level
+;; forms run, the binary calls -main (script's own, or <ns>/-main with -m)
+;; with the command-line args; an integer return becomes the exit status,
+;; matching `cljc -m`. A script with no -main just runs top-to-bottom as
+;; before. Embedded files are
 ;; resolved by slurp/require/load-file at runtime, so a script that uses
 ;; clojure.test, clojure.set, csp, etc. runs standalone anywhere. (Bundling,
 ;; not compilation — the script still runs on the interpreter inside.)
@@ -31,6 +39,7 @@
          pos   []]
     (if-let [a (first args)]
       (cond
+        (= a "-m")                     (recur (rest (rest args)) (assoc flags :main (second args)) pos)
         (= a "--static")               (recur (rest args) (assoc flags :static true) pos)
         (= a "--windows")              (recur (rest args) (assoc flags :windows true) pos)
         (str/starts-with? a "--cc=")     (recur (rest args) (assoc flags :cc (subs a 5)) pos)
@@ -99,21 +108,39 @@
               (when-let [[nm c] (find-file (second form))] (add-dep! nm c)))))))))
 
 (let [[flags pos] (parse-args *args*)
-      [script-path out-path] pos]
-  (when-not (and script-path out-path)
-    (throw (ex-info "usage: cljc bundle [--static] [--cc=CC] [--libs=...] [--cflags=...] <script.clj> <output>" {})))
+      main-ns    (:main flags)
+      ;; -m mode: the only positional is the output; the "script" is a
+      ;; synthesized require, and the ns file itself rides as a dependency.
+      [script-path out-path] (if main-ns [nil (first pos)] pos)]
+  (when-not (if main-ns out-path (and script-path out-path))
+    (throw (ex-info "usage: cljc bundle [-m <ns>] [--static] [--cc=CC] [--libs=...] [--cflags=...] [<script.clj>] <output>" {})))
   (let [srcdir (cond
                  (cljc/slurp-maybe "cljc.c") "."
                  (cljc/slurp-maybe (str (cljc/sharedir*) "/cljc.c")) (cljc/sharedir*)
                  :else (throw (ex-info "bundle: cljc.c not found (looked in . and the share dir)" {})))
-        code   (slurp script-path)
-        _      (walk-source code)        ; collect transitive .clj dependencies
+        code   (if main-ns
+                 (let [[nm c] (or (find-on-path (ns->rel main-ns))
+                                  (throw (ex-info (str "bundle: namespace " main-ns
+                                                       " not found on *load-path*") {})))]
+                   (add-dep! nm c)       ; embeds the ns + its transitive deps
+                   (str "(require '[" main-ns "])"))
+                 (slurp script-path))
+        _      (when-not main-ns (walk-source code))  ; collect transitive .clj dependencies
         dep-list (vec @deps)             ; [[name content] ...]
         cfile  (str out-path ".gen.c")
         cc     (or (:cc flags) (cljc/env* "CLJC_CC") (if (:windows flags) "x86_64-w64-mingw32-gcc" "cc"))
         libs   (or (:libs flags) (if (:windows flags) "-lm -lws2_32" "-lm -ldl"))
         static (if (:static flags) " -static" "")
-        extra  (if (:cflags flags) (str " " (:cflags flags)) "")]
+        extra  (if (:cflags flags) (str " " (:cflags flags)) "")
+        ;; Entrypoint glue, evaluated after the top-level forms. -m demands a
+        ;; -main (missing one is an error); a plain script gets auto-detect —
+        ;; call -main if defining one, otherwise stay a pure top-level script.
+        entry  (if main-ns
+                 (str "(let [m (or (cljc/resolve-maybe \"" main-ns "/-main\")"
+                      "            (cljc/resolve-maybe \"-main\"))]"
+                      "  (if m (apply m *args*)"
+                      "    (throw (ex-info \"no -main found in " main-ns "\" {}))))")
+                 "(when-let [m (cljc/resolve-maybe \"-main\")] (apply m *args*))")]
     (when (seq dep-list)
       (println (str "  embedding " (count dep-list) " dependency file(s): "
                     (str/join " " (map first dep-list)))))
@@ -136,6 +163,10 @@
                             (str "    {\"" name "\", (const char *)dep" i "},\n"))
                           dep-list))
            "    {0,0}\n};\n"           ; sentinel keeps the array non-empty in C
+           ;; entrypoint glue as bytes too — sidesteps C string escaping
+           "static const unsigned char entry[] = {"
+           (str/join "," (cljc/str-bytes* entry))
+           ",0};\n"
            "int main(int argc, char **argv) {\n"
            "    cljc_set_stack_base(&argc);\n"
            "    CljcEnv *env = cljc_new_env();\n"
@@ -145,7 +176,11 @@
            "        as = vec_conj1(as, mk_str(argv[i], strlen(argv[i])));\n"
            "    env_define_root(env, intern(\"*args*\", 6), as);\n"
            "    cljc_eval_string(env, (const char *)script);\n"
-           "    return 0;\n"
+           "    if (cljc_eval_errored) return 1;\n"
+           ;; -main's integer return is the exit status, same rule as `cljc -m`
+           "    Cljc *r = cljc_eval_string(env, (const char *)entry);\n"
+           "    if (cljc_eval_errored) return 1;\n"
+           "    return (r && r->tag == CLJC_INT) ? (int)r->as.i : 0;\n"
            "}\n"))
     (let [cmd (str cc " -O2" static extra " -I" srcdir " -o " out-path " " cfile " " libs " 2>&1")
           r   (sh cmd)]

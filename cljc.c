@@ -13522,6 +13522,219 @@ CljcEnv *cljc_new_env(void) {
         "      (fiber/timer! deadline (fn [] nil))\n"
         "      (loop [] (when (< (cljc/now-ms*) deadline) (fiber/pump!) (recur)))))\n"
         "  nil)\n");
+    /* Tier 3.6: agents + STM refs (shadow the PRELUDE's degenerate shims).
+     * Agents: a deftype over a state atom {:val :queue :running :error ...};
+     * send enqueues, a drain FIBER runs actions serially per agent (so agents
+     * need coroutines at runtime; on coro-less builds send fails like future).
+     * STM: real MVCC-lite. A ref carries {:val :version}; a transaction keeps
+     * in-tx values + the version of each ref at first touch, and commit
+     * verifies WRITTEN and ENSURED refs are unchanged, retrying the body
+     * otherwise (plain reads don't conflict — snapshot-ish, like Clojure,
+     * write skew and all; that's what `ensure` is for). On a cooperative
+     * scheduler a conflict requires the body to yield (sleep/deref/io) while
+     * another fiber commits — rare, but the retry makes it correct.
+     * Clojure fidelity kept: sends inside a transaction are held until commit
+     * (a retried body re-sends nothing); commutes re-apply on the latest
+     * committed value with no conflict. Divergences: no validators; sends
+     * inside agent ACTIONS dispatch immediately (Clojure holds them); watches
+     * are real on agents/refs but remain no-ops on atoms (swap! is a C
+     * native that predates any watch registry). */
+    cljc_eval_string(e,
+        /* The current STM transaction must be FIBER-local, not a dynamic var:
+         * `binding` is a global stack, so a tx body that yields (sleep, deref,
+         * io) would leak its binding to whichever context runs next — the main
+         * thread's dosync would silently JOIN the parked fiber's transaction
+         * (found by the retry test). The fiber *self* var is rebound around
+         * every resume (item 46), so a map keyed by it (nil = main thread) is
+         * correct across yields; coros hash by identity. */
+        "(def cljc/txs (atom {}))\n"
+        "(defn cljc/tx [] (get (deref cljc/txs) fiber/*self*))\n"
+        "(defn cljc/tx-deref [r]\n"            /* first touch records the version */
+        "  (let [tx (cljc/tx) id (:id r)]\n"
+        "    (if (contains? (deref (:vals tx)) id)\n"
+        "      (get (deref (:vals tx)) id)\n"
+        "      (let [s (deref (:state r))]\n"
+        "        (swap! (:readv tx) assoc id (:version s))\n"
+        "        (swap! (:vals tx) assoc id (:val s))\n"
+        "        (:val s)))))\n"
+        "(defn cljc/fire-watches! [r old new]\n"
+        "  (doseq [kv (:watches (deref (:state r)))] ((second kv) (first kv) r old new)))\n"
+        "(defn add-watch [r k f]\n"           /* shadows the PRELUDE no-op */
+        "  (when (and (map? r) (#{:CljcAgent :CljcRef} (:cljc/type r)))\n"
+        "    (swap! (:state r) update :watches assoc k f))\n"
+        "  r)\n"
+        "(defn remove-watch [r k]\n"
+        "  (when (and (map? r) (#{:CljcAgent :CljcRef} (:cljc/type r)))\n"
+        "    (swap! (:state r) update :watches dissoc k))\n"
+        "  r)\n"
+        /* ── agents ── */
+        "(deftype CljcAgent [state]\n"
+        "  clojure.lang.IDeref\n"
+        "  (deref [_] (:val (deref state))))\n"
+        "(defn agent [v & opts]\n"
+        "  (let [o (apply hash-map opts)\n"
+        "        handler (:error-handler o)\n"
+        /* Clojure's default: a supplied handler implies :continue */
+        "        mode (or (:error-mode o) (if handler :continue :fail))]\n"
+        "    (CljcAgent. (atom {:val v :queue [] :running false :error nil\n"
+        "                       :error-mode mode :error-handler handler :watches {}}))))\n"
+        "(defn cljc/agent-drain! [a]\n"        /* runs as a fiber; serial per agent */
+        "  (let [st (:state a)]\n"
+        "    (loop []\n"
+        "      (if-let [action (first (:queue (deref st)))]\n"
+        "        (do (swap! st update :queue subvec 1)\n"
+        "            (if (try\n"
+        "                  (let [old (:val (deref st))\n"
+        "                        nv (apply (first action) old (second action))]\n"
+        "                    (swap! st assoc :val nv)\n"
+        "                    (cljc/fire-watches! a old nv)\n"
+        "                    true)\n"
+        "                  (catch Exception e\n"
+        "                    (let [m (deref st)]\n"
+        "                      (if (= :continue (:error-mode m))\n"
+        "                        (do (when-let [h (:error-handler m)]\n"
+        "                              (try (h a e) (catch Exception _ nil)))\n"
+        "                            true)\n"
+        /* :fail — store the error, keep the remaining queue HELD */
+        "                        (do (swap! st assoc :error e) false)))))\n"
+        "              (recur)\n"
+        "              (swap! st assoc :running false)))\n"
+        "        (swap! st assoc :running false)))))\n"
+        "(defn cljc/agent-enqueue! [a f args]\n"
+        "  (let [st (:state a)]\n"
+        "    (swap! st update :queue conj [f args])\n"
+        "    (when-not (or (:running (deref st)) (:error (deref st)))\n"
+        "      (swap! st assoc :running true)\n"
+        "      (fiber/spawn! (fn [] (cljc/agent-drain! a))))\n"
+        "    a))\n"
+        "(defn send [a f & args]\n"
+        "  (when-let [e (:error (deref (:state a)))] (throw e))\n"
+        "  (if (cljc/tx)\n"                    /* in-tx sends held until commit */
+        "    (do (swap! (:sends (cljc/tx)) conj [a f args]) a)\n"
+        "    (cljc/agent-enqueue! a f args)))\n"
+        "(def send-off send)\n"                /* no blocking-vs-cpu pools here */
+        "(defn send-via [_ a f & args] (apply send a f args))\n"
+        "(defn agent-error [a] (:error (deref (:state a))))\n"
+        "(defn agent-errors [a] (when-let [e (agent-error a)] (list e)))\n"
+        "(defn restart-agent [a v & opts]\n"
+        "  (let [st (:state a) o (apply hash-map opts)]\n"
+        "    (when-not (:error (deref st))\n"
+        "      (throw (ex-info \"restart-agent: agent does not need a restart\" {})))\n"
+        "    (swap! st assoc :val v :error nil)\n"
+        "    (when (:clear-actions o) (swap! st assoc :queue []))\n"
+        "    (when (and (seq (:queue (deref st))) (not (:running (deref st))))\n"
+        "      (swap! st assoc :running true)\n"
+        "      (fiber/spawn! (fn [] (cljc/agent-drain! a))))\n"
+        "    v))\n"
+        "(defn clear-agent-errors [a] (restart-agent a (:val (deref (:state a)))))\n"
+        "(defn set-error-handler! [a h] (swap! (:state a) assoc :error-handler h) nil)\n"
+        "(defn error-handler [a] (:error-handler (deref (:state a))))\n"
+        "(defn set-error-mode! [a m] (swap! (:state a) assoc :error-mode m) nil)\n"
+        "(defn error-mode [a] (:error-mode (deref (:state a))))\n"
+        /* await: piggyback a marker action per agent; its promise delivers
+           when everything enqueued before it has run. deref drives the pump. */
+        "(defn cljc/await-marker! [a]\n"
+        "  (when-let [e (agent-error a)] (throw e))\n"
+        "  (let [p (promise)]\n"
+        "    (cljc/agent-enqueue! a (fn [v] (deliver p true) v) [])\n"
+        "    p))\n"
+        "(defn await [& agents]\n"
+        "  (doseq [p (mapv cljc/await-marker! agents)] (deref p))\n"
+        "  nil)\n"
+        "(defn await-for [ms & agents]\n"
+        "  (let [deadline (+ (cljc/now-ms*) ms)]\n"
+        "    (loop [ps (seq (mapv cljc/await-marker! agents))]\n"
+        "      (if ps\n"
+        "        (if (= :cljc/tmo (deref (first ps)\n"
+        "                                (max 0 (- deadline (cljc/now-ms*)))\n"
+        "                                :cljc/tmo))\n"
+        "          false\n"
+        "          (recur (next ps)))\n"
+        "        true))))\n"
+        "(defn release-pending-sends []\n"
+        "  (if (cljc/tx)\n"
+        "    (let [sends (deref (:sends (cljc/tx)))]\n"
+        "      (reset! (:sends (cljc/tx)) [])\n"
+        "      (doseq [s sends] (cljc/agent-enqueue! (nth s 0) (nth s 1) (nth s 2)))\n"
+        "      (count sends))\n"
+        "    0))\n"
+        "(defn shutdown-agents [] nil)\n"      /* cooperative: nothing to stop */
+        /* ── STM refs ── */
+        "(def cljc/ref-counter (atom 0))\n"
+        "(deftype CljcRef [id state]\n"
+        "  clojure.lang.IDeref\n"
+        "  (deref [this] (if (cljc/tx) (cljc/tx-deref this) (:val (deref state)))))\n"
+        "(defn ref [v & _] (CljcRef. (swap! cljc/ref-counter inc) (atom {:val v :version 0 :watches {}})))\n"
+        "(defn cljc/tx-check! [op]\n"
+        "  (when-not (cljc/tx)\n"
+        "    (throw (ex-info (str op \": no transaction running (use dosync)\") {}))))\n"
+        "(defn ref-set [r v]\n"
+        "  (cljc/tx-check! \"ref-set\")\n"
+        "  (let [tx (cljc/tx) id (:id r)]\n"
+        "    (when-not (contains? (deref (:readv tx)) id)\n"
+        "      (swap! (:readv tx) assoc id (:version (deref (:state r)))))\n"
+        "    (swap! (:vals tx) assoc id v)\n"
+        "    (swap! (:writes tx) conj id)\n"
+        "    (swap! (:refs tx) assoc id r)\n"
+        "    v))\n"
+        "(defn alter [r f & args] (ref-set r (apply f (do (cljc/tx-check! \"alter\") (cljc/tx-deref r)) args)))\n"
+        "(defn commute [r f & args]\n"         /* re-applied on latest at commit; never conflicts */
+        "  (cljc/tx-check! \"commute\")\n"
+        "  (let [tx (cljc/tx) id (:id r)\n"
+        "        nv (apply f (cljc/tx-deref r) args)]\n"
+        "    (swap! (:vals tx) assoc id nv)\n"  /* tentative, for in-tx reads */
+        "    (swap! (:refs tx) assoc id r)\n"
+        "    (swap! (:commutes tx) conj [id f args])\n"
+        "    nv))\n"
+        "(defn ensure [r]\n"                   /* read that participates in conflict detection */
+        "  (cljc/tx-check! \"ensure\")\n"
+        "  (let [v (cljc/tx-deref r)]\n"
+        "    (swap! (:ensures (cljc/tx)) conj (:id r))\n"
+        "    (swap! (:refs (cljc/tx)) assoc (:id r) r)\n"
+        "    v))\n"
+        "(defn cljc/tx-commit! [tx]\n"
+        "  (let [ids (into (deref (:writes tx)) (deref (:ensures tx)))]\n"
+        "    (if (some (fn [id] (not= (get (deref (:readv tx)) id)\n"
+        "                             (:version (deref (:state (get (deref (:refs tx)) id))))))\n"
+        "              ids)\n"
+        "      false\n"                        /* conflict: caller retries the body */
+        "      (do\n"
+        "        (doseq [id (deref (:writes tx))]\n"
+        "          (let [r (get (deref (:refs tx)) id) st (:state r)\n"
+        "                old (:val (deref st)) nv (get (deref (:vals tx)) id)]\n"
+        "            (swap! st assoc :val nv :version (inc (:version (deref st))))\n"
+        "            (cljc/fire-watches! r old nv)))\n"
+        "        (doseq [c (deref (:commutes tx))]\n"
+        "          (let [r (get (deref (:refs tx)) (nth c 0)) st (:state r)\n"
+        "                old (:val (deref st))\n"
+        "                nv (apply (nth c 1) old (nth c 2))]\n"
+        "            (swap! st assoc :val nv :version (inc (:version (deref st))))\n"
+        "            (cljc/fire-watches! r old nv)))\n"
+        "        (doseq [s (deref (:sends tx))]\n"   /* held sends fire on success only */
+        "          (cljc/agent-enqueue! (nth s 0) (nth s 1) (nth s 2)))\n"
+        "        true))))\n"
+        "(defn cljc/tx-run [f]\n"
+        "  (if (cljc/tx)\n"
+        "    (f)\n"                            /* nested dosync joins the outer tx */
+        "    (loop [attempt 0]\n"
+        "      (when (> attempt 100)\n"
+        "        (throw (ex-info \"dosync: transaction retry limit exceeded\" {})))\n"
+        "      (let [tx {:vals (atom {}) :readv (atom {}) :writes (atom #{})\n"
+        "                :ensures (atom #{}) :commutes (atom []) :refs (atom {})\n"
+        "                :sends (atom [])}\n"
+        "            result (do (swap! cljc/txs assoc fiber/*self* tx)\n"
+        "                       (try (f)\n"
+        "                         (finally (swap! cljc/txs dissoc fiber/*self*))))]\n"
+        "        (if (cljc/tx-commit! tx) result (recur (inc attempt)))))))\n"
+        "(defmacro dosync [& body] `(cljc/tx-run (fn [] ~@body)))\n"
+        "(defmacro sync [_ & body] `(cljc/tx-run (fn [] ~@body)))\n"
+        "(defmacro io! [& body]\n"
+        "  `(if (cljc/tx)\n"
+        "     (throw (ex-info \"io! block inside a transaction\" {}))\n"
+        "     (do ~@body)))\n"
+        "(defn ref-history-count [_] 0)\n"
+        "(defn ref-min-history ([r] 0) ([r n] r))\n"
+        "(defn ref-max-history ([r] 0) ([r n] r))\n");
     /* FFI glue generator — declare C signatures as data, compile, load:
      * (ffi/define [[:double cos [:double]] [:int getpid []]]
      *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */
@@ -14583,7 +14796,9 @@ static void usage(FILE *f) {
         "                             (test expr) results; -a apply, -i review\n"
         "  lint [files...]            reader syntax check, full error rendering\n"
         "  fmt [check] <files...>     format with cljfmt (fix in place; check only)\n"
-        "  bundle <file> <out>        script + runtime → one native binary\n"
+        "  bundle <file> <out>        script + runtime → one native binary;\n"
+        "                             calls -main (argv) if the script defines one\n"
+        "  bundle -m <ns> <out>       bundle a namespace, entrypoint its -main\n"
         "  watch <file> [args]        run the script, rerun whenever it changes\n"
         "  vendor <git-url|user/repo> copy a library's .clj sources into ./vendor\n"
         "  doctor                     print resolved load path + batteries\n"
@@ -14613,6 +14828,22 @@ static int run_subprogram(CljcEnv *env, const char *src, bool truthy_exit) {
         last = eval(env, form);
     }
     return (truthy_exit && (last == NIL || last == FALSE)) ? 1 : 0;
+}
+
+/* Like run_subprogram, but an integer final value becomes the exit status
+ * (-main returning an int, bb-style). Shared rule with bundled binaries. */
+static int run_subprogram_int_exit(CljcEnv *env, const char *src) {
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; return 1; }
+    const char *p = src;
+    Cljc *volatile last = NIL;
+    while (*p) {
+        skip_ws(&p);
+        if (!*p) break;
+        Cljc *form = read_form(&p);
+        if (!form) break;
+        last = eval(env, form);
+    }
+    return (last != NIL && last->tag == CLJC_INT) ? (int)last->as.i : 0;
 }
 
 /* `cljc lint`: reader-level syntax check, Elm-style errors with carets. */
@@ -14823,7 +15054,7 @@ int main(int argc, char **argv) {
                  "  (if m (apply m *args*)"
                  "    (throw (ex-info \"no -main found in %s\" {}))))",
                  ns, ns, ns);
-        return run_subprogram(env, prog, false);
+        return run_subprogram_int_exit(env, prog);
     }
     if (!strcmp(cmd, "eval") || !strcmp(cmd, "-e")) {
         if (argc < 3) { fputs("usage: cljc eval <expr...>\n", stderr); return 1; }
@@ -14913,7 +15144,10 @@ int main(int argc, char **argv) {
         return (last != NIL && last->tag == CLJC_INT) ? (int)last->as.i : 0;
     }
     if (!strcmp(cmd, "bundle")) {
-        if (argc != 4) { fputs("usage: cljc bundle <script.clj> <output>\n", stderr); return 1; }
+        /* Just require "some args" here — bundle.clj owns the real arg
+         * grammar (flags like --static/--cc=/-m), so a strict positional
+         * count in C would reject every flag it documents. */
+        if (argc < 3) { fputs("usage: cljc bundle [-m <ns>] [flags] [script.clj] <output>\n", stderr); return 1; }
         set_args(env, argc, argv, 2);
         return run_subprogram(env, "(load-file \"bundle.clj\")", false);
     }

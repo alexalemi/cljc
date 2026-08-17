@@ -921,6 +921,76 @@ GC-stress on every push; tagged releases publish portable binaries.
     conservative scan (the arm64 suite burned 10 CPU-minutes before the
     fix; expect normal times after).
 
+48. ~~Bundle entrypoint parity (`-main` + args)~~ ✅ done 2026-08-17 — filed
+    and fixed same day, found by comparing against `jolt build` (see
+    "Prior art" below). Three defects: (a) `cljc.c` gated `bundle` on
+    `argc != 4`, so EVERY flag `bundle.clj` documents (`--static`,
+    `--windows`, `--cc=`, `--libs=`, `--cflags=`) was rejected before
+    reaching the Clojure side — the header's cross-compilation recipes
+    were unrunnable; the gate is now `argc < 3` and bundle.clj owns the
+    arg grammar. (b) The generated `main()` had script semantics only —
+    a script that is just `(defn -main ...)` bundled into a binary that
+    defined a fn and exited silently. Now: after the top-level forms, an
+    embedded entry-glue expr auto-calls `-main` (resolve-maybe) with the
+    argv strings; an integer return is the exit status; new
+    `cljc bundle -m <ns> <out>` bundles a namespace from *load-path*
+    (`add-dep!` pulls its transitive requires — verified clojure.string
+    rides along) and REQUIRES a `-main`. (c) latent: a bundled script
+    that threw still exited 0 — main() now checks `cljc_eval_errored`.
+    Bonus: `cljc -m` itself gained the int-exit rule
+    (run_subprogram_int_exit; judge keeps its own loop — it exits 2 on
+    load errors by contract). e2e regression tests in tests.clj bundle
+    with `--cflags=-O0`, which doubles as the flag-path regression test.
+
+49. ~~Agents + STM refs (Tier 3.6)~~ ✅ done 2026-08-17 — the two API gaps
+    the jolt comparison surfaced, closed the cheap way the fiber scheduler
+    allows (jolt gets them from Chez OS threads; see "Prior art").
+    Agents: CljcAgent deftype over a state atom; send enqueues, a drain
+    fiber runs actions serially per agent; error modes match Clojure
+    (default :fail — handler implies :continue, handler NOT called in
+    :fail; failed agent holds its queue for restart-agent); await rides a
+    marker action + promise so deref drives the pump. STM: MVCC-lite —
+    CljcRef carries {:val :version}; a tx caches first-touch values +
+    versions and commit verifies WRITTEN and ENSURED refs, retrying the
+    body on mismatch (reads don't conflict = snapshot-ish, write skew and
+    all, which is what ensure is for); commute re-applies at commit
+    without conflicting; in-tx sends held until commit. THE BUG WORTH
+    REMEMBERING: the current tx started as a ^:dynamic var — but binding
+    is a GLOBAL stack, so a tx body that yields (sleep/deref/io) leaks
+    its binding to whichever context runs next; the main thread's dosync
+    silently JOINED the parked fiber's tx (caught by the retry test:
+    attempts stayed 1). Fix: cljc/txs map keyed by fiber/*self* (nil =
+    main), which item 46 already rebinds around every resume; coros hash
+    by identity so they work as map keys. Divergences: no validators;
+    sends inside agent ACTIONS dispatch immediately (Clojure holds them);
+    watches real on agents/refs, still no-ops on atoms (swap! is a C
+    native with no watch registry). Conflict-retry e2e tests use a
+    future that sleeps mid-tx while the main thread commits under it —
+    deterministic under the cooperative scheduler. ASan gotcha re-found:
+    `cljc-asan < tests.clj` "fails" one dbg assert that checks the
+    FILENAME in output — stdin mode prints <stdin>; run `cljc-asan
+    tests.clj` like the Makefile does.
+
+## Prior art / inspiration
+
+- **jolt** (<https://jolt-lang.net/>, <https://github.com/jolt-lang/jolt>,
+  EPL-1.0 like cljc) — a self-hosted Clojure that compiles to Scheme
+  (Chez natively; Gambit → JavaScript) instead of the JVM. Same "Clojure
+  without a JVM" target as cljc, opposite strategy: cljc is a tree-walking
+  interpreter in one C file that BUNDLES source next to the runtime, jolt
+  is a real compiler emitting host-neutral IR → Scheme, AoT-linked into a
+  standalone binary with C deps statically linked. Worth stealing from:
+  - `jolt build -m <ns>` — entrypoint-based standalone binaries; the
+    direct model for roadmap item 48 above.
+  - `jolt run -m` with dependency resolution — cljc has `vendor` +
+    `*load-path*`, no resolver.
+  - Native C FFI and OS-threaded `future`/`agent`/`pmap` as headline
+    goals (cljc's concurrency is fiber/coroutine-based — item 46 — so
+    it is cooperative, not parallel; jolt is the pressure test for
+    whether that ceiling matters).
+  Non-goals for cljc: we are not becoming a compiler or growing a second
+  host language. The single embeddable `cljc.c` file is the constraint.
+
 ## 2026-07 arc: perf campaign, usability, unicode, tooling (summary)
 
 Compressed log of the July push (details in git history, commits 6b964f7..):

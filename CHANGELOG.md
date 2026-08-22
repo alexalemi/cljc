@@ -29,13 +29,17 @@
   honors the integer-exit rule too.
 
 ### Fixed
+- **STM**: `commute` on a ref also `alter`ed/`ref-set` in the same transaction
+  was applied twice at commit (`(dosync (alter r inc) (commute r inc))` on
+  `(ref 0)` gave 3, not 2, and fired watches twice); commutes now skip refs in
+  the write set, as in Clojure.
 - `cljc bundle` rejected every flag `bundle.clj` documents (`--static`,
   `--windows`, `--cc=`, `--libs=`, `--cflags=`) — the C dispatcher demanded
   exactly two arguments, so cross-compilation was unreachable from the CLI;
   a bundled script that threw still exited 0 (now 1)
 - **Memory safety**: int-array bounds checks truncated 64-bit indices to 32
-  bits (`(aget a 4294967296)` read/wrote out of bounds — segfault or heap
-  corruption); printing bigints over ~280 digits overflowed a heap buffer
+  bits (`(aget a 4294967296)` and `(get a 4294967296)` read/wrote out of
+  bounds — segfault or heap corruption); printing bigints over ~280 digits overflowed a heap buffer
   (`(str (apply *' (range 1 201)))`); a source file ending right after `^`
   crashed the reader (NULL deref)
 - `binding` now installs in parallel like Clojure (inits can't see earlier

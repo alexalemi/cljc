@@ -6891,7 +6891,7 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
         Cljc *out;
         if (sorted_get(env, coll, k, &out)) return out;
     } else if (coll != NIL && coll->tag == CLJC_IARRAY && k->tag == CLJC_INT) {
-        if (k->as.i >= 0 && (uint32_t)k->as.i < coll->as.iarr.n)
+        if (k->as.i >= 0 && k->as.i < (int64_t)coll->as.iarr.n)
             return mk_int(coll->as.iarr.data[k->as.i]);
     } else if (coll != NIL && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)
                && k->tag == CLJC_INT) {
@@ -13704,7 +13704,8 @@ CljcEnv *cljc_new_env(void) {
         "                old (:val (deref st)) nv (get (deref (:vals tx)) id)]\n"
         "            (swap! st assoc :val nv :version (inc (:version (deref st))))\n"
         "            (cljc/fire-watches! r old nv)))\n"
-        "        (doseq [c (deref (:commutes tx))]\n"
+        "        (doseq [c (deref (:commutes tx))\n"
+        "                :when (not (contains? (deref (:writes tx)) (nth c 0)))]\n" /* alter/ref-set already committed it (Clojure: sets.contains(ref)) */
         "          (let [r (get (deref (:refs tx)) (nth c 0)) st (:state r)\n"
         "                old (:val (deref st))\n"
         "                nv (apply (nth c 1) old (nth c 2))]\n"

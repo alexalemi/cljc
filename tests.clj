@@ -1563,6 +1563,13 @@
                  (dosync (ref-set r 6) (ensure r))
                  @saw))
 (assert= 6 (let [r (ref 5)] (dosync (alter r inc) @r)))   ; deref inside tx = tx value
+(assert= 2 (let [r (ref 0)] (dosync (alter r inc) (commute r inc)) @r))   ; commute not re-applied over alter
+(assert= 6 (let [r (ref 0)] (dosync (ref-set r 5) (commute r inc)) @r))  ; same for ref-set
+(assert= [[0 2]] (let [r (ref 0) log (atom [])]                          ; one watch fire, not two
+                   (add-watch r :k (fn [_ _ o n] (swap! log conj [o n])))
+                   (dosync (alter r inc) (commute r inc)) @log))
+(assert (nil? (get (int-array 4) 4294967296)))                ; get: 64-bit index must not truncate
+(assert= :d (get (int-array 4) 4294967296 :d))
 
 (when cljc-test-coro?  ; coro through futures: all need the ucontext engine
 (def cljc-coro-g (coro/new (fn [] (coro/yield 1) (coro/yield 2) :done)))

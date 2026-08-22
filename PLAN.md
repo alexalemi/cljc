@@ -1041,6 +1041,50 @@ Compressed log of the July push (details in git history, commits 6b964f7..):
   the first char's codepoint, Double/isNaN could not work ((= x x) is
   identity-true; num_cmp treats NaN equal-to-all → cljc/nan?* native).
 
+## 2026-08 arc: Jolt-inspired batch (summary)
+
+Four items picked from comparing against Jolt (Clojure-on-Chez), adapted to
+cljc's niche:
+
+- **JIT type hints** (jit.clj + reader): the reader keeps `^Tag` hints as
+  static `{:tag Tag}` metadata on SYMBOL cells (fresh per read, so invisible
+  to eval/=; non-symbol hints still discarded — `^String (foo)` in expression
+  position must not become a runtime with-meta). jit.clj gained a two-type
+  system (:long/:double): param types from `^long`/`^double` hints, return
+  type from a hint on the fn name or body inference (two-pass fixpoint for
+  self-recursion — the lattice is monotone so one promotion pass converges).
+  New in the subset: `/` (double-only), `Math/sqrt`, `(double x)`/`(long x)`,
+  unary minus (was silently `dst = t1`). GOTCHA that shaped the design:
+  defaulting an unhinted return to :long silently truncated double bodies —
+  interpreted/compiled agreement is the contract, so inference, not default.
+- **Conformance corpus** (fuzz/conformance.txt): 412 curated clojure.core
+  exprs diffed against a JVM-verified golden (`make conformance`, in `make
+  test`; re-derived live when bb is on PATH). Ground rules: deterministic,
+  print unordered colls only through sorted views, skip documented
+  divergences. Caught on first run: `(partition-all n step c)` and 3-coll
+  `interleave` missing, `.toUpperCase`/`.toLowerCase` unshimmed,
+  `rationalize` was identity (now exact ratio from the shortest decimal
+  repr), and double `range` promoting its first element — JVM semantics are
+  element type = start/step promotion only, a double end only bounds
+  (`(range 2.5)` => `(0 1 2)`).
+- **vendor deps.edn** (prelude): `cljc vendor` with no arg resolves ./deps.edn
+  :deps transitively — pinned :mvn/version via Clojars/Maven Central then the
+  jar's poms (compile/runtime scope; property-versioned/optional/clojure
+  skipped; Java-only jars tolerated with a note), :git/url+:git/sha|tag via
+  clone (io.github/com.github names infer the URL; :deps/root honored),
+  :local/root by copy; git/local deps recurse into their own deps.edn.
+  First coordinate wins. Maven repos live in the cljc/vendor-repos* atom so
+  tests point it at a file:// layout — the tests.clj integration test builds
+  a throwaway m2 repo + git repo + local project and runs a SUBPROCESS cljc
+  (so the repo's own vendor/ stays clean).
+- **bundle --library** (bundle.clj): `--library` emits a shared library plus
+  a generated <out>.h — cljc_lib_init/cljc_lib_eval/cljc_lib_last_error over
+  the embedded script, results as pr-str strings owned by the library.
+  cljc_eval_string anchors the conservative GC at its own frame per call, so
+  hosts call from any stack depth; errors are captured from cur_exc/err_msg
+  and the interpreter survives. Also fixed: the C CLI's `argc != 4` guard
+  had been rejecting ALL bundle flags (--static/--windows/--cc) — now >= 4.
+
 ## Known divergences from Clojure (deliberate)
 - `catch` is untyped; hash maps/sets iterate in hash order; plain int64
   arithmetic wraps (see README's list — it supersedes this one)

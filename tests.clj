@@ -291,6 +291,8 @@
 (assert= -1 (compare 1 2))
 (assert= 0 (compare [1 2] [1 2]))
 (assert= 1 (compare [1 2 3] [1 2]))
+(assert= -1 (compare [2] [1 10]))                          ; vectors: count first, then elements
+(assert= (quote ([2] [1 2] [1 10])) (sort compare [[2] [1 10] [1 2]]))
 (assert= -1 (compare nil 1))          ; nil sorts first
 (assert= :incomparable (try (compare 1 "x") (catch Exception e :incomparable)))
 
@@ -892,6 +894,27 @@
 (assert= 97 (int \a))
 (assert= 65 (int "A"))
 (assert= 3 (int 3.7))
+; conformance-corpus catches: gaps found by fuzz/conformance.txt
+(assert= '((1 2 3) (3 4 5) (5)) (partition-all 3 2 [1 2 3 4 5]))
+(assert= '(1 :a "x" 2 :b "y") (interleave [1 2] [:a :b] ["x" "y"]))
+(assert= '(1 2 3) (interleave [1 2 3]))
+(assert= [[1 2] [3]] (into [] (partition-all 2) [1 2 3]))   ; xf arity intact
+(assert= "AB" (.toUpperCase "ab"))
+(assert= "ab" (.toLowerCase "AB"))
+(assert= 1/2 (rationalize 0.5))
+(assert= 1/10 (rationalize 0.1))
+(assert= -3/4 (rationalize -0.75))
+(assert= 3/200000 (rationalize 1.5E-5))
+(assert= 2 (rationalize 2))
+(assert= 1/3 (rationalize 1/3))
+; range element types follow start/step promotion, end only bounds (JVM parity)
+(assert= '(0 1 2) (range 2.5))
+(assert= '(0 1 2) (range 0 2.5))
+(assert= '(0 0.25 0.5 0.75) (range 0 1 0.25))
+(assert= '(0.5 1.5 2.5) (range 0.5 3))
+(assert= '(0 0.5 1.0 1.5) (range 0 2 0.5))
+(assert= 0 (first (range 0 2 0.5)))                  ; int start stays an int
+(assert= 0.5 (second (range 0 2 0.5)))
 (assert= 42 (int 42))
 (assert= [] *args*)                                  ; no args to the test run
 (assert= "abc" (str/join "" (map (fn [c] c) (seq "abc"))))
@@ -918,7 +941,147 @@
 (jit/defn jit-no [s] (str s "!"))                   ; outside the subset
 (assert= :unsupported (try (jit/compile! 'jit-no) (catch Exception e :unsupported)))
 (assert= "still works!" (jit-no "still works"))     ; interpreted version intact
+; ^long/^double hints: unboxed doubles, hinted params and return
+(assert= {:tag 'double} (meta '^double x))          ; reader keeps hints on symbols
+(jit/defn ^double jit-dist [^double x ^double y] (Math/sqrt (+ (* x x) (* y y))))
+(def jit-dist-interp (jit-dist 3.0 4.0))
+(jit/compile! 'jit-dist)
+(assert= jit-dist-interp (jit-dist 3.0 4.0))        ; identical semantics
+(assert= 5.0 (jit-dist 3 4))                        ; int args coerce to double params
+(jit/defn ^double jit-harm [^long n]                ; mixed loop: long counter, double acc
+  (loop [i 1 acc 0.0] (if (> i n) acc (recur (inc i) (+ acc (/ 1.0 i))))))
+(def jit-harm-interp (jit-harm 50))
+(jit/compile! 'jit-harm)
+(assert= jit-harm-interp (jit-harm 50))
+(jit/defn jit-avg [^double a ^double b] (/ (+ a b) 2.0))
+(def jit-avg-interp (jit-avg 1.0 2.0))              ; no ret hint: return type inferred
+(jit/compile! 'jit-avg)
+(assert= jit-avg-interp (jit-avg 1.0 2.0))
+(jit/defn jit-geo [^double q ^long n] (if (zero? n) 1.0 (* q (jit-geo q (dec n)))))
+(def jit-geo-interp (jit-geo 0.5 10))               ; inference through self-recursion
+(jit/compile! 'jit-geo)
+(assert= jit-geo-interp (jit-geo 0.5 10))
+(jit/defn ^long jit-truncr [^double x] (+ x 1))     ; explicit ^long ret truncates
+(jit/compile! 'jit-truncr)
+(assert= 3 (jit-truncr 2.5))
+(jit/defn jit-negl [^double x] (long (- x)))        ; casts + unary minus
+(jit/compile! 'jit-negl)
+(assert= -3 (jit-negl 3.7))
+(jit/defn jit-fbad [^float x] x)                    ; only ^long/^double allowed
+(assert= :badhint (try (jit/compile! 'jit-fbad) (catch Exception e :badhint)))
+(jit/defn jit-idiv [a b] (/ a b))                   ; / needs a double operand
+(assert= :intdiv (try (jit/compile! 'jit-idiv) (catch Exception e :intdiv)))
+(jit/defn jit-drem [^double a] (rem a 2))           ; rem/quot/mod stay integer-only
+(assert= :drem (try (jit/compile! 'jit-drem) (catch Exception e :drem)))
 ) ; end when-unix
+
+; ── vendor: deps.edn resolution against local fixtures (no network) ──
+(def cljc-test-vendor?
+  (and cljc-test-unix?
+       (zero? (:exit (sh "command -v git && command -v zip && command -v unzip && command -v curl")))))
+(when-not cljc-test-vendor? (println "SKIP: vendor deps.edn section (needs git/zip/unzip/curl)"))
+(when cljc-test-vendor?
+(require 'fs)
+; pure pom parsing: compile+runtime kept; test/optional/property-versioned/clojure skipped
+(assert= '[[g/a {:mvn/version "1"}] [g/r {:mvn/version "2"}]]
+         (vec (cljc/pom-parse-deps* (str "<project><dependencies>"
+              "<dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>t</artifactId><version>1</version><scope>test</scope></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>o</artifactId><version>1</version><optional>true</optional></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>p</artifactId><version>${v}</version></dependency>"
+              "<dependency><groupId>org.clojure</groupId><artifactId>clojure</artifactId><version>1.12.0</version></dependency>"
+              "<dependency><groupId>g</groupId><artifactId>r</artifactId><version>2</version><scope>runtime</scope></dependency>"
+              "</dependencies></project>"))))
+(assert= nil (cljc/pom-parse-deps* "<project></project>"))
+; end-to-end in a subprocess (so ./vendor of this repo stays untouched):
+; file:// maven repo with a pom-transitive chain, a git dep carrying its own
+; deps.edn, and a :local/root dep
+(let [T (str (fs/temp-dir) "/cljc-vendor-selftest")
+      exe (str (cljc/exe-dir*) "/cljc")]
+  (sh (str "rm -rf " (pr-str T)))
+  (fs/create-dir (str T "/build/liba/liba"))
+  (spit (str T "/build/liba/liba/core.clj")
+        "(ns liba.core) (defn greet [n] (str \"hello \" n))")
+  (fs/create-dir (str T "/build/liba/META-INF/maven/com.example/liba"))
+  (spit (str T "/build/liba/META-INF/maven/com.example/liba/pom.xml")
+        "<project><groupId>com.example</groupId><artifactId>liba</artifactId><version>1.0.0</version></project>")
+  (fs/create-dir (str T "/build/libb/libb"))
+  (spit (str T "/build/libb/libb/core.clj")
+        "(ns libb.core (:require [liba.core :as a])) (defn shout [n] (str/upper-case (a/greet n)))")
+  (fs/create-dir (str T "/build/libb/META-INF/maven/com.example/libb"))
+  (spit (str T "/build/libb/META-INF/maven/com.example/libb/pom.xml")
+        (str "<project><groupId>com.example</groupId><artifactId>libb</artifactId><version>2.0.0</version>"
+             "<dependencies><dependency><groupId>com.example</groupId><artifactId>liba</artifactId><version>1.0.0</version></dependency>"
+             "<dependency><groupId>org.clojure</groupId><artifactId>clojure</artifactId><version>1.12.0</version></dependency>"
+             "</dependencies></project>"))
+  (fs/create-dir (str T "/m2/com/example/liba/1.0.0"))
+  (fs/create-dir (str T "/m2/com/example/libb/2.0.0"))
+  (sh (str "cd " T "/build/liba && zip -qr " T "/m2/com/example/liba/1.0.0/liba-1.0.0.jar ."))
+  (sh (str "cd " T "/build/libb && zip -qr " T "/m2/com/example/libb/2.0.0/libb-2.0.0.jar ."))
+  (fs/create-dir (str T "/gitrepo/src/gitlib"))
+  (spit (str T "/gitrepo/src/gitlib/core.clj")
+        "(ns gitlib.core (:require [libb.core :as b])) (defn loud [n] (str (b/shout n) \"!\"))")
+  (spit (str T "/gitrepo/deps.edn") "{:deps {com.example/libb {:mvn/version \"2.0.0\"}}}")
+  (sh (str "cd " T "/gitrepo && git init -q && git add -A"
+           " && git -c user.email=t@t -c user.name=t commit -qm x"))
+  (let [sha (str/trim (:out (sh (str "cd " T "/gitrepo && git rev-parse HEAD"))))]
+    (fs/create-dir (str T "/localproj/src/localx"))
+    (spit (str T "/localproj/src/localx/core.clj") "(ns localx.core) (def answer 42)")
+    (fs/create-dir (str T "/proj"))
+    (spit (str T "/proj/deps.edn")
+          (str "{:deps {io.example/gitlib {:git/url \"" T "/gitrepo\" :git/sha \"" sha "\"}"
+               " local/x {:local/root \"../localproj\"}}}"))
+    (spit (str T "/proj/run.clj")
+          (str "(require 'fs) (require 'process)"
+               "(reset! cljc/vendor-repos* [[\"file://" T "/m2/\" \"local-m2\"]])"
+               "(cljc/vendor-deps! \"deps.edn\")"))
+    (let [r (sh (str "cd " T "/proj && " exe " run.clj"))]
+      (assert= 0 (:exit r))
+      (assert= true (str/includes? (:out r) "(require 'gitlib.core)   ; loads OK"))
+      (assert= true (str/includes? (:out r) "(require 'liba.core)   ; loads OK"))
+      (assert= true (str/includes? (:out r) "(require 'libb.core)   ; loads OK"))
+      (assert= true (str/includes? (:out r) "(require 'localx.core)   ; loads OK"))
+      (assert= true (fs/exists? (str T "/proj/vendor/liba/core.clj")))
+      (assert= true (fs/exists? (str T "/proj/vendor/gitlib/core.clj")))))
+  (sh (str "rm -rf " (pr-str T))))
+) ; end when cljc-test-vendor?
+
+; ── bundle --library: C-ABI shared library round-trip ──
+; Compiles all of cljc.c once (-O0 keeps it quick); unix-only, needs cc and
+; the cljc.c source in cwd. CLJC_GC_STRESS is cleared for the subprocesses:
+; the generated C is a megabyte-scale string and stress-GC'ing its assembly
+; tests nothing this section is about.
+(when (and cljc-test-unix? (cljc/slurp-maybe "cljc.c"))
+(require 'fs)
+(let [T (str (fs/temp-dir) "/cljc-libtest")
+      exe (str (cljc/exe-dir*) "/cljc")]
+  (sh (str "rm -rf " (pr-str T)))
+  (fs/create-dir T)
+  (spit (str T "/greet.clj") "(defn greet [n] (str \"hello, \" n \"!\"))")
+  (spit (str T "/host.c")
+        (str "#include <stdio.h>\n"
+             "int cljc_lib_init(void);\n"
+             "const char *cljc_lib_eval(const char *src);\n"
+             "const char *cljc_lib_last_error(void);\n"
+             "int main(void) {\n"
+             "  if (cljc_lib_init() != 0) return 1;\n"
+             "  printf(\"%s\\n\", cljc_lib_eval(\"(greet \\\"lib\\\")\"));\n"
+             "  const char *bad = cljc_lib_eval(\"(nope)\");\n"
+             "  printf(\"%s\\n\", bad ? \"BAD\" : \"got-error\");\n"
+             "  printf(\"%s\\n\", cljc_lib_eval(\"(+ 1 2)\"));\n"
+             "  return 0;\n}\n"))
+  (let [rb (sh (str "env -u CLJC_GC_STRESS " exe " bundle --library --cflags=-O0 "
+                    T "/greet.clj " T "/libgreet.so"))]
+    (assert= 0 (:exit rb))
+    (assert= true (fs/exists? (str T "/libgreet.so.h")))
+    (let [rc (sh (str "cd " T " && cc -O0 host.c ./libgreet.so -o host 2>&1"))]
+      (assert= 0 (:exit rc))
+      ; subshell: cljc's sh appends 2>&1, which would override a bare
+      ; 2>/dev/null and pull the expected eval-error print into :out
+      (let [r (sh (str "(cd " T " && LD_LIBRARY_PATH=. ./host 2>/dev/null)"))]
+        (assert= 0 (:exit r))
+        (assert= "\"hello, lib!\"\ngot-error\n3\n" (:out r)))))
+  (sh (str "rm -rf " (pr-str T)))))
 
 ; ── library survey: upstream clojure.set via loading require ──
 (require '[clojure.set :refer [union intersection difference rename-keys map-invert project join select subset?]])

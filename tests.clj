@@ -2702,4 +2702,84 @@
 (i26-defn-n i26-add35 35 (+ i26a0 i26a34))
 (assert= 36 (apply i26-add35 (map inc (range 35))))
 
+;; ── specter bring-up round (2026-08-27): six interpreter fixes ──
+;; top-level (do ...) evaluates subforms one at a time (JVM semantics): a
+;; macro defined by an earlier subform expands at a later one. Compiled as one
+;; chunk, the use site's ARGS were compiled as evaluations before the defmacro
+;; ran (specter's #?(:clj (do (defmacro defmacroalias ..) (defmacroalias ..))))
+(do (defmacro s50-twice [x] `(* 2 ~x))
+    (def s50-twice-val (s50-twice 21)))
+(assert= 42 s50-twice-val)
+;; macro alias through a Var: (def alias (var m)) + :macro meta (defmacroalias)
+(defmacro s50-m1 [x] `(inc ~x))
+(def s50-m2 (var s50-m1))
+(alter-meta! (var s50-m2) merge {:macro true})
+(assert= 4 (s50-m2 3))
+(assert= '(inc 3) (macroexpand-1 '(s50-m2 3)))
+(defn s50-in-fn [] (s50-m2 10))          ; VM-compiled body path
+(assert= 11 (s50-in-fn))
+;; :bb reader-conditional feature: priority cljc > bb > default > clj
+(assert= :bb #?(:bb :bb :clj :clj))
+(assert= :bb #?(:clj :clj :bb :bb))
+(assert= :bb #?(:bb :bb :default :d))
+(assert= [1 2 3] [1 #?@(:bb [2 3])])
+;; the empty vector is a singleton, like PersistentVector/EMPTY — specter's
+;; terminal* tests (identical? vals [])
+(assert= true (identical? [] (vector)))
+(assert= true (identical? [] (empty [1 2])))
+(assert= true (identical? [] (persistent! (transient []))))
+(assert= true (identical? [] (pop [1])))
+(assert= true (identical? [] (vec ())))
+(assert= {:a 1} (meta (persistent! (transient (with-meta [] {:a 1})))))
+(assert= nil (meta []))
+(assert= [1 2] (conj (conj [] 1) 2))
+;; fn bodies whose list spine ends in a lazy seq (macro-built via cons/drop)
+;; evaluated to nil — the clause walker stepped raw cons tails
+(def s50-f (eval (list 'fn (cons '[x] (drop 0 (list '(+ x 1)))))))
+(assert= 6 (s50-f 5))
+(def s50-f2 (eval (list 'fn (cons '[x] (drop 0 (list 1))) (cons '[x y] (drop 0 (list 2))))))
+(assert= [1 2] [(s50-f2 0) (s50-f2 0 0)])
+;; reify: same-name clauses become ONE multi-arity fn (a hash-map kept the
+;; last); reduce/into/transduce honor a reify's IReduce; count sees Counted
+(def s50-r (reify clojure.lang.IReduce
+             (reduce [this f] (clojure.core/reduce f [1 2 3]))
+             (reduce [this f init] (clojure.core/reduce f init [1 2 3]))))
+(assert= 6 (clojure.core/reduce + s50-r))
+(assert= 16 (clojure.core/reduce + 10 s50-r))
+(assert= [1 2 3] (into [] s50-r))
+(assert= 9 (transduce (map inc) + 0 s50-r))
+(assert= 42 (count (reify clojure.lang.Counted (count [this] 42))))
+;; host class names specter's extend-protocol clauses dispatch on
+(assert= true (isa? (type [1]) java.util.List))
+(assert= true (isa? (type (list 1)) java.util.List))
+(assert= false (isa? (type #{1}) java.util.List))
+(assert= true (isa? (type #{1}) java.util.Set))
+(assert= :sorted-map clojure.lang.PersistentTreeMap)
+(assert= true (isa? (type (sorted-map)) clojure.lang.IPersistentMap))
+(assert= :transient-vector (type (transient [])))
+(defrecord S50Rec [a])
+(assert= true (isa? (type (->S50Rec 1)) clojure.lang.IRecord))
+(assert= false (isa? (type {:a 1}) clojure.lang.IRecord))
+(assert= true (instance? clojure.lang.Cons (list 1 2)))
+
+;; macros expand under the namespace the form was WRITTEN in (JVM: definition-
+;; time expansion), not the caller's: cljc expands lazily at first call, so
+;; a macro reading *ns* / (ns-aliases *ns*) inside a library fn called from
+;; user saw `user` (meander's alias-qualified operator symbols). *ns* is
+;; restored afterwards, including when the expansion throws (ErrFrame).
+(spit "/tmp/cljc-s50-nslib.clj" "(ns s50ns.lib (:require [clojure.string :as s50str]))
+(defmacro s50-ns-now [] (list 'quote *ns*))
+(defmacro s50-alias-of [a] (list 'quote (get (ns-aliases *ns*) a)))
+(defn s50-ns-probe [] (s50-ns-now))
+(defn s50-alias-probe [] (s50-alias-of s50str))
+(defmacro s50-boom [] (throw (ex-info \"boom\" {})))
+(defn s50-boom-fn [] (s50-boom))")
+(load-file "/tmp/cljc-s50-nslib.clj")
+(assert= 'user *ns*)
+(assert= 's50ns.lib (s50ns.lib/s50-ns-probe))
+(assert= 'clojure.string (s50ns.lib/s50-alias-probe))
+(assert= 'user *ns*)
+(assert= "boom" (try (s50ns.lib/s50-boom-fn) (catch Exception e (ex-message e))))
+(assert= 'user *ns*)
+
 (println "tests complete")

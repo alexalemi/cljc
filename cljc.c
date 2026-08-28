@@ -436,7 +436,7 @@ static size_t vec_len(Cljc *v);
 static Cljc *vec_nth(Cljc *v, size_t i);
 static char *as_str(Cljc *v, const char *what);
 static int64_t as_int(Cljc *v, const char *what);
-static Cljc *NIL, *TRUE, *FALSE, *EMPTY;
+static Cljc *NIL, *TRUE, *FALSE, *EMPTY, *EMPTY_VEC;
 
 /* ───── Error handling ───────────────────────────────────────────────── */
 
@@ -471,7 +471,11 @@ typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; in
                            * nested source (stale :file/:line meta on every
                            * later form) */
                           int rd_line_save; const char *rd_start_save;
-                          Cljc *rd_file_save; } ErrFrame;
+                          Cljc *rd_file_save;
+                          /* current namespace: macro_expand1 switches it to the
+                           * call site's home ns; a throw mid-expansion must not
+                           * leave the caller in the library's namespace */
+                          const char *ns_save; Cljc *nsvar_save; } ErrFrame;
 #define EVAL_STACK_MAX 4096
 static Cljc *eval_stack[EVAL_STACK_MAX];
 static int eval_sp;
@@ -769,6 +773,7 @@ static Cljc *mk_char(int32_t cp) {
 }
 static Cljc *mk_bool(bool b)         { return b ? TRUE : FALSE; }
 static const char *cur_reader_ns;   /* set while require loads a library */
+static Binding *g_ns_binding;       /* the *ns* var's root binding, once seen (ErrFrame restore) */
 static Cljc *mk_sym(const char *s) {
     Cljc *v = alloc(CLJC_SYMBOL);
     v->as.sym = s;
@@ -1339,7 +1344,7 @@ static void gc_collect(void) {
     jmp_buf regs;
     setjmp(regs);
 
-    gc_mark(NIL); gc_mark(TRUE); gc_mark(FALSE); gc_mark(EMPTY);
+    gc_mark(NIL); gc_mark(TRUE); gc_mark(FALSE); gc_mark(EMPTY); gc_mark(EMPTY_VEC);
     gc_mark(cur_exc);  /* exception value may be in flight between throw and catch */
     for (size_t vi = 0; vi < vsp; vi++) gc_mark(vstack[vi]);
     /* trace frames: a VM tail-call frame can outlive the chunk whose const
@@ -1947,7 +1952,23 @@ static Cljc *vec_cell(Cljc *root, uint8_t shift, uint32_t count,
     return nv;
 }
 
-static Cljc *mk_empty_vec(void) { return vec_cell(NULL, 0, 0, NULL, 0, NULL); }
+/* The empty vector is a shared singleton, like Clojure's PersistentVector/
+ * EMPTY: `[]`, (vector), (empty v), (persistent! (transient [])) all return
+ * the same cell, so (identical? x []) works as an emptiness test (specter's
+ * terminal* relies on it). Never write to it — vec_with_meta copies. */
+static Cljc *mk_empty_vec(void) {
+    return EMPTY_VEC ? EMPTY_VEC : vec_cell(NULL, 0, 0, NULL, 0, NULL);
+}
+
+/* Attach metadata to a just-built vector; a non-NULL meta on the empty
+ * singleton takes a private copy (EMPTY.withMeta semantics). */
+static Cljc *vec_with_meta(Cljc *nv, Cljc *meta) {
+    if (nv != EMPTY_VEC) { nv->meta = meta; return nv; }
+    if (!meta) return nv;
+    Cljc *c = vec_cell(NULL, 0, 0, NULL, 0, NULL);
+    c->meta = meta;
+    return c;
+}
 
 static Cljc *vec_newpath(int level, Cljc *node) {
     while (level > 0) {
@@ -2095,10 +2116,10 @@ static Cljc *prim_persistent_bang(CljcEnv *env, Cljc **argv, int nargs) {
     }
     Cljc *t = as_tvec(argv[0], "persistent!");
     t->as.vec.alive = false;            /* invalidate further edits */
-    Cljc *nv = vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
+    Cljc *nv = t->as.vec.count == 0 ? mk_empty_vec()
+             : vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
                         t->as.vec.tail, t->as.vec.taillen, NULL);
-    nv->meta = t->meta;
-    return nv;
+    return vec_with_meta(nv, t->meta);
 }
 
 static Cljc *tvec_pushtail(int level, Cljc *parent, Cljc *tailnode,
@@ -2691,8 +2712,11 @@ static Cljc *read_form(const char **p) {
         cljc_error("unknown ## literal (expected ##Inf, ##-Inf, ##NaN)");
     }
     if (c == '#' && (*p)[1] == '?') {
-        /* reader conditional: pick a branch by PRIORITY :cljc > :default >
-         * :clj. :cljc always wins (cljc-specific); :default beats :clj so a
+        /* reader conditional: pick a branch by PRIORITY :cljc > :bb >
+         * :default > :clj. :cljc always wins (cljc-specific); :bb next — a
+         * library's babashka branch is its JVM-class-free path (specter's
+         * MutableCell is a defrecord under :bb, an imported Java class under
+         * :clj), which is what cljc can run; :default beats :clj so a
          * portable #?(:clj java :default portable) still takes the portable
          * branch; :clj is a last resort so cljc can still load clj-only
          * conditionals like #?(:clj X :cljs Y) (taking X). #?@(...) splices the
@@ -2703,23 +2727,24 @@ static Cljc *read_form(const char **p) {
         skip_ws(p);
         if (**p != '(') cljc_error("#? expects a list");
         Cljc *clauses = read_list(p, ')');
-        static const char *KW_CLJC, *KW_CLJ, *KW_DEFAULT;
+        static const char *KW_CLJC, *KW_CLJ, *KW_DEFAULT, *KW_BB;
         if (!KW_CLJC) { KW_CLJC = intern("cljc", 4); KW_CLJ = intern("clj", 3);
-                        KW_DEFAULT = intern("default", 7); }
-        Cljc *b_cljc = NULL, *b_clj = NULL, *b_default = NULL;
+                        KW_DEFAULT = intern("default", 7); KW_BB = intern("bb", 2); }
+        Cljc *b_cljc = NULL, *b_clj = NULL, *b_default = NULL, *b_bb = NULL;
         for (Cljc *l = clauses; l && l->tag == CLJC_LIST && l->as.cons.tail != NIL;
              l = l->as.cons.tail->as.cons.tail) {
             Cljc *k = l->as.cons.head;
             Cljc *branch = l->as.cons.tail->as.cons.head;
             if (k->tag == CLJC_KEYWORD) {
                 if (k->as.kw == KW_CLJC && !b_cljc) b_cljc = branch;
+                else if (k->as.kw == KW_BB && !b_bb) b_bb = branch;
                 else if (k->as.kw == KW_CLJ && !b_clj) b_clj = branch;
                 else if (k->as.kw == KW_DEFAULT && !b_default) b_default = branch;
             }
             if (l->as.cons.tail == NIL) break;
         }
         {
-            Cljc *branch = b_cljc ? b_cljc : b_default ? b_default : b_clj;
+            Cljc *branch = b_cljc ? b_cljc : b_bb ? b_bb : b_default ? b_default : b_clj;
             if (branch) {
                 if (!splicing) return branch;
                 return mk_cons(mk_sym(intern("**reader-splice**", 17)),
@@ -3269,6 +3294,7 @@ static void set_cur_ns(CljcEnv *root, const char *ns) {
     if (!ns) return;
     register_ns(ns);
     Binding *b = root_find(root, intern("*ns*", 4), NULL, false);
+    g_ns_binding = b;
     if (b) b->value = mk_sym(ns);
 }
 
@@ -3326,10 +3352,35 @@ static void print_to(SBuf *sb, Cljc *v, bool readably);
  * The binding is a plain root set/restore; a throw mid-expansion leaves the
  * stale form behind, which only ever mislabels the next reader of &form. */
 static Cljc *macro_expand1(CljcEnv *env, Cljc *fn, Cljc **args, int n, Cljc *form) {
-    Binding *b = root_find(env_root(env), intern("&form", 5), NULL, false);
+    CljcEnv *root = env_root(env);
+    Binding *b = root_find(root, intern("&form", 5), NULL, false);
     Cljc *saved = b ? b->value : NULL;
     if (b) b->value = form;
+    /* Expand under the call site's HOME namespace. cljc expands macros lazily
+     * (first call of the enclosing fn), by which time *ns* is the CALLER's;
+     * JVM Clojure expands at definition time, so a macro that reads *ns* or
+     * (ns-aliases *ns*) (meander's expand-symbol, alias-qualified operator
+     * symbols) must see the namespace the form was written in. Symbols record
+     * that at read time (home_ns; NULL in the main script, where nothing
+     * changes). ErrFrames restore it on a throw mid-expansion. */
+    const char *home = NULL;
+    if (form && form != NIL && form->tag == CLJC_LIST &&
+        form->as.cons.head->tag == CLJC_SYMBOL)
+        home = form->as.cons.head->as.symc.home_ns;
+    const char *saved_ns = cur_reader_ns;
+    Cljc *saved_nsvar = NULL;
+    Binding *nsb = NULL;
+    bool swap_ns = home && home != saved_ns;
+    if (swap_ns) {
+        nsb = root_find(root, intern("*ns*", 4), NULL, false);
+        saved_nsvar = nsb ? nsb->value : NULL;
+        set_cur_ns(root, home);
+    }
     Cljc *r = apply(env, fn, args, n);
+    if (swap_ns) {
+        cur_reader_ns = saved_ns;
+        if (nsb) nsb->value = saved_nsvar;
+    }
     if (b) b->value = saved;
     return r;
 }
@@ -3501,6 +3552,28 @@ static bool vm_special_name(const char *s) {
  * lexical shadow structure is identical for every closure sharing the
  * arities), else the full root resolution (home_ns + alias paths, the
  * same ones resolve_symbol takes) without erroring. */
+/* The macro fn behind a call head, or NULL: a CLJC_FN flagged is_macro, or
+ * a Var (chain of Vars) whose root value is one. The latter is Clojure's
+ * macro-alias idiom — `(def alias (var m))` + `(alter-meta! #'alias merge
+ * {:macro true})` (specter's defmacroalias). Var cells here are fresh per
+ * (var x) so the :macro meta cannot stick; a Var that derefs to a macro fn
+ * is taken as a macro alias regardless (the JVM would otherwise invoke the
+ * macro fn with the wrong arity — never a useful program). */
+static Cljc *macro_fn_of(CljcEnv *env, Cljc *v) {
+    for (int hops = 0; v && v != NIL && hops < 4; hops++) {
+        if (v->tag == CLJC_FN) return v->as.fn.is_macro ? v : NULL;
+        if (v->tag != CLJC_VAR) return NULL;
+        Binding *b = root_find(env_root(env), v->as.var.name, NULL, false);
+        if (!b || b->value == v) return NULL;
+        v = b->value;
+    }
+    return NULL;
+}
+/* Hot-path form: FNs answer with the flag, only Vars take the lookup. */
+#define IS_MACRO_HEAD(env, f) \
+    ((f) != NIL && ((f)->tag == CLJC_FN ? (f)->as.fn.is_macro \
+                    : ((f)->tag == CLJC_VAR && macro_fn_of((env), (f)) != NULL)))
+
 static Cljc *vm_resolve_maybe(CljcEnv *env, Cljc *sym) {
     const char *name = sym->as.symc.name;
     CljcEnv *e = env;
@@ -3827,7 +3900,8 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
          * any local shadowing the name suppresses it (vm_resolve_maybe
          * scans the compile env chain AND c's own body locals below) */
         Cljc *mfn = vmc_local_p(c, s) ? NULL : vm_resolve_maybe(cenv, head);
-        if (mfn && mfn->tag == CLJC_FN && mfn->as.fn.is_macro) {
+        mfn = macro_fn_of(cenv, mfn);
+        if (mfn) {
             size_t base = vsp;
             for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
                 vpush(a->as.cons.head);
@@ -3978,7 +4052,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                 uint32_t n = a & 0xff;
                 Cljc *f = vstack[vsp - n - 1];
                 Cljc *r;
-                if (f != NIL && f->tag == CLJC_FN && f->as.fn.is_macro) {
+                if (IS_MACRO_HEAD(env, f)) {
                     /* late-resolved macro: deopt to eval of the source
                      * form (expands + splices, same as the tree-walk) */
                     if (getenv("CLJC_VM_LOG")) {
@@ -4071,7 +4145,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                  * to it instead of recursing — a proper tail call. */
                 uint32_t n = a & 0xff;
                 Cljc *f = vstack[vsp - n - 1];
-                if (f != NIL && f->tag == CLJC_FN && f->as.fn.is_macro) {
+                if (IS_MACRO_HEAD(env, f)) {
                     vsp -= n + 1;                    /* late macro: deopt, no TCO */
                     vpush(eval(env, K[a >> 8]));
                     VM_NEXT();
@@ -4143,13 +4217,22 @@ static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
     if (!KW_CLJC_TYPE) KW_CLJC_TYPE = mk_kw(intern("cljc/type", 9));
     Cljc *tykw;
     if (!map_find(inst, KW_CLJC_TYPE, &tykw)) return false;
-    Binding *mtb = root_find(env_root(env), intern("cljc/deftype-methods", 20), NULL, false);
-    if (!mtb || mtb->value == NIL || mtb->value->tag != CLJC_ATOM) return false;
-    Cljc *tables = mtb->value->as.atom.value, *tab, *method;
-    if (tables == NIL || tables->tag != CLJC_MAP) return false;
-    if (!map_find(tables, mk_sym(intern(mname, strlen(mname))), &tab)) return false;
-    if (tab == NIL || tab->tag != CLJC_MAP) return false;
-    if (!map_find(tab, tykw, &method)) return false;
+    Cljc *msym = mk_sym(intern(mname, strlen(mname)));
+    /* reify instances carry their methods on the instance (:cljc/impls) and
+     * register in cljc/multi-tables, not deftype-methods — look there first */
+    static Cljc *KW_IMPLS;
+    if (!KW_IMPLS) KW_IMPLS = mk_kw(intern("cljc/impls", 10));
+    Cljc *impls, *method = NULL;
+    if (!(map_find(inst, KW_IMPLS, &impls) && impls != NIL && impls->tag == CLJC_MAP &&
+          map_find(impls, msym, &method) && method != NIL)) {
+        Binding *mtb = root_find(env_root(env), intern("cljc/deftype-methods", 20), NULL, false);
+        if (!mtb || mtb->value == NIL || mtb->value->tag != CLJC_ATOM) return false;
+        Cljc *tables = mtb->value->as.atom.value, *tab;
+        if (tables == NIL || tables->tag != CLJC_MAP) return false;
+        if (!map_find(tables, msym, &tab)) return false;
+        if (tab == NIL || tab->tag != CLJC_MAP) return false;
+        if (!map_find(tab, tykw, &method)) return false;
+    }
     Cljc *iargv[256];
     if (nargs + 1 > 256) cljc_error("too many args to %s", mname);
     iargv[0] = inst;
@@ -4407,6 +4490,21 @@ static bool is_arities_meta(Cljc *m) {
            m->as.cons.head->as.sym == SYM_ARITIES;
 }
 
+/* Realize lazy tails hidden in a form's list spine, IN PLACE. Macro-built
+ * fn forms routinely carry one — `(cons params (drop 2 m))`, `(list* ..)` —
+ * and the clause/body walkers below step raw cons tails, so a lazy tail
+ * read as an EMPTY BODY (the fn silently returned nil). Element-preserving,
+ * hence invisible to other holders; in place so the **arities** cache marker
+ * on the spine survives (a copy would recompile the fn per closure). */
+static Cljc *realize_spine(Cljc *l) {
+    if (l == NIL) return NIL;
+    if (l->tag != CLJC_LIST) return to_seq(l);
+    Cljc *c = l;
+    while (c->as.cons.tail != NIL && c->as.cons.tail->tag == CLJC_LIST) c = c->as.cons.tail;
+    if (c->as.cons.tail != NIL) c->as.cons.tail = to_seq(c->as.cons.tail);
+    return l;
+}
+
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
     /* The closure holds env — every frame up the chain may now outlive its
      * scope, so loop frames among them must stop rebinding in place
@@ -4425,6 +4523,7 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
         f->as.fn.is_macro = is_macro;
         return f;
     }
+    forms = realize_spine(forms);
     /* single arity with a return-type hint: (fn ^{:tag T} [x] ..) reads its
      * params as (with-meta [x] {..}); unwrap so it's seen as a [params] head. */
     if (forms != NIL && forms->as.cons.head->tag == CLJC_LIST) {
@@ -4439,7 +4538,7 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
         *t = mk_cons(build_arity(forms->as.cons.head, forms->as.cons.tail), NIL);
     } else {
         for (Cljc *c = forms; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
-            Cljc *clause = c->as.cons.head;
+            Cljc *clause = realize_spine(c->as.cons.head);
             if (clause == NIL || clause->tag != CLJC_LIST)
                 cljc_error("fn: expected ([params] body...) clauses");
             *t = mk_cons(build_arity(clause->as.cons.head, clause->as.cons.tail), NIL);
@@ -4773,7 +4872,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     frame.prev = err_top;
                     frame.vsp_save = vsp;
                     frame.esp_save = eval_sp;
-                    frame.vm_tsp_save = vm_tsp;
+                    frame.vm_tsp_save = vm_tsp; frame.ns_save = cur_reader_ns; frame.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
                     frame.rd_line_save = rd_line;
                     frame.rd_start_save = rd_line_start;
                     frame.rd_file_save = rd_file_cell;
@@ -4785,7 +4884,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         err_top = frame.prev;
                         vsp = frame.vsp_save;
                         eval_sp = frame.esp_save;
-                        vm_tsp = frame.vm_tsp_save;
+                        vm_tsp = frame.vm_tsp_save; cur_reader_ns = frame.ns_save; if (g_ns_binding && frame.nsvar_save) g_ns_binding->value = frame.nsvar_save;
                         rd_line = frame.rd_line_save;
                         rd_line_start = frame.rd_start_save;
                         rd_file_cell = frame.rd_file_save;
@@ -4801,7 +4900,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             hframe.prev = err_top;
                             hframe.vsp_save = vsp;
                             hframe.esp_save = eval_sp;
-                            hframe.vm_tsp_save = vm_tsp;
+                            hframe.vm_tsp_save = vm_tsp; hframe.ns_save = cur_reader_ns; hframe.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
                             hframe.rd_line_save = rd_line;
                             hframe.rd_start_save = rd_line_start;
                             hframe.rd_file_save = rd_file_cell;
@@ -4813,7 +4912,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                 err_top = hframe.prev;
                                 vsp = hframe.vsp_save;
                                 eval_sp = hframe.esp_save;
-                                vm_tsp = hframe.vm_tsp_save;
+                                vm_tsp = hframe.vm_tsp_save; cur_reader_ns = hframe.ns_save; if (g_ns_binding && hframe.nsvar_save) g_ns_binding->value = hframe.nsvar_save;
                                 rd_line = hframe.rd_line_save;
                                 rd_line_start = hframe.rd_start_save;
                                 rd_file_cell = hframe.rd_file_save;
@@ -4981,7 +5080,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         frame.prev = err_top;
                         frame.vsp_save = vsp;
                         frame.esp_save = eval_sp;
-                        frame.vm_tsp_save = vm_tsp;
+                        frame.vm_tsp_save = vm_tsp; frame.ns_save = cur_reader_ns; frame.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
                         frame.rd_line_save = rd_line;
                         frame.rd_start_save = rd_line_start;
                         frame.rd_file_save = rd_file_cell;
@@ -4995,7 +5094,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             err_top = frame.prev;
                             vsp = frame.vsp_save;
                             eval_sp = frame.esp_save;
-                            vm_tsp = frame.vm_tsp_save;
+                            vm_tsp = frame.vm_tsp_save; cur_reader_ns = frame.ns_save; if (g_ns_binding && frame.nsvar_save) g_ns_binding->value = frame.nsvar_save;
                             rd_line = frame.rd_line_save;
                             rd_line_start = frame.rd_start_save;
                             rd_file_cell = frame.rd_file_save;
@@ -5249,9 +5348,16 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         env_define(scope, names[i], val);
                     }
                     Cljc *body = rest->as.cons.tail;
+                    /* volatile: the recur sentinel owns the (possibly heap-spilled)
+                     * arg array read below, and env_new/env_define can collect —
+                     * an optimizer keeping only `rvals` (a malloc interior pointer
+                     * the conservative scan can't see) let the sweep free it
+                     * under us (ASan -O1 heap-use-after-free). Same as apply's. */
+                    Cljc * volatile recur_keep = NIL;
                     for (;;) {
                         Cljc *r = eval_body(scope, body);
                         if (!(r && r->tag == CLJC_RECUR)) { free(names); return r; }
+                        recur_keep = r;
 
                         if (r->as.recur.n != nparams)
                             cljc_error("recur arity mismatch: expected %zu, got %d",
@@ -5265,6 +5371,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         scope = env_new(env);
                         for (size_t i = 0; i < nparams; i++)
                             env_define(scope, names[i], rvals[i]);
+                        (void)recur_keep;
                     }
                 }
                 {
@@ -5305,10 +5412,12 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
              * is then evaluated in the caller's environment. */
             Cljc *fn = eval(env, head);
             size_t base = vsp;
-            if (fn->tag == CLJC_FN && fn->as.fn.is_macro) {
+            Cljc *mfn = fn->tag == CLJC_FN ? (fn->as.fn.is_macro ? fn : NULL)
+                      : fn->tag == CLJC_VAR ? macro_fn_of(env, fn) : NULL;
+            if (mfn) {
                 for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
                     vpush(a->as.cons.head);    /* unevaluated forms */
-                Cljc *expansion = macro_expand1(env, fn, &vstack[base], (int)(vsp - base), form);
+                Cljc *expansion = macro_expand1(env, mfn, &vstack[base], (int)(vsp - base), form);
                 vsp = base;
                 /* Splice the expansion into the call site: each macro use
                  * expands ONCE (like compiled Clojure — re-expansion was
@@ -7284,6 +7393,15 @@ static Cljc *prim_filter(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
     /* (reduce f coll) or (reduce f init coll) */
     Cljc *f = argv[0];
+    {   /* a reify/deftype implementing IReduce reduces itself (specter's
+         * traverse-all returns one); records without a `reduce` fall through */
+        Cljc *coll = nargs < 3 ? argv[1] : argv[2];
+        if (coll != NIL && coll->tag == CLJC_MAP) {
+            Cljc *out, *a[2] = { f, nargs < 3 ? NIL : argv[1] };
+            if (dispatch_deftype_method(env, coll, "reduce", a, nargs < 3 ? 1 : 2, &out))
+                return out;
+        }
+    }
     Cljc *acc;
     Cljc **slot;                           /* the input-seq arg: advanced as we
                                               walk so the head isn't pinned */
@@ -8354,7 +8472,7 @@ static Cljc *prim_doc_info(CljcEnv *env, Cljc **argv, int nargs) {
     m = map_assoc(m, mk_kw(intern("doc", 3)),
                   doc ? mk_str(doc, strlen(doc)) : NIL);
     m = map_assoc(m, mk_kw(intern("macro?", 6)),
-                  mk_bool(v != NIL && v->tag == CLJC_FN && v->as.fn.is_macro));
+                  mk_bool(macro_fn_of(env, v) != NULL));
     m = map_assoc(m, mk_kw(intern("native?", 7)),
                   mk_bool(v != NIL && v->tag == CLJC_NATIVE));
     m = map_assoc(m, mk_kw(intern("arglists", 8)), arglists);
@@ -8443,6 +8561,80 @@ static Cljc *prim_set_var(CljcEnv *env, Cljc **argv, int nargs) {
  * resolve. cur_reader_ns is saved/restored so loading a file doesn't leak its
  * ns to the caller. `name` (load-file passes its path) becomes the forms'
  * :file meta, so error traces can say which file a frame lives in. */
+/* Evaluate one top-level form in the root env: VM-compile it as a zero-arg
+ * chunk when possible, else tree-walk (see the comments inside). A literal
+ * (do ...) is taken apart and its subforms evaluated one at a time, as JVM
+ * Clojure does — so `(do (defmacro m ..) (m ..))` (reader-conditional
+ * `#?(:clj (do ...))` bodies, specter's macro aliases) sees the macro at
+ * its use. Compiled as one chunk, the use site is compiled before the
+ * defmacro has run: the head only deopts at runtime, but its args were
+ * already compiled as evaluations. */
+static Cljc *eval_toplevel(CljcEnv *root, Cljc *form) {
+    if (form->tag == CLJC_LIST && form->as.cons.head != NIL &&
+        form->as.cons.head->tag == CLJC_SYMBOL &&
+        form->as.cons.head->as.sym == intern("do", 2)) {
+        Cljc *last = NIL;
+        vpush(form);
+        for (Cljc *a = form->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+            last = eval_toplevel(root, a->as.cons.head);
+        vsp--;
+        return last;
+    }
+    Cljc *last;
+    vpush(form);
+    /* (def name <compound-expr>) bails the compiler (def isn't an op);
+     * compile just the EXPR and def the quoted result via the tree-walker
+     * — (def ans (loop ...)) shapes carry the hot loops in script files. */
+    Cljc *compile_body = form;
+    Cljc *def_name = NULL;
+    if (form->tag == CLJC_LIST && form->as.cons.head->tag == CLJC_SYMBOL &&
+        form->as.cons.head->as.sym == intern("def", 3)) {
+        Cljc *t1 = form->as.cons.tail;
+        if (t1 != NIL && t1->tag == CLJC_LIST && t1->as.cons.head->tag == CLJC_SYMBOL &&
+            t1->as.cons.tail != NIL && t1->as.cons.tail->tag == CLJC_LIST &&
+            t1->as.cons.tail->as.cons.tail == NIL &&
+            t1->as.cons.tail->as.cons.head != NIL &&
+            t1->as.cons.tail->as.cons.head->tag == CLJC_LIST) {
+            def_name = t1->as.cons.head;
+            compile_body = t1->as.cons.tail->as.cons.head;
+        }
+    }
+    Cljc *chunk = vm_compile(root, NIL, mk_cons(compile_body, NIL));
+    if (!chunk && def_name) {           /* expr uncompilable: whole-form fallback */
+        def_name = NULL;
+    }
+    last = chunk ? vm_run(root, chunk) : eval(root, form);
+    /* the whole form is the chunk's tail position, so a call form
+     * compiles to a TAILCALL sentinel meant for apply's trampoline —
+     * dispatch it here (volatile keep: the sentinel owns the argv). */
+    Cljc *volatile sentinel_keep = NIL;
+    int tcf = -1;   /* trace-frame slot for the top-level tail call */
+    while (last && last->tag == CLJC_RECUR && last->meta) {
+        sentinel_keep = last;
+        if (g_tc_form) {
+            if (tcf < 0 && eval_sp < EVAL_STACK_MAX) tcf = eval_sp++;
+            if (tcf >= 0) eval_stack[tcf] = g_tc_form;
+            g_tc_form = NULL;
+        }
+        Cljc **av = last->as.recur.spill
+            ? (Cljc **)last->as.recur.iv[0] : last->as.recur.iv;
+        last = apply(root, last->meta, av, (int)last->as.recur.n);
+        (void)sentinel_keep;
+    }
+    if (tcf >= 0) eval_sp = tcf;
+    if (chunk && def_name) {            /* now perform the def itself */
+        vpush(last);
+        Cljc *q = mk_cons(mk_sym(intern("quote", 5)), mk_cons(last, NIL));
+        Cljc *d = mk_cons(mk_sym(intern("def", 3)),
+                          mk_cons(def_name, mk_cons(q, NIL)));
+        vpush(d);
+        last = eval(root, d);
+        vsp -= 2;
+    }
+    vsp--;
+    return last;
+}
+
 static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
     const char *src = as_str(argv[0], "eval-forms");
     const char *saved_ns = cur_reader_ns;
@@ -8474,57 +8666,7 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
          * iterations spent 40% in eval_inner + 16% resolve_symbol). Fallback
          * to the tree-walker when the compiler bails. The form is rooted on
          * the vstack across compile+run (macro splice mutates it in place). */
-        vpush(form);
-        /* (def name <compound-expr>) bails the compiler (def isn't an op);
-         * compile just the EXPR and def the quoted result via the tree-walker
-         * — (def ans (loop ...)) shapes carry the hot loops in script files. */
-        Cljc *compile_body = form;
-        Cljc *def_name = NULL;
-        if (form->tag == CLJC_LIST && form->as.cons.head->tag == CLJC_SYMBOL &&
-            form->as.cons.head->as.sym == intern("def", 3)) {
-            Cljc *t1 = form->as.cons.tail;
-            if (t1 != NIL && t1->tag == CLJC_LIST && t1->as.cons.head->tag == CLJC_SYMBOL &&
-                t1->as.cons.tail != NIL && t1->as.cons.tail->tag == CLJC_LIST &&
-                t1->as.cons.tail->as.cons.tail == NIL &&
-                t1->as.cons.tail->as.cons.head != NIL &&
-                t1->as.cons.tail->as.cons.head->tag == CLJC_LIST) {
-                def_name = t1->as.cons.head;
-                compile_body = t1->as.cons.tail->as.cons.head;
-            }
-        }
-        Cljc *chunk = vm_compile(root, NIL, mk_cons(compile_body, NIL));
-        if (!chunk && def_name) {           /* expr uncompilable: whole-form fallback */
-            def_name = NULL;
-        }
-        last = chunk ? vm_run(root, chunk) : eval(root, form);
-        /* the whole form is the chunk's tail position, so a call form
-         * compiles to a TAILCALL sentinel meant for apply's trampoline —
-         * dispatch it here (volatile keep: the sentinel owns the argv). */
-        Cljc *volatile sentinel_keep = NIL;
-        int tcf = -1;   /* trace-frame slot for the top-level tail call */
-        while (last && last->tag == CLJC_RECUR && last->meta) {
-            sentinel_keep = last;
-            if (g_tc_form) {
-                if (tcf < 0 && eval_sp < EVAL_STACK_MAX) tcf = eval_sp++;
-                if (tcf >= 0) eval_stack[tcf] = g_tc_form;
-                g_tc_form = NULL;
-            }
-            Cljc **av = last->as.recur.spill
-                ? (Cljc **)last->as.recur.iv[0] : last->as.recur.iv;
-            last = apply(root, last->meta, av, (int)last->as.recur.n);
-            (void)sentinel_keep;
-        }
-        if (tcf >= 0) eval_sp = tcf;
-        if (chunk && def_name) {            /* now perform the def itself */
-            vpush(last);
-            Cljc *q = mk_cons(mk_sym(intern("quote", 5)), mk_cons(last, NIL));
-            Cljc *d = mk_cons(mk_sym(intern("def", 3)),
-                              mk_cons(def_name, mk_cons(q, NIL)));
-            vpush(d);
-            last = eval(root, d);
-            vsp -= 2;
-        }
-        vsp--;
+        last = eval_toplevel(root, form);
     }
     set_cur_ns(env_root(env), saved_ns);   /* restore ns + *ns* (NULL pre-boot: ok) */
     rd_line = save_line;
@@ -8553,7 +8695,8 @@ static Cljc *prim_macroexpand_1(CljcEnv *env, Cljc **argv, int nargs) {
         if (!b) b = root_find(env_root(env), head->as.symc.name, head->as.symc.home_ns, false);
         if (b) fn = b->value;
     }
-    if (!fn || fn->tag != CLJC_FN || !fn->as.fn.is_macro) return form;
+    fn = macro_fn_of(env, fn);
+    if (!fn) return form;
     size_t base = vsp;
     for (Cljc *a = form->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
         vpush(a->as.cons.head);
@@ -8761,6 +8904,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_SET: n = "set"; break;
         case CLJC_SORTED: n = v->as.sorted.is_map ? "sorted-map" : "sorted-set"; break;
         case CLJC_IARRAY: n = "int-array"; break;
+        case CLJC_TVEC: n = "transient-vector"; break;
         case CLJC_ATOM: n = "atom"; break;
         case CLJC_FN: case CLJC_NATIVE: n = "fn"; break;
         case CLJC_CORO: n = "coroutine"; break;
@@ -10589,7 +10733,7 @@ static Cljc *coro_yield(Cljc *val) {
 static void coro_trampoline(void) {
     Coro *self = coro_current;
     ErrFrame base; base.prev = NULL; base.vsp_save = vsp; base.esp_save = eval_sp;
-    base.vm_tsp_save = vm_tsp;
+    base.vm_tsp_save = vm_tsp; base.ns_save = cur_reader_ns; base.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
     base.rd_line_save = rd_line; base.rd_start_save = rd_line_start;
     base.rd_file_save = rd_file_cell;
     err_top = &base;
@@ -10597,7 +10741,7 @@ static void coro_trampoline(void) {
         self->xfer = apply(gc_root_envs[0], self->thunk, NULL, 0);
         self->error = NULL;
     } else {
-        vsp = base.vsp_save; eval_sp = base.esp_save; vm_tsp = base.vm_tsp_save;
+        vsp = base.vsp_save; eval_sp = base.esp_save; vm_tsp = base.vm_tsp_save; cur_reader_ns = base.ns_save; if (g_ns_binding && base.nsvar_save) g_ns_binding->value = base.nsvar_save;
         rd_line = base.rd_line_save; rd_line_start = base.rd_start_save;
         rd_file_cell = base.rd_file_save;
         self->error = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
@@ -10817,9 +10961,10 @@ static const char *PRELUDE =
     "    identity\n"
     "    (reduce (fn [f g] (fn [& args] (f (apply g args)))) fs)))\n"
     "(defn partial [f & pre] (fn [& args] (apply f (concat pre args))))\n"
+    /* reduce over `from` itself, not (seq from): a reify IReduce reduces itself */
     "(defn into [to from]\n"
     "  (if (vector? to)\n"
-    "    (persistent! (reduce conj! (transient to) (seq from)))\n"
+    "    (persistent! (reduce conj! (transient to) from))\n"
     "    (reduce conj to from)))\n"
     "(defn mapv\n"
     "  ([f coll] (apply vector (map f coll)))\n"
@@ -12288,6 +12433,7 @@ CljcEnv *cljc_new_env(void) {
         EMPTY = alloc(CLJC_EMPTY);
         EMPTY->as.cons.head = NIL;   /* (first ()) => nil */
         EMPTY->as.cons.tail = EMPTY; /* (rest ())  => ()   */
+        EMPTY_VEC = vec_cell(NULL, 0, 0, NULL, 0, NULL);
     }
     CljcEnv *e = env_new(NULL);
     /* Register as a GC root immediately — everything defined below
@@ -13311,6 +13457,30 @@ CljcEnv *cljc_new_env(void) {
         "(def java.util.Collection :java.util.Collection)\n"
         "(derive :vector :java.util.Collection) (derive :list :java.util.Collection)\n"
         "(derive :set :java.util.Collection) (derive :lazy-seq :java.util.Collection)\n"
+        /* specter's extend-protocol clauses (bring-up 2026-08-27): List/Set,
+           the sorted collections' concrete classes, IReduce, IRecord (every
+           defrecord derives it), transients. MapEntry stays an inert
+           placeholder — cljc map entries are plain vectors, and mapping it
+           to :vector would let a MapEntry clause clobber a sibling
+           IPersistentVector clause in the same extend-protocol. */
+        "(def java.util.List :java.util.List) (def java.util.Set :java.util.Set)\n"
+        "(doseq [t [:vector :list :lazy-seq]] (derive t :java.util.List))\n"
+        "(derive :set :java.util.Set) (derive :sorted-set :java.util.Set)\n"
+        "(derive :sorted-set :java.util.Collection) (derive :sorted-map :java.util.Map)\n"
+        "(def clojure.lang.PersistentTreeMap :sorted-map) (def clojure.lang.PersistentTreeSet :sorted-set)\n"
+        "(doseq [c [:clojure.lang.IPersistentMap :clojure.lang.Associative :clojure.lang.Sorted\n"
+        "           :clojure.lang.IPersistentCollection :clojure.lang.Seqable :java.lang.Iterable]]\n"
+        "  (derive :sorted-map c))\n"
+        "(doseq [c [:clojure.lang.IPersistentSet :clojure.lang.Sorted :clojure.lang.IPersistentCollection\n"
+        "           :clojure.lang.Seqable :java.lang.Iterable]] (derive :sorted-set c))\n"
+        "(def clojure.lang.Sorted :clojure.lang.Sorted)\n"
+        "(def clojure.lang.IReduce :clojure.lang.IReduce) (def clojure.lang.IReduceInit :clojure.lang.IReduce)\n"
+        "(doseq [t [:vector :list :lazy-seq :map :set :sorted-map :sorted-set]] (derive t :clojure.lang.IReduce))\n"
+        "(def clojure.lang.IRecord :clojure.lang.IRecord)\n"
+        "(def clojure.lang.ITransientVector :transient-vector) (def clojure.lang.ITransientCollection :transient-vector)\n"
+        "(def clojure.lang.Cons :list)\n"
+        "(def clojure.lang.MapEntry :clojure.lang.MapEntry)\n"
+        "(defn clojure.lang.MapEntry. [k v] [k v])\n"
         "(def java.util.concurrent.atomic.AtomicInteger :AtomicInteger)\n"
         "(def java.util.concurrent.atomic.AtomicLong :AtomicLong)\n"
         /* boxed-number instance methods (Double.isInfinite etc.) as global
@@ -13515,6 +13685,7 @@ CljcEnv *cljc_new_env(void) {
         "    `(do\n"
         "       (def ~rname ~kw)\n"
         "       (swap! cljc/record-types conj ~kw)\n"   /* records ARE maps; deftypes aren't */
+        "       (derive ~kw :clojure.lang.IRecord)\n"
         "       (defn ~(symbol (str \"->\" rname)) ~fsyms (hash-map :cljc/type ~kw ~@kvs))\n"
         "       (def ~(symbol (str rname \".\")) ~(symbol (str \"->\" rname)))\n"
         "       (defn ~(symbol (str \"map->\" rname)) [m] (assoc m :cljc/type ~kw))\n"
@@ -13552,12 +13723,17 @@ CljcEnv *cljc_new_env(void) {
         "    (swap! cljc/multi-tables update mname\n"
         "           (fn [tb] (assoc (or tb {}) t\n"
         "                       (fn [& args] (apply (get (:cljc/impls (first args)) mname) args)))))))\n"
+        /* same-name clauses (e.g. IReduce's 2- and 3-arg `reduce`) become ONE
+           multi-arity fn, as deftype does — a plain hash-map kept only the last */
         "(defmacro reify [& clauses]\n"
         "  (let [t (keyword (str (gensym)))\n"
         "        ms (filter list? clauses)\n"
-        "        regs (map (fn [m] (list 'cljc/reg-reify-method! (list 'quote (first m)) t)) ms)\n"
-        "        impls (mapcat (fn [m] (list (list 'quote (first m))\n"
-        "                                    (cons 'fn (cons (vec (second m)) (drop 2 m))))) ms)\n"
+        "        groups (reduce (fn [acc m] (update acc (first m) (fn [v] (conj (or v []) m)))) {} ms)\n"
+        "        regs (map (fn [mname] (list 'cljc/reg-reify-method! (list 'quote mname) t)) (keys groups))\n"
+        "        impls (mapcat (fn [[mname cs]]\n"
+        "                        (list (list 'quote mname)\n"
+        "                              (cons 'fn (map (fn [m] (cons (vec (second m)) (drop 2 m))) cs))))\n"
+        "                      groups)\n"
         "        inst (list 'hash-map :cljc/type t :cljc/impls (cons 'hash-map impls))]\n"
         "    (concat (list 'do) regs (list inst))))\n");
     /* Tier 3.5: the fiber scheduler + Clojure's blocking concurrency API.
@@ -14818,7 +14994,7 @@ static void nrepl_lookup(FILE *out, NreplMsg *m, CljcEnv *env, const char *symna
     Cljc *volatile info = NIL;
     ErrFrame fr;
     fr.prev = err_top; fr.vsp_save = vsp; fr.esp_save = eval_sp;
-    fr.vm_tsp_save = vm_tsp; fr.rd_line_save = rd_line;
+    fr.vm_tsp_save = vm_tsp; fr.ns_save = cur_reader_ns; fr.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL; fr.rd_line_save = rd_line;
     fr.rd_start_save = rd_line_start; fr.rd_file_save = rd_file_cell;
     err_top = &fr;
     if (setjmp(fr.jb) == 0) {
@@ -14829,7 +15005,7 @@ static void nrepl_lookup(FILE *out, NreplMsg *m, CljcEnv *env, const char *symna
         err_top = fr.prev;
     } else {
         err_top = fr.prev;
-        vsp = fr.vsp_save; eval_sp = fr.esp_save; vm_tsp = fr.vm_tsp_save;
+        vsp = fr.vsp_save; eval_sp = fr.esp_save; vm_tsp = fr.vm_tsp_save; cur_reader_ns = fr.ns_save; if (g_ns_binding && fr.nsvar_save) g_ns_binding->value = fr.nsvar_save;
         rd_line = fr.rd_line_save; rd_line_start = fr.rd_start_save;
         rd_file_cell = fr.rd_file_save;
         info = NIL;

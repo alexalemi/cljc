@@ -33,14 +33,19 @@ borkdude/deflet.
 |---|---|
 | org.clojure/core.match | wildcards, multi-column, nested vectors, maps, seq patterns, `:or`, `:guard`, `:as`, rest patterns, clause ordering (13/13 battery) |
 | markdown-clj | `md-to-html-string`: headings, emphasis, lists, links, code blocks, tables, YAML front-matter metadata |
-| meander/epsilon | `match`/`search`/`find`: logic + memory vars, maps (nested/multi-key), `scan`, `pred`, `or`, `app` (9/9 battery). `m/rewrite` not yet |
+| meander/epsilon | `match`/`search`/`find`: logic + memory vars, maps (nested/multi-key), `scan`, `pred`, `or`, `app` (9/9 battery). `m/rewrite` not yet: meander registers its `with`/`$` parsers under syntax-quoted bare symbols, which cljc's syntax-quote leaves unqualified (documented divergence) while lookups use the qualified name |
+
+## Works — verified functionally (bring-up round, 2026-08-27)
+
+| Library | Verified |
+|---|---|
+| com.rpl/specter (+ riddley/riddley) | `select`/`transform`/`setval`/`select-one`/`select-first`/`select-any`/`vtransform`/`replace-in`/`traverse-all`, `defnav`/`defdynamicnav`/`recursive-path`/`path`, navigators `ALL MAP-VALS MAP-KEYS FIRST LAST END BEGINNING BEFORE-ELEM AFTER-ELEM NONE-ELEM INDEXED-VALS ATOM META NAME NAMESPACE VAL DISPENSE STOP STAY`, `keypath nthpath srange filterer walker submap subset must pred pred= pred> view parser putval collect-one if-path cond-path multi-path selected? not-selected? transformed terminal terminal-val nil->val regex-nav map-key index-nav before-index with-fresh-collected continue-then-stay stay-then-continue`, `NONE` removal (92/92 battery). Runs specter's `:bb` reader-conditional branches |
 
 ## Partial
 
 | Library | Status |
 |---|---|
 | meander `m/rewrite` | its self-hosted clause analyzer reports non-exhaustive — match/search/find are fine |
-| com.rpl/specter | loads with riddley vendored; `defnav`-generated vars missing at use — its macro layer needs bring-up |
 
 ## Won't work (JVM-native by design)
 

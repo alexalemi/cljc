@@ -971,6 +971,72 @@ GC-stress on every push; tagged releases publish portable binaries.
     `cljc-asan < tests.clj` "fails" one dbg assert that checks the
     FILENAME in output — stdin mode prints <stdin>; run `cljc-asan
     tests.clj` like the Makefile does.
+50. ~~Specter bring-up~~ ✅ done 2026-08-27 — com.rpl/specter 1.1.6 (+
+    riddley) runs: 92/92 navigator battery (COMPATIBILITY.md). Library
+    bring-up again paid off as a bug-finder: six GENERAL fixes, none
+    specter-specific. (1) TOP-LEVEL `do` SPLITTING in eval_toplevel: the
+    whole `#?(:clj (do (defmacro defmacroalias ..) (defmacroalias richnav
+    ..)))` form was one VM chunk, so the alias call compiled before its
+    macro existed — VOP_CALL's late-macro deopt only saves the HEAD; the
+    args were already compiled as evaluations ("I don't know what
+    `richnav` refers to"). JVM Clojure evaluates top-level do subforms
+    one at a time; now so do we. (2) macro_fn_of(): a call head that is
+    a CLJC_VAR chain deref'ing to a macro fn IS a macro (Var cells are
+    fresh per (var x), so :macro meta can't stick — a Var to a macro fn
+    is taken as an alias regardless; the JVM would arity-error otherwise).
+    Six check sites unified (compiler, VOP_CALL/TAILCALL via
+    IS_MACRO_HEAD, eval, macroexpand-1, macro?). (3) `:bb` READER
+    CONDITIONAL feature, priority cljc > bb > default > clj — specter's
+    MutableCell is a defrecord under :bb, an imported Java class under
+    :clj. (4) EMPTY_VEC SINGLETON (rooted like EMPTY): specter's
+    terminal* does (identical? vals []) — JVM `[]` is
+    PersistentVector/EMPTY; mk_empty_vec returns it, vec_with_meta copies
+    on non-NULL meta (persistent! was the one writer). (5) FN BODIES WITH
+    LAZY SPINES returned nil — my reify rewrite built clauses as (cons
+    params (drop 2 m)); make_fn's clause walker stepped raw cons tails,
+    saw the LAZY cell, and read an EMPTY body. realize_spine() patches
+    the spine in place (keeps the **arities** cache on the same cells).
+    This one is general and nasty: any macro building a fn body with
+    cons/list*/concat hit it silently. (6) REIFY same-name clauses (the
+    2- and 3-arg IReduce `reduce`) collapsed to the last in a hash-map;
+    now grouped into one multi-arity fn as deftype does; prim_reduce
+    dispatches a deftype/reify `reduce` method and dispatch_deftype_method
+    reads a reify's :cljc/impls (reify registers in multi-tables, not
+    deftype-methods — the memory note about reg-method! applies here
+    too). Plus host class mappings (java.util.List/Set, PersistentTree*,
+    IReduce, ITransientVector, Cons, IRecord via defrecord derive) and
+    (type (transient [])) = :transient-vector. NOT bugs (test-author
+    errors to avoid re-chasing): (defnav x [] ..) yields the navigator
+    OBJECT, use `x` not `(x)`; NONE-ELEM on a vector APPENDS;
+    with-fresh-collected reverts collected vals at the terminal ([2]);
+    replace-in's second value must be seqable; walker/MAP-VALS results on
+    hash-maps come in hash order (documented divergence). meander
+    m/rewrite still open. ALSO FOUND by building ASan at -O1 instead of
+    the documented -O0: eval_inner's loop/recur read the sentinel's
+    spilled arg array after env_new/env_define collected — `r` was not
+    volatile-kept (apply's recur_keep was); -O0 kept `r` on the stack so
+    the conservative scan saw it. Lesson: run the ASan sweep at -O1 too
+    (`cc -g -O1 -fsanitize=address,undefined ...`); put a `cljc` copy
+    next to the ASan binary or the exe-dir subprocess tests exit 127.
+    MISDIAGNOSIS TO REMEMBER: meander's m/rewrite "non exhaustive pattern
+    match" looked like an alias-resolution bug (an alias-vs-fully-
+    qualified A/B even "confirmed" it) — it was THIS GC bug corrupting
+    loop rebinding nondeterministically; allocation-pattern changes flip
+    such symptoms. When an A/B flips on an innocuous edit, suspect the GC
+    first. Separately real and fixed: macro_expand1 now expands under the
+    call site's home ns (symc.home_ns) with ErrFrame save/restore of
+    cur_reader_ns + the *ns* var — JVM expands at definition time, so
+    `*ns*`/`(ns-aliases *ns*)` inside a macro must be the defining ns.
+    m/rewrite's REMAINING blocker (not fixed, a deliberate divergence):
+    meander registers its pattern parsers under syntax-quoted bare
+    symbols (`with, `$) — JVM qualifies an UNRESOLVABLE bare symbol to
+    the current ns (meander.syntax.epsilon/with); cljc leaves it bare,
+    while lookups use the qualified symbol → `with` parsed as a plain seq
+    → "Unbound reference %right". Flipping syntax-quote to qualify
+    unresolvable bare symbols (at least inside library loads) is the fix;
+    it is held back only because cljc's non-hygienic macro style (bare
+    binding symbols in templates, illegal in JVM Clojure) is documented
+    as load-bearing — needs a prelude/battery audit first.
 
 ## Prior art / inspiration
 

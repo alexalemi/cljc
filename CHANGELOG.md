@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Added
+- **Specter runs** (`com.rpl/specter` + `riddley`): see COMPATIBILITY.md for the
+  92-case battery. The bring-up fixed six general interpreter issues below.
+- Reader conditionals honor the `:bb` feature (priority `:cljc` > `:bb` >
+  `:default` > `:clj`): a library's babashka branch is its JVM-class-free
+  path, which is what cljc can run.
+- Host class names for protocol dispatch: `java.util.List`/`Set`,
+  `clojure.lang.PersistentTreeMap`/`PersistentTreeSet`, `IReduce`,
+  `ITransientVector`, `Cons`, `IRecord` (every `defrecord` type derives it),
+  `Sorted`; sorted maps/sets derive the map/set interfaces.
+  `(type (transient []))` is `:transient-vector` (was `:unknown`).
+
+### Fixed
+- A top-level `(do ...)` evaluates its subforms one at a time, as JVM Clojure
+  does: `(do (defmacro m ..) (m ..))` — e.g. a `#?(:clj (do ...))` body — saw
+  the macro use compiled before the `defmacro` ran (the head deopted at
+  runtime but its args had been compiled as evaluations: "I don't know what
+  `richnav` refers to").
+- Macro aliases through a Var work: `(def alias (var m))` +
+  `(alter-meta! #'alias merge {:macro true})` (specter's `defmacroalias`) now
+  expands as a macro everywhere (tree-walker, VM, `macroexpand-1`, `macro?`);
+  it used to be called as a plain fn returning the expansion unevaluated.
+- The empty vector is a singleton like `PersistentVector/EMPTY`:
+  `(identical? [] (vector))`, `(empty v)`, `(pop [x])`,
+  `(persistent! (transient []))` all hold (specter's `terminal*` relies on
+  it). Metadata on an empty vector takes a private copy.
+- `fn` bodies whose list spine ends in a lazy seq — macro-built with
+  `(cons params (drop 2 m))`, `list*`, `concat` — evaluated to **nil**: the
+  clause/body walkers stepped raw cons tails and read the lazy tail as an
+  empty body. Spines are realized in place (the arity cache survives).
+- `reify` with several clauses of the same method name (IReduce's 2- and
+  3-arg `reduce`) kept only the last; they now form one multi-arity fn as in
+  `deftype`. `reduce`, `into` and `transduce` honor a reify/deftype's own
+  `reduce`; the C-side deftype method dispatch (`count`/`nth`/`get`/…) also
+  finds methods on reify instances.
+- **GC**: the tree-walker's `loop` did not root its `recur` sentinel across
+  the rebinding allocations; an optimizing build could keep only the pointer
+  into the sentinel's heap-spilled argument array (invisible to the
+  conservative scan) and the sweep freed it mid-iteration (ASan `-O1`
+  heap-use-after-free; `-O0` hid it). Now `volatile`-kept like `apply`'s.
+- Macros expand under the namespace their call site was *written* in. cljc
+  expands lazily (first call of the enclosing fn), so a macro that reads
+  `*ns*` or `(ns-aliases *ns*)` inside a library fn first called from `user`
+  saw `user` — JVM Clojure expands at definition time. `*ns*` is restored
+  afterwards, including when the expansion throws.
+
 ## v0.3.0 — 2026-08-27
 
 ### Added

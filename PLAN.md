@@ -4,9 +4,10 @@ Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
 (`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test` (runs the
 suite twice — normal and `CLJC_GC_STRESS=1`).
 
-## Status (as of 2026-07-07, v0.2.0)
+## Status (as of 2026-08-27, v0.3.0)
 
-~14,700 lines, zero warnings, ~1350 assertions in `tests.clj`, ASan/UBSan clean
+~15,400 lines, zero warnings, ~1470 assertions in `tests.clj` + 412-expression
+conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan),
 macOS arm64 + x86_64/Rosetta, Windows (MSYS2 mingw64) — suite runs normal +

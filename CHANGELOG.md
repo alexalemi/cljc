@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.3.0 — 2026-08-27
+
 ### Added
 - **Agents**: `agent`/`send`/`send-off`/`send-via`, `await`/`await-for`,
   `agent-error`/`restart-agent` (`:clear-actions`; a failed agent holds its
@@ -94,6 +96,11 @@
   `str/split`/`replace`/`replace-first` only treat a string as a pattern when
   it carries the `:regex` meta tag, not any metadata
 - `read-line` no longer silently splits lines longer than 4095 bytes
+- Conformance corpus: `(- 1/2 1/2)` was in the golden as `0` while JVM Clojure
+  gives `0N` (ratio→integer collapse yields a BigInt; cljc's small-N demotion
+  is a documented divergence, so the case is replaced by `(- 3/2 1/4)`); the
+  babashka re-verification in `make conformance` now fails on disagreement
+  instead of being swallowed
 - `(keyword nil "a")` returns `:a` (was an error), matching `symbol`
 - `(int-array 4294967296)` errors instead of silently making a 0-length array
 - Under-arity native calls (`(atom)`, `(mod 5)`, `(subseq ss)`, …) raise

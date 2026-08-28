@@ -30,9 +30,10 @@ test: cljc
 conformance: cljc
 	@./cljc fuzz/runner_cljc.clj fuzz/conformance.txt | diff - fuzz/conformance_expected.txt \
 	  && echo "conformance: $$(grep -cv '^;' fuzz/conformance.txt | cat) expressions, no divergences"
-	@command -v bb > /dev/null && \
-	  { bb -f fuzz/runner.clj -- fuzz/conformance.txt | diff - fuzz/conformance_expected.txt \
-	    && echo "conformance: golden verified against babashka"; } || true
+	@if command -v bb > /dev/null; then \
+	  bb -f fuzz/runner.clj -- fuzz/conformance.txt | diff - fuzz/conformance_expected.txt \
+	    && echo "conformance: golden verified against babashka"; \
+	else echo "conformance: bb not on PATH, golden not re-verified"; fi
 
 install: cljc
 	install -d $(DESTDIR)$(PREFIX)/bin

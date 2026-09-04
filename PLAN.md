@@ -1,8 +1,8 @@
 # cljc — single-file Clojure in C
 
 Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
-(`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test` (runs the
-suite twice — normal and `CLJC_GC_STRESS=1`).
+(`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test`
+(suite + conformance); `make test-full` adds the `CLJC_GC_STRESS=1` pass.
 
 ## Status (as of 2026-08-27, v0.3.0)
 

@@ -31,7 +31,8 @@ built-in namespaces. See [Running real libraries](#running-real-libraries).
 make            # builds ./cljc (cc, -lm -ldl, nothing else)
 ./cljc          # REPL: editing, history, tab-completion, highlighting, *1 *2 *3
 ./cljc file.clj # run a script
-make test       # 1000+ assertions, run twice: normal + GC-stress mode
+make test       # 1000+ assertions + conformance corpus (~20s)
+make test-full  # adds the CLJC_GC_STRESS=1 pass (~8x slower; CI/pre-release)
 
 ./install.sh                      # install to ~/.local (no sudo)
 PREFIX=/usr/local ./install.sh    # system-wide
@@ -406,7 +407,8 @@ The full list, the roadmap, and the GC invariants live in [PLAN.md](PLAN.md).
 ## Testing
 
 ```sh
-make test                      # full suite, normal + CLJC_GC_STRESS=1
+make test                      # normal suite + conformance
+make test-full                 # adds CLJC_GC_STRESS=1 (slow; shakes out GC roots)
 # sanitizers (flags required by conservative stack scanning, as with Boehm GC):
 cc -g -fsanitize=address,undefined -o /tmp/cljc-asan cljc.c -lm
 ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 /tmp/cljc-asan tests.clj

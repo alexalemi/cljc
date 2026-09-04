@@ -16,7 +16,7 @@ jobs:
       - name: Build (zero warnings enforced)
         run: make CFLAGS='-O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function'
       - name: Test (normal + GC stress)
-        run: make test
+        run: make test-full
 
   linux-asan:
     runs-on: ubuntu-latest

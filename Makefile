@@ -17,12 +17,23 @@ example: examples/host.c cljc.c
 	$(CC) $(CFLAGS) -o examples/host examples/host.c -lm -ldl
 	./examples/host
 
+# Each suite runs ONCE, capturing output instead of piping to grep. A pipe
+# yields grep's exit status, not cljc's, so catching a crash used to need a
+# second identical run -- which doubled the suite's cost. $$out gives both
+# the exit code and the text to scan, from one run.
 test: cljc
-	@./cljc tests.clj 2>&1 | grep -E 'FAIL|error' && exit 1 || true
-	@./cljc tests.clj > /dev/null
-	@CLJC_GC_STRESS=1 ./cljc tests.clj 2>&1 | grep -E 'FAIL|error' && exit 1 || true
-	@CLJC_GC_STRESS=1 ./cljc tests.clj > /dev/null
+	@out=$$(./cljc tests.clj 2>&1) || { echo "$$out"; exit 1; }; \
+	  echo "$$out" | grep -E 'FAIL|error' && exit 1 || true
 	@$(MAKE) --no-print-directory conformance
+	@echo "all tests pass (normal + conformance)"
+
+# Adds the GC-stress pass: collect every 512 allocations instead of the
+# adaptive ~1M threshold, which is what shakes out missing GC roots. It is
+# ~8x slower than the normal run (140s vs 18s here) and dominates everything
+# else, so it lives in CI and pre-release rather than in every install.
+test-full: test
+	@out=$$(CLJC_GC_STRESS=1 ./cljc tests.clj 2>&1) || { echo "$$out"; exit 1; }; \
+	  echo "$$out" | grep -E 'FAIL|error' && exit 1 || true
 	@echo "all tests pass (normal + GC stress + conformance)"
 
 # Diff the conformance corpus against the checked-in JVM-Clojure golden file.
@@ -85,4 +96,4 @@ lint:
 	clj-kondo --lint json.clj libc.clj test.clj examples 2>/dev/null || true
 	@echo "(name files .cljc if they use #?(:cljc ...) reader conditionals)"
 
-.PHONY: run test clean example lint install uninstall
+.PHONY: run test test-full clean example lint install uninstall

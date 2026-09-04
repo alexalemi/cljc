@@ -21,7 +21,7 @@ jobs:
       - name: Build + test
         run: |
           make CFLAGS='-O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function'
-          make test
+          make test-full
       - name: Package
         run: |
           D=cljc-${GITHUB_REF_NAME}-linux-x86_64

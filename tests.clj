@@ -1973,16 +1973,26 @@
 (assert= [{"op" "eval" "id" "1" "code" "(+ 2 3)"} ""]      ; bencode encode/decode round-trip
          (cljc-n/bdecode (cljc-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"})))
 (cljc-n/start 8092)
-(let [resp (cljc-a/<!! (cljc-a/go
-             (let [fd (tcp/connect "127.0.0.1" 8092)]
-               (csp/send! fd (cljc-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"}))
-               (loop [b ""]
-                 (let [m (csp/recv! fd)]
-                   (if (or (nil? m) (str/includes? (str b m) "done"))
-                     (do (tcp/close fd) (str b m))
-                     (recur (str b m))))))))]
-  (assert= true (str/includes? resp "5:value1:5"))         ; value 5 came back
-  (assert= true (str/includes? resp "4:done")))            ; status done
+; The read loop parks on POLLIN with no deadline. If the server fiber ever
+; dies without closing the socket, recv! never returns, "done" never arrives,
+; and the suite wedges at 100% CPU -- taking ./install.sh down with it. Race
+; the reader against a timer so a stall FAILs loudly instead of hanging.
+(let [reader (cljc-a/go
+               (let [fd (tcp/connect "127.0.0.1" 8092)]
+                 (csp/send! fd (cljc-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"}))
+                 (loop [b ""]
+                   (let [m (csp/recv! fd)]
+                     (if (or (nil? m) (str/includes? (str b m) "done"))
+                       (do (tcp/close fd) (str b m))
+                       (recur (str b m)))))))
+      ; timeout wins -> its closed chan delivers nil; the reader can only
+      ; ever deliver a string, so nil? tells the two apart.
+      resp (cljc-a/<!! (cljc-a/go
+                         (let [[v _] (cljc-a/alts! [reader (cljc-a/timeout 10000)])]
+                           (if (nil? v) ::nrepl-timeout v))))]
+  (assert= false (= ::nrepl-timeout resp))                 ; reader stalled, not a protocol bug
+  (assert= true (and (string? resp) (str/includes? resp "5:value1:5")))   ; value 5 came back
+  (assert= true (and (string? resp) (str/includes? resp "4:done"))))      ; status done
 ) ; end when-coro
 
 ; ── AoC regressions ──

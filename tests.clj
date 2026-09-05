@@ -2576,6 +2576,21 @@
 (assert= :int (type (cljc/getpid)))
 (assert= true (= (cljc/getpid) (cljc/getpid)))               ; stable within a process
 
+; System/exit really exits, with the given status, and stops execution. Was a
+; no-op stub: it returned nil and the script ran on, so `cmd || echo failed`
+; never fired. Needs a subprocess -- calling it here would end this run.
+(let [exe (str (cljc/exe-dir*) "/cljc")
+      f   (str (or (System/getenv "TMPDIR") "/tmp") "/cljc-exit-" (cljc/getpid) ".clj")]
+  (spit f "(println \"before\")(System/exit 3)(println \"after\")")
+  (let [r (sh (str exe " " f))]
+    (assert= 3 (:exit r))
+    (assert= "before" (str/trim (:out r))))                  ; did not run on
+  (spit f "(System/exit 0)")
+  (assert= 0 (:exit (sh (str exe " " f))))
+  (spit f "(+ 1 1)")
+  (assert= 0 (:exit (sh (str exe " " f))))                   ; no exit call -> 0
+  (sh (str "rm -f " f)))
+
 ; `cljc test` discovery: recursive, sorted, skips vendor/target/hidden dirs.
 ; Uses the native cljc/list-dir* (nil for a non-dir, [] -- truthy -- for an
 ; empty one), so it needs no FFI. Exercised against a temp tree.

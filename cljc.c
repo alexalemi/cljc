@@ -1130,6 +1130,10 @@ static CljcEnv *env_freelist;      /* linked through ->parent */
 static size_t gc_allocs, gc_threshold = GC_MIN_THRESHOLD;
 static size_t churn_floor = GC_MIN_THRESHOLD;   /* adaptive collection floor */
 static size_t gc_freed_last;
+/* True while a REPL prompt or an nREPL eval is driving evaluation. Guards
+ * cljc/exit*: taking the process down would kill the session or the server
+ * out from under the user, so it unwinds with an error there instead. */
+static bool cljc_interactive;
 static bool gc_stress;             /* CLJC_GC_STRESS=1: collect every 512 allocs */
 static void *gc_stack_base;
 static CljcEnv *gc_root_envs[8];
@@ -9909,6 +9913,20 @@ static Cljc *prim_getpid(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
+/* (cljc/exit* n) -> terminate the process with status n. System/exit is
+ * defined on top of this. Streams are flushed first: exit() flushes stdio
+ * but cljc may hold buffered output of its own. */
+static Cljc *prim_exit(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    int code = nargs > 0 ? (int)as_int(argv[0], "cljc/exit*") : 0;
+    if (cljc_interactive)
+        cljc_error("System/exit: would exit %d, but a REPL/nREPL session is "
+                   "not terminated; evaluation unwinds instead", code);
+    fflush(stdout);
+    fflush(stderr);
+    exit(code);
+}
+
 /* (cljc/sleep-ms* ms) → sleep this many milliseconds (csp timeouts). */
 static Cljc *prim_sleep_ms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -11517,7 +11535,7 @@ static const char *PRELUDE =
     /* java.lang.System statics */
     "(defn System/getenv ([] {}) ([k] (cljc/env* k)))\n"
     "(defn System/getProperty ([k] nil) ([k d] d))\n"
-    "(defn System/exit [n] nil)\n"
+    "(defn System/exit ([] (cljc/exit* 0)) ([n] (cljc/exit* n)))\n"
     "(defn System/currentTimeMillis [] (quot (cljc/now-us*) 1000))\n"
     /* Apache Commons Math integer gcd, used by Emmy's rational-function simplifier */
     "(defn ArithmeticUtils/gcd [a b]\n"
@@ -12705,6 +12723,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
     cljc_define_native(e, "cljc/now-us*", prim_now_us);
     cljc_define_native(e, "cljc/getpid", prim_getpid);
+    cljc_define_native(e, "cljc/exit*", prim_exit);
     cljc_define_native(e, "cljc/sleep-ms*", prim_sleep_ms);
     cljc_define_native(e, "cljc/poll-fds*", prim_poll_fds);
     cljc_define_native(e, "cljc/epoch*", prim_epoch);
@@ -14799,6 +14818,7 @@ static void repl_record(CljcEnv *env, Cljc *result) {
 }
 
 static int run_repl(CljcEnv *env) {
+    cljc_interactive = true;
     hist_load();
 #ifdef _WIN32
     SetConsoleCtrlHandler(cljc_ctrl_handler, 1);
@@ -15168,6 +15188,7 @@ static void nrepl_serve_client(int fd, CljcEnv *env) {
 #endif  /* _WIN32 (nREPL helpers) */
 
 static int nrepl_server(CljcEnv *env, int port) {
+    cljc_interactive = true;
 #ifdef _WIN32
     /* nREPL wraps the client socket in a FILE* via fdopen(); Windows sockets
      * are not C file descriptors, so this loop can't run as-is. */

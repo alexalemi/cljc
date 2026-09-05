@@ -11864,16 +11864,29 @@ static const char *PRELUDE =
     "               (+ (* acc radix) d)))\n"
     "           0 (seq s))))\n"
     "(def Long/parseLong Integer/parseInt)\n"
+    /* toString/radix is SIGNED (Java prefixes '-'); toBinaryString is UNSIGNED
+     * (Java renders the raw two's-complement word). They are different
+     * functions and one cannot be defined as the other. Digits are accumulated
+     * on the NEGATIVE side so Long/MIN_VALUE works -- negating it overflows. */
     "(defn Integer/toString\n"
     "  ([n] (str n))\n"
     "  ([n radix]\n"
     "   (if (zero? n) \"0\"\n"
-    "       (loop [n n acc \"\"]\n"
-    "         (if (zero? n) acc\n"
-    "             (recur (quot n radix)\n"
-    "                    (str (get cljc/digit-chars (mod n radix)) acc)))))))\n"
+    "       (let [neg (neg? n)]\n"
+    "         (loop [n (if neg n (- n)) acc \"\"]\n"
+    "           (if (zero? n) (if neg (str \"-\" acc) acc)\n"
+    "               (recur (quot n radix)\n"
+    "                      (str (get cljc/digit-chars (- (rem n radix))) acc))))))))\n"
     "(def Long/toString Integer/toString)\n"
-    "(defn Integer/toBinaryString [n] (Integer/toString n 2))\n"
+    /* Unsigned: shift in with >>> so the sign bit is data, not sign. 64-bit for
+     * Long, masked to 32 for Integer -- Java's take an int and a long. */
+    "(defn Long/toBinaryString [n]\n"
+    "  (if (zero? n) \"0\"\n"
+    "      (loop [n n acc \"\"]\n"
+    "        (if (zero? n) acc\n"
+    "            (recur (unsigned-bit-shift-right n 1)\n"
+    "                   (str (get cljc/digit-chars (bit-and n 1)) acc))))))\n"
+    "(defn Integer/toBinaryString [n] (Long/toBinaryString (bit-and n 4294967295)))\n"
     "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
     "(defn RuntimeException. ([] (ex-info \"\" {})) ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
     "(defn Exception. ([] (ex-info \"\" {})) ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"

@@ -1672,6 +1672,25 @@
 (assert= "1010" (Integer/toBinaryString 10))
 (assert= "42" (Integer/toString 42))
 (assert= "0" (Integer/toString 0 2))
+; Negatives: toString/radix is SIGNED (Java prefixes '-'), toBinaryString is
+; UNSIGNED (raw two's-complement word). Defining one as the other dropped the
+; sign entirely -- (Integer/toBinaryString -1) was "1", and +2^54 and -2^54
+; printed identically. Values below are byte-identical to the JVM.
+(assert= "-101" (Integer/toString -5 2))
+(assert= "-ff" (Integer/toString -255 16))
+(assert= "11111111111111111111111111111011" (Integer/toBinaryString -5))   ; 32-bit
+(assert= "11111111111111111111111111111111" (Integer/toBinaryString -1))
+(assert= (apply str (repeat 64 "1")) (Long/toBinaryString -1))             ; 64-bit
+(assert= "1111111111000000000000000000000000000000000000000000000000000000"
+         (Long/toBinaryString (bit-shift-left 1023 54)))                   ; ten 1s, not one
+; Long/MIN_VALUE: negating it overflows, so it must not be negated
+(assert= "-1000000000000000000000000000000000000000000000000000000000000000"
+         (Integer/toString -9223372036854775808 2))
+(assert= "1000000000000000000000000000000000000000000000000000000000000000"
+         (Long/toBinaryString -9223372036854775808))
+; +2^54 and -2^54 must not render alike
+(assert= false (= (Long/toBinaryString (bit-shift-left 1023 54))
+                  (Long/toBinaryString (bit-shift-left 1 54))))
 
 ; lazy param destructuring (was: to_seq realized infinite seqs — 17GB)
 (defn cljc-lazy-destructure-probe [[x & xs]] (cons x (lazy-seq (cljc-lazy-destructure-probe xs))))

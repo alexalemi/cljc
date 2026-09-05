@@ -9864,6 +9864,108 @@ static Cljc *prim_isatty(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_bool(isatty(1));
 }
 
+/* Raw terminal input for TUIs, the same termios recipe the REPL's line editor
+ * uses (rl_raw_enter below) but exposed as natives so a script can own the
+ * screen without the FFI. Three primitives, decoded in Clojure, not here:
+ *
+ *   (cljc/raw-mode* bool)  enter/leave raw mode; false when stdin isn't a tty.
+ *                          An atexit hook restores the terminal even if the
+ *                          script dies with an uncaught error mid-screen.
+ *   (cljc/read-key*)       block for one keypress and return its bytes as a
+ *                          string: one UTF-8 character (all its continuation
+ *                          bytes), or a whole escape sequence ("\e[A" for Up).
+ *                          nil on EOF. An ESC that is followed by nothing
+ *                          within 30ms is a lone Escape.
+ *   (cljc/term-size*)      [rows cols], [24 80] when unknown. */
+#ifndef _WIN32
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+static struct termios raw_orig;
+static bool raw_active = false, raw_atexit = false;
+static void raw_restore(void) {
+    if (raw_active) { tcsetattr(0, TCSAFLUSH, &raw_orig); raw_active = false; }
+}
+#endif
+static Cljc *prim_raw_mode(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+#ifdef _WIN32
+    (void)argv; (void)nargs; return FALSE;
+#else
+    bool on = nargs > 0 && argv[0] != NIL && argv[0] != FALSE;
+    if (!on) { raw_restore(); return TRUE; }
+    if (raw_active) return TRUE;
+    if (tcgetattr(0, &raw_orig) == -1) return FALSE;    /* not a tty */
+    struct termios raw = raw_orig;
+    raw.c_iflag &= (tcflag_t)~(ICRNL | IXON);            /* Enter is \r, ^S/^Q are keys */
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | ISIG | IEXTEN);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(0, TCSAFLUSH, &raw) == -1) return FALSE;
+    raw_active = true;
+    if (!raw_atexit) { atexit(raw_restore); raw_atexit = true; }
+    return TRUE;
+#endif
+}
+#ifndef _WIN32
+/* one byte, or -1 on EOF/error */
+static int raw_getc(void) {
+    unsigned char c;
+    ssize_t n;
+    do { n = read(0, &c, 1); } while (n == -1 && errno == EINTR);
+    return n == 1 ? c : -1;
+}
+/* is a byte waiting on stdin within ms milliseconds? */
+static bool raw_pending(int ms) {
+    fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    return select(1, &fds, NULL, NULL, &tv) > 0;
+}
+#endif
+static Cljc *prim_read_key(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+#ifdef _WIN32
+    return NIL;
+#else
+    char buf[32]; size_t n = 0;
+    int c = raw_getc();
+    if (c < 0) return NIL;
+    buf[n++] = (char)c;
+    if (c == 0x1b) {
+        /* escape sequence: gather what arrives promptly (CSI "\e[...", SS3
+           "\eO..."), stopping at the final byte (0x40-0x7e) after a CSI */
+        while (n < sizeof buf - 1 && raw_pending(30)) {
+            int d = raw_getc();
+            if (d < 0) break;
+            buf[n++] = (char)d;
+            bool csi = n >= 2 && buf[1] == '[';
+            if (n >= 3 && (csi ? (d >= 0x40 && d <= 0x7e) : true)) break;
+        }
+    } else if (c >= 0xc0) {
+        /* UTF-8 lead byte: 110xxxxx=1, 1110xxxx=2, 11110xxx=3 continuations */
+        int more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : 1;
+        while (more-- > 0 && n < sizeof buf - 1) {
+            int d = raw_getc();
+            if (d < 0) break;
+            buf[n++] = (char)d;
+        }
+    }
+    return mk_str(buf, n);
+#endif
+}
+static Cljc *prim_term_size(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    int64_t rows = 24, cols = 80;
+#ifndef _WIN32
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+        rows = ws.ws_row; cols = ws.ws_col;
+    }
+#endif
+    Cljc *items[2] = { mk_int(rows), mk_int(cols) };
+    return mk_vector(items, 2);
+}
+
 /* (cljc/now-ms*) → monotonic milliseconds as a double (for `time`). */
 static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
@@ -12731,6 +12833,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "read-line", prim_read_line);
     cljc_define_native(e, "flush", prim_flush);
     cljc_define_native(e, "cljc/isatty*", prim_isatty);
+    cljc_define_native(e, "cljc/raw-mode*", prim_raw_mode);
+    cljc_define_native(e, "cljc/read-key*", prim_read_key);
+    cljc_define_native(e, "cljc/term-size*", prim_term_size);
     cljc_define_native(e, "cljc/dir?*",  prim_dir_p);
     cljc_define_native(e, "cljc/list-dir*", prim_list_dir);
     cljc_define_native(e, "tcp/listen", prim_tcp_listen);

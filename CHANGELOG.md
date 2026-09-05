@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- Raw terminal input natives for TUIs, no FFI needed: `(cljc/raw-mode* bool)`
+  enters/leaves raw mode (false when stdin isn't a tty; an `atexit` hook
+  restores the terminal on a hard exit), `(cljc/read-key*)` blocks for one
+  keypress and returns its bytes — a whole UTF-8 character or a whole escape
+  sequence (`"\e[A"` for Up; a lone Esc resolves after 30 ms), nil on EOF —
+  and `(cljc/term-size*)` gives `[rows cols]`. Same termios recipe as the
+  REPL's line editor. Windows builds get no-ops.
 - **Specter runs** (`com.rpl/specter` + `riddley`): see COMPATIBILITY.md for the
   92-case battery. The bring-up fixed six general interpreter issues below.
 - Reader conditionals honor the `:bb` feature (priority `:cljc` > `:bb` >

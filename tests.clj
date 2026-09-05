@@ -2578,7 +2578,11 @@
 
 ; System/exit really exits, with the given status, and stops execution. Was a
 ; no-op stub: it returned nil and the script ran on, so `cmd || echo failed`
-; never fired. Needs a subprocess -- calling it here would end this run.
+; never fired. Needs a subprocess -- calling it here would end this run --
+; so it is unix-gated like the other exe-spawning sections: the binary is
+; cljc.exe on Windows, and the temp path must not be an absolute POSIX one
+; (a mingw build resolves /tmp against the current drive root).
+(when cljc-test-unix?
 (let [exe (str (cljc/exe-dir*) "/cljc")
       f   (str (or (System/getenv "TMPDIR") "/tmp") "/cljc-exit-" (cljc/getpid) ".clj")]
   (spit f "(println \"before\")(System/exit 3)(println \"after\")")
@@ -2590,6 +2594,7 @@
   (spit f "(+ 1 1)")
   (assert= 0 (:exit (sh (str exe " " f))))                   ; no exit call -> 0
   (sh (str "rm -f " f)))
+) ; end when-unix
 
 ; ── TUI natives: raw-mode* / read-key* / term-size* ──
 ; term-size* is portable: a real ioctl when there is a tty, [24 80] otherwise.
@@ -2623,8 +2628,11 @@
 ; `cljc test` discovery: recursive, sorted, skips vendor/target/hidden dirs.
 ; Uses the native cljc/list-dir* (nil for a non-dir, [] -- truthy -- for an
 ; empty one), so it needs no FFI. Exercised against a temp tree.
+; Unix-gated: builds the tree with mkdir -p / rm -rf, and an absolute POSIX
+; temp path is meaningless to a mingw build. find-test-files itself is portable.
 (load-file "test.clj")   ; explicit: otherwise bound only via the clojure.test
                          ; shim required far above, which is cached/idempotent
+(when cljc-test-unix?
 (let [root (str (or (System/getenv "TMPDIR") "/tmp") "/cljc-disc-" (cljc/getpid))]
   (sh (str "rm -rf " root "; mkdir -p " root "/test/sub " root "/vendor " root "/.hid"))
   (spit (str root "/a_test.clj") "")
@@ -2636,6 +2644,7 @@
            (mapv #(subs % (inc (count root)))
                  (cljc/find-test-files root)))
   (sh (str "rm -rf " root)))
+) ; end when-unix
 (assert= "2025-07-02T23:46:40Z"
          (.format java.time.format.DateTimeFormatter/ISO_INSTANT
                   (java.time.Instant/ofEpochMilli 1751500000000)))
@@ -2884,19 +2893,20 @@
 ;; a macro reading *ns* / (ns-aliases *ns*) inside a library fn called from
 ;; user saw `user` (meander's alias-qualified operator symbols). *ns* is
 ;; restored afterwards, including when the expansion throws (ErrFrame).
-(spit "/tmp/cljc-s50-nslib.clj" "(ns s50ns.lib (:require [clojure.string :as s50str]))
+(spit "cljc_s50_nslib.clj" "(ns s50ns.lib (:require [clojure.string :as s50str]))
 (defmacro s50-ns-now [] (list 'quote *ns*))
 (defmacro s50-alias-of [a] (list 'quote (get (ns-aliases *ns*) a)))
 (defn s50-ns-probe [] (s50-ns-now))
 (defn s50-alias-probe [] (s50-alias-of s50str))
 (defmacro s50-boom [] (throw (ex-info \"boom\" {})))
 (defn s50-boom-fn [] (s50-boom))")
-(load-file "/tmp/cljc-s50-nslib.clj")
+(load-file "cljc_s50_nslib.clj")
 (assert= 'user *ns*)
 (assert= 's50ns.lib (s50ns.lib/s50-ns-probe))
 (assert= 'clojure.string (s50ns.lib/s50-alias-probe))
 (assert= 'user *ns*)
 (assert= "boom" (try (s50ns.lib/s50-boom-fn) (catch Exception e (ex-message e))))
 (assert= 'user *ns*)
+(sh "rm -f cljc_s50_nslib.clj")
 
 (println "tests complete")

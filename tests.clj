@@ -2538,6 +2538,11 @@
 (let [us (quot (cljc/now-us*) 1000)                           ; read first, so ms >= us
       ms (System/currentTimeMillis)]
   (assert= true (and (<= us ms) (< (- ms us) 5000))))         ; one clock, one epoch
+; getpid: native, so no require and no FFI (libc.clj also binds it, but that
+; needs dlopen and self-skips on Windows). Bounds only -- the value varies.
+(assert= true (pos? (cljc/getpid)))
+(assert= :int (type (cljc/getpid)))
+(assert= true (= (cljc/getpid) (cljc/getpid)))               ; stable within a process
 (assert= "2025-07-02T23:46:40Z"
          (.format java.time.format.DateTimeFormatter/ISO_INSTANT
                   (java.time.Instant/ofEpochMilli 1751500000000)))

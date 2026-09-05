@@ -9896,6 +9896,19 @@ static Cljc *prim_now_us(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
+/* (cljc/getpid) -> this process's id, as an int. Native rather than the
+ * libc.clj FFI binding, so it needs no require, costs no dlopen, and works
+ * on Windows -- where getpid() lives in <process.h> rather than <unistd.h>,
+ * so GetCurrentProcessId is used instead of relying on the mingw shim. */
+static Cljc *prim_getpid(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+#ifdef _WIN32
+    return mk_int((int64_t)GetCurrentProcessId());
+#else
+    return mk_int((int64_t)getpid());
+#endif
+}
+
 /* (cljc/sleep-ms* ms) → sleep this many milliseconds (csp timeouts). */
 static Cljc *prim_sleep_ms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -12678,6 +12691,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/mtime*", prim_mtime);
     cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
     cljc_define_native(e, "cljc/now-us*", prim_now_us);
+    cljc_define_native(e, "cljc/getpid", prim_getpid);
     cljc_define_native(e, "cljc/sleep-ms*", prim_sleep_ms);
     cljc_define_native(e, "cljc/poll-fds*", prim_poll_fds);
     cljc_define_native(e, "cljc/epoch*", prim_epoch);

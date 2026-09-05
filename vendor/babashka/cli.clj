@@ -58,8 +58,14 @@
             (recur (nnext args) (put m coerce kk nx) extra))
 
           (and (string? a) (str/starts-with? a "-") (> (count a) 1))
-          (let [kk (let [s (keyword (subs a 1))] (get alias s s))]
-            (recur (next args) (assoc m kk true) extra))
+          ;; Short flags take a value too (real babashka.cli does this whether
+          ;; or not :alias maps the key -- the alias only renames it). Assuming
+          ;; `true` dropped the value AND let it fall through to :else, where it
+          ;; became a phantom positional arg: -n 2 file -> {:args [2 file]}.
+          (let [kk (let [s (keyword (subs a 1))] (get alias s s)) nx (second args)]
+            (if (value-token? nx)
+              (recur (nnext args) (put m coerce kk nx) extra)
+              (recur (next args) (assoc m kk true) extra)))
 
           :else (recur (next args) m (conj extra a)))))))
 

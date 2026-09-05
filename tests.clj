@@ -2287,6 +2287,19 @@
 (require '[babashka.cli :as cli])
 (assert= {:threshold -5} (cli/parse-opts ["--threshold" "-5"] {:coerce {:threshold :int}}))
 (assert= {:id [1 2]} (cli/parse-opts ["--id" "1" "--id" "2"] {:coerce {:id [:int]}}))
+; Short flags take a value, like real babashka.cli -- and like the --flag
+; branch already did. Assuming `true` dropped the value AND let it fall to
+; the positional branch, so -n 2 file yielded {:args ["2" "file"]}.
+(assert= {:limit "2"} (cli/parse-opts ["-n" "2"] {:alias {:n :limit}}))
+(assert= {:n "2"}     (cli/parse-opts ["-n" "2"] {}))            ; alias only renames
+(assert= 2            (:limit (cli/parse-opts ["-n" "2"] {:alias {:n :limit}
+                                                          :coerce {:limit :int}})))
+(assert= {:args ["file.txt"] :opts {:limit "2"}}                 ; no phantom positional
+         (cli/parse-args ["-n" "2" "file.txt"] {:alias {:n :limit}}))
+(assert= {:limit "-5"} (cli/parse-opts ["-n" "-5"] {:alias {:n :limit}}))  ; negatives are values
+(assert= {:verbose true} (cli/parse-opts ["-v"] {:alias {:v :verbose}}))   ; bare flag still true
+(assert= {:verbose true :limit "3"}                              ; flag then flag-with-value
+         (cli/parse-opts ["-v" "-n" "3"] {:alias {:v :verbose :n :limit}}))
 
 ;; ── second bug pass (2026-06-28): differential-tested against real Clojure ──
 ; doubles print at full precision (was %g, 6 sig figs), Clojure Double.toString style

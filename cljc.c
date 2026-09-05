@@ -15219,7 +15219,8 @@ static void usage(FILE *f) {
         "  notebook <file|dir> [port] live literate notebook (default 7878);\n"
         "                             dir: any .clj saved in the tree is shown\n"
         "  notebook <file> -o <html>  static notebook build\n"
-        "  test [files...]            load files, run deftests, exit 1 on failure\n"
+        "  test [files...]            run deftests, exit 1 on failure; no args:\n"
+        "                             glob *_test.clj(c) under .\n"
         "  judge [-a|-i] <files...>   inline snapshot tests: fill in/verify\n"
         "                             (test expr) results; -a apply, -i review\n"
         "  lint [files...]            reader syntax check, full error rendering\n"
@@ -15517,10 +15518,19 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "test")) {
         set_args(env, argc, argv, 2);
+        /* No file arguments: discover *_test.clj(c) from . rather than loading
+         * nothing and exiting 0 -- a green result that tested nothing is worse
+         * than an error. Explicit arguments always win. */
         return run_subprogram(env,
             "(load-file \"test.clj\")"
-            "(doseq [f *args*] (load-file f))"
-            "(run-tests)", true);
+            "(let [fs (if (seq *args*) (vec *args*) (cljc/find-test-files))]"
+            "  (if (empty? fs)"
+            "    (do (println \"cljc test: no *_test.clj or *_test.cljc files found under .\")"
+            "        false)"
+            "    (do (when-not (seq *args*)"
+            "          (println (str \"testing \" (count fs) \" file(s): \" (str/join \" \" fs))))"
+            "        (doseq [f fs] (load-file f))"
+            "        (run-tests))))", true);
     }
     if (!strcmp(cmd, "lint")) {
         if (argc < 3) { fputs("usage: cljc lint <files...>\n", stderr); return 1; }

@@ -2562,6 +2562,23 @@
 (assert= true (pos? (cljc/getpid)))
 (assert= :int (type (cljc/getpid)))
 (assert= true (= (cljc/getpid) (cljc/getpid)))               ; stable within a process
+
+; `cljc test` discovery: recursive, sorted, skips vendor/target/hidden dirs.
+; Uses the native cljc/list-dir* (nil for a non-dir, [] -- truthy -- for an
+; empty one), so it needs no FFI. Exercised against a temp tree.
+(load-file "test.clj")   ; explicit: otherwise bound only via the clojure.test
+                         ; shim required far above, which is cached/idempotent
+(let [root (str (or (System/getenv "TMPDIR") "/tmp") "/cljc-disc-" (cljc/getpid))]
+  (sh (str "rm -rf " root "; mkdir -p " root "/test/sub " root "/vendor " root "/.hid"))
+  (spit (str root "/a_test.clj") "")
+  (spit (str root "/test/sub/b_test.cljc") "")
+  (spit (str root "/vendor/skip_test.clj") "")            ; skipped dir
+  (spit (str root "/.hid/skip_test.clj") "")              ; hidden dir
+  (spit (str root "/notatest.clj") "")                    ; wrong suffix
+  (assert= ["a_test.clj" "test/sub/b_test.cljc"]
+           (mapv #(subs % (inc (count root)))
+                 (cljc/find-test-files root)))
+  (sh (str "rm -rf " root)))
 (assert= "2025-07-02T23:46:40Z"
          (.format java.time.format.DateTimeFormatter/ISO_INSTANT
                   (java.time.Instant/ofEpochMilli 1751500000000)))

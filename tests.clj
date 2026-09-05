@@ -2591,6 +2591,35 @@
   (assert= 0 (:exit (sh (str exe " " f))))                   ; no exit call -> 0
   (sh (str "rm -f " f)))
 
+; ── TUI natives: raw-mode* / read-key* / term-size* ──
+; term-size* is portable: a real ioctl when there is a tty, [24 80] otherwise.
+(let [sz (cljc/term-size*)]
+  (assert= 2 (count sz))
+  (assert= :int (type (first sz)))
+  (assert= true (and (pos? (first sz)) (pos? (second sz)))))
+
+(when cljc-test-unix?
+; read-key* reads fd 0 with read()/select(), which do not require a tty -- so
+; these drive it from a pipe, with no pty and no sleeps to go flaky. Escape
+; sequences must arrive whole, a lone ESC must fall out of the 30ms window,
+; and multi-byte UTF-8 must be gathered into ONE character (count 1, not 2).
+(let [exe (str (cljc/exe-dir*) "/cljc")
+      f   (str "/tmp/cljc-key-" (cljc/getpid) ".clj")
+      run (fn [in] (str/trim (:out (sh (str "printf '" in "' | " exe " " f)))))]
+  (spit f "(println (str/join \",\" (map int (seq (cljc/read-key*)))))")
+  (assert= "27,91,65"           (run "\\033[A"))        ; Up arrow: whole CSI
+  (assert= "113"                (run "q"))               ; plain key
+  (assert= "27"                 (run "\\033"))          ; lone Esc, not a prefix
+  (assert= "233"                (run "\\303\\251"))    ; é: one char, not two bytes
+  (assert= "27,91,49,59,53,65"  (run "\\033[1;5A"))     ; CSI with parameters
+  (spit f "(prn (cljc/read-key*))")
+  (assert= "nil" (run ""))                               ; EOF
+  ; raw-mode* declines when stdin is not a tty, rather than erroring
+  (spit f "(prn (cljc/raw-mode* true))")
+  (assert= "false" (str/trim (:out (sh (str exe " " f " < /dev/null")))))
+  (sh (str "rm -f " f)))
+) ; end when-unix
+
 ; `cljc test` discovery: recursive, sorted, skips vendor/target/hidden dirs.
 ; Uses the native cljc/list-dir* (nil for a non-dir, [] -- truthy -- for an
 ; empty one), so it needs no FFI. Exercised against a temp tree.

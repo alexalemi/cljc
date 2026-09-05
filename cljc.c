@@ -9875,6 +9875,27 @@ static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
+/* (cljc/now-us*) -> WALL-CLOCK microseconds since the Unix epoch, as an int.
+ * Deliberately separate from now-ms*, which is CLOCK_MONOTONIC: monotonic is
+ * the right clock for measuring durations (timers, deadlines -- it cannot jump
+ * when NTP steps the clock) but its origin is boot, not 1970, so it can never
+ * answer "what time is it". int64 holds epoch micros until AD 294247. Returned
+ * as an integer, not a double: at this magnitude a double's ulp is ~0.5us
+ * (2^-52 * 2^41 ms), so microseconds would not survive the round trip. */
+static Cljc *prim_now_us(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);           /* 100ns ticks since 1601-01-01 */
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | (uint64_t)ft.dwLowDateTime;
+    return mk_int((int64_t)(t / 10u) - 11644473600000000LL);  /* 1601 -> 1970 */
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return mk_int((int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000);
+#endif
+}
+
 /* (cljc/sleep-ms* ms) → sleep this many milliseconds (csp timeouts). */
 static Cljc *prim_sleep_ms(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -11484,7 +11505,7 @@ static const char *PRELUDE =
     "(defn System/getenv ([] {}) ([k] (cljc/env* k)))\n"
     "(defn System/getProperty ([k] nil) ([k d] d))\n"
     "(defn System/exit [n] nil)\n"
-    "(defn System/currentTimeMillis [] (long (cljc/now-ms*)))\n"
+    "(defn System/currentTimeMillis [] (quot (cljc/now-us*) 1000))\n"
     /* Apache Commons Math integer gcd, used by Emmy's rational-function simplifier */
     "(defn ArithmeticUtils/gcd [a b]\n"
     "  (let [a (if (neg? a) (- a) a) b (if (neg? b) (- b) b)]\n"
@@ -12656,6 +12677,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "spit",    prim_spit);
     cljc_define_native(e, "cljc/mtime*", prim_mtime);
     cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
+    cljc_define_native(e, "cljc/now-us*", prim_now_us);
     cljc_define_native(e, "cljc/sleep-ms*", prim_sleep_ms);
     cljc_define_native(e, "cljc/poll-fds*", prim_poll_fds);
     cljc_define_native(e, "cljc/epoch*", prim_epoch);
@@ -13396,7 +13418,7 @@ CljcEnv *cljc_new_env(void) {
         "      (format \"%04d-%02d-%02dT%02d:%02d:%02dZ\" y m d hh mi ss)\n"
         "      (format \"%04d-%02d-%02dT%02d:%02d:%02d.%03dZ\" y m d hh mi ss frac))))\n"
         "(def java.time.Instant :Instant)\n"
-        "(defn java.time.Instant/now [] {:cljc/type :Instant :ms (long (cljc/now-ms*))})\n"
+        "(defn java.time.Instant/now [] {:cljc/type :Instant :ms (quot (cljc/now-us*) 1000)})\n"
         "(defn java.time.Instant/ofEpochMilli [ms] {:cljc/type :Instant :ms (long ms)})\n"
         "(cljc/reg-method! 'toEpochMilli :Instant (fn [this] (:ms this)))\n"
         "(cljc/reg-method! 'getEpochSecond :Instant (fn [this] (quot (:ms this) 1000)))\n"
@@ -13405,7 +13427,7 @@ CljcEnv *cljc_new_env(void) {
         "(def java.time.format.DateTimeFormatter/ISO_INSTANT {:cljc/type :DateTimeFormatter :kind :iso-instant})\n"
         "(cljc/reg-method! 'format :DateTimeFormatter (fn [this t] (cljc/instant-iso* (:ms t))))\n"
         "(def java.util.Date :Date)\n"
-        "(defn java.util.Date. ([] {:cljc/type :Date :ms (long (cljc/now-ms*))})\n"
+        "(defn java.util.Date. ([] {:cljc/type :Date :ms (quot (cljc/now-us*) 1000)})\n"
         "                      ([ms] {:cljc/type :Date :ms (long ms)}))\n"
         "(cljc/reg-method! 'toInstant :Date (fn [this] {:cljc/type :Instant :ms (:ms this)}))\n"
         "(cljc/reg-method! 'getTime :Date (fn [this] (:ms this)))\n"

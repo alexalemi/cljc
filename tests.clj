@@ -2529,6 +2529,15 @@
 (assert= "2025-07-02T23:46:40Z" (str (java.time.Instant/ofEpochMilli 1751500000000)))
 (assert= "1970-01-01T00:00:00.123Z" (str (java.time.Instant/ofEpochMilli 123)))
 (assert= 1751500000000 (.toEpochMilli (java.time.Instant/ofEpochMilli 1751500000000)))
+; Wall clock, NOT the monotonic clock behind now-ms*. Deriving these from
+; now-ms* reported machine uptime instead: Instant/now said 1970-01-16 and
+; currentTimeMillis returned ~1.4e12 rather than ~1.8e12 (fixed 2026-09-05).
+; Asserted as bounds, not exact values, so the test stays deterministic.
+(assert= true (> (System/currentTimeMillis) 1750000000000))   ; after 2025-06-21
+(assert= "20" (subs (str (java.time.Instant/now)) 0 2))       ; 21st century, not 1970
+(let [us (quot (cljc/now-us*) 1000)                           ; read first, so ms >= us
+      ms (System/currentTimeMillis)]
+  (assert= true (and (<= us ms) (< (- ms us) 5000))))         ; one clock, one epoch
 (assert= "2025-07-02T23:46:40Z"
          (.format java.time.format.DateTimeFormatter/ISO_INSTANT
                   (java.time.Instant/ofEpochMilli 1751500000000)))

@@ -2584,6 +2584,24 @@
 ; currentTimeMillis returned ~1.4e12 rather than ~1.8e12 (fixed 2026-09-05).
 ; Asserted as bounds, not exact values, so the test stays deterministic.
 (assert= true (> (System/currentTimeMillis) 1750000000000))   ; after 2025-06-21
+
+; compare on strings/keywords/symbols follows Java's String.compareTo: the
+; difference of the first differing char, or of the LENGTHS when one is a
+; prefix of the other. It returned strcmp's raw value, whose magnitude C does
+; not specify -- aarch64 glibc gave 64 for ("b" "a") where x86 gave 1 -- and
+; whose prefix case was wrong everywhere, comparing against the NUL: ("a" "aa")
+; was 0 - \a = -97 on every platform. Found on Linux/aarch64 by the ides.club
+; session; the prefix cases were latent on x86 too.
+(assert= -1  (compare "a" "aa"))          ; prefix -> length difference
+(assert= 1   (compare "aa" "a"))
+(assert= -1  (compare "" "a"))
+(assert= 0   (compare "" ""))
+(assert= -23 (compare "abc" "abz"))       ; mismatch -> char difference
+(assert= 1   (compare "b" "a"))
+(assert= -32 (compare "A" "a"))
+(assert= -1  (compare :a :aa))            ; keywords and symbols too
+(assert= -1  (compare 'a 'aa))
+(assert= ["" "a" "aa" "abc" "b"] (vec (sorted-set "b" "a" "aa" "" "abc")))
 (assert= "20" (subs (str (java.time.Instant/now)) 0 2))       ; 21st century, not 1970
 (let [us (quot (cljc/now-us*) 1000)                           ; read first, so ms >= us
       ms (System/currentTimeMillis)]

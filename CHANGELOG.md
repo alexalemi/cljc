@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+- `compare` on strings, keywords and symbols follows Java's `String.compareTo`:
+  the difference of the first differing character, or of the **lengths** when
+  one is a prefix of the other. It returned `strcmp`'s raw value, and C
+  specifies only `strcmp`'s *sign* — aarch64 glibc's word-at-a-time strcmp
+  returns 64 for `(compare "b" "a")` where x86 returns 1. The prefix case was
+  wrong on every platform, since strcmp compares against the NUL terminator:
+  `(compare "a" "aa")` was `0 - \a` = -97 where the JVM gives -1; x86 only
+  looked correct because glibc happens to return the byte difference for
+  mismatches there. Sign was always correct, so sorting and comparators were
+  unaffected. Found on Linux/aarch64 by the ides.club Claude session; the
+  conformance corpus gains a prefix pair and a far-apart-chars pair, which
+  would have caught the latent half on x86.
+
 ## v0.4.1 — 2026-09-05
 
 ### Security

@@ -38,6 +38,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>   /* INT_MAX — clamping the length delta in str_compare */
 #include <setjmp.h>
 #include <math.h>
 #include <time.h>
@@ -9136,6 +9137,33 @@ static Cljc *prim_swap(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── compare / sort ── */
 
+/* Java's String.compareTo, which is what Clojure's `compare` uses on strings,
+ * keywords and symbols: the difference of the first differing character, or
+ * of the LENGTHS when one is a prefix of the other.
+ *
+ * Not strcmp. C specifies only strcmp's SIGN -- the magnitude is the libc's
+ * business and differs by architecture: aarch64 glibc's word-at-a-time strcmp
+ * returns 64 for ("b" "a") where x86 returns 1. And the prefix case was wrong
+ * on EVERY platform, because strcmp compares against the NUL terminator:
+ * (compare "a" "aa") gave 0 - 'a' = -97 where the JVM gives -1. x86 only
+ * looked correct because glibc happens to return the byte difference there.
+ *
+ * Byte-wise, not codepoint-wise: identical to the JVM for ASCII, and since
+ * UTF-8 preserves codepoint order the sign is right for any input. The
+ * magnitude of a multi-byte mismatch is a byte difference rather than the
+ * JVM's UTF-16 char difference; callers may only rely on the sign there. */
+static int str_compare(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b), lim = la < lb ? la : lb;
+    for (size_t i = 0; i < lim; i++) {
+        int ca = (unsigned char)a[i], cb = (unsigned char)b[i];
+        if (ca != cb) return ca - cb;
+    }
+    if (la == lb) return 0;
+    size_t d = la < lb ? lb - la : la - lb;
+    int dd = d > (size_t)INT_MAX ? INT_MAX : (int)d;
+    return la < lb ? -dd : dd;
+}
+
 static int cmp_values(Cljc *a, Cljc *b) {
     if (a == b) return 0;
     if (a == NIL) return -1;          /* nil sorts first */
@@ -9145,10 +9173,10 @@ static int cmp_values(Cljc *a, Cljc *b) {
     if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
     if (a->tag != b->tag) cljc_error("compare: %s and %s are not comparable", val_desc(a), val_desc(b));
     switch (a->tag) {
-        case CLJC_STRING:  return strcmp(a->as.str, b->as.str);
+        case CLJC_STRING:  return str_compare(a->as.str, b->as.str);
         case CLJC_CHAR:    return a->as.chr - b->as.chr;
-        case CLJC_KEYWORD: return strcmp(a->as.kw, b->as.kw);
-        case CLJC_SYMBOL:  return strcmp(a->as.sym, b->as.sym);
+        case CLJC_KEYWORD: return str_compare(a->as.kw, b->as.kw);
+        case CLJC_SYMBOL:  return str_compare(a->as.sym, b->as.sym);
         case CLJC_BOOL:    return (int)a->as.b - (int)b->as.b;
         case CLJC_VECTOR: case CLJC_LIST: {
             /* Clojure's APersistentVector.compareTo orders by count FIRST,

@@ -2575,6 +2575,20 @@
 (assert= true (pos? (cljc/getpid)))
 (assert= :int (type (cljc/getpid)))
 (assert= true (= (cljc/getpid) (cljc/getpid)))               ; stable within a process
+(assert= :int (type (cljc/getuid)))
+(assert= true (>= (cljc/getuid) 0))
+
+; The FFI module cache is dlopen'd, so it must not sit at a path shared with
+; other users in a world-writable /tmp: anyone could plant a .so there and get
+; it executed in this process. It lives in a private 0700 per-user dir, and is
+; loaded only when `test -O` says this user owns it. (ls, not stat -c: BSD stat
+; takes different flags and CI runs macOS.)
+(when cljc-test-unix?
+(let [d (cljc/user-tmp-dir*)]
+  (assert= true (str/includes? d (str "cljc-" (cljc/getuid))))     ; per-user path
+  (assert= 0 (:exit (sh (str "test -d " d " && test -O " d))))     ; exists, ours
+  (assert= true (str/starts-with? (:out (sh (str "ls -ld " d))) "drwx------")))
+) ; end when-unix
 
 ; System/exit really exits, with the given status, and stops execution. Was a
 ; no-op stub: it returned nil and the script ran on, so `cmd || echo failed`

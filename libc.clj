@@ -11,7 +11,7 @@
 
 ;; getcwd wants a caller-owned buffer, and the buffer-free GNU alternative
 ;; (get_current_dir_name) doesn't exist on macOS — a tiny shim owns the buffer.
-(spit "/tmp/cljc_libc_shim.h"
+(spit (str (cljc/user-tmp-dir*) "/cljc_libc_shim.h")
       "#include <unistd.h>\nstatic inline char *cljc_libc_cwd(void){ static char b[4096]; return getcwd(b, sizeof b); }\n")
 
 (ffi/define
@@ -34,7 +34,7 @@
    [:int sleep [:int]]
    [:int usleep [:int]]]
   {:headers ["unistd.h" "stdlib.h" "sys/stat.h" "stdio.h" "cljc_libc_shim.h"]
-   :libs "-I/tmp"})
+   :libs (str "-I" (cljc/user-tmp-dir*))})
 
 ;; ── friendly wrappers ──
 

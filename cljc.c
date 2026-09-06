@@ -10015,6 +10015,17 @@ static Cljc *prim_getpid(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
+/* (cljc/getuid) -> the real user id; 0 on Windows, which has no uid. Used to
+ * give each user a private scratch dir for the FFI module cache. */
+static Cljc *prim_getuid(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+#ifdef _WIN32
+    return mk_int(0);
+#else
+    return mk_int((int64_t)getuid());
+#endif
+}
+
 /* (cljc/exit* n) -> terminate the process with status n. System/exit is
  * defined on top of this. Streams are flushed first: exit() flushes stdio
  * but cljc may hold buffered output of its own. */
@@ -12825,6 +12836,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
     cljc_define_native(e, "cljc/now-us*", prim_now_us);
     cljc_define_native(e, "cljc/getpid", prim_getpid);
+    cljc_define_native(e, "cljc/getuid", prim_getuid);
     cljc_define_native(e, "cljc/exit*", prim_exit);
     cljc_define_native(e, "cljc/sleep-ms*", prim_sleep_ms);
     cljc_define_native(e, "cljc/poll-fds*", prim_poll_fds);
@@ -14303,13 +14315,29 @@ CljcEnv *cljc_new_env(void) {
         "       \" void*(*mk_vec)(void**,int); void*(*nth_elem)(void*,int);\"\n"
         "       \" } CljcFfiApi;\\n\"\n"
         "       \"static CljcFfiApi *api;\\n\"))\n"
+        /* A private 0700 scratch dir per user. The FFI cache below is dlopen'd,
+         * so a path shared across users in a world-writable /tmp lets anyone
+         * plant a .so and get it executed in another user's process. Created
+         * and ownership-checked once, then memoised. */
+        "(def cljc/user-tmp-dir-cache (atom nil))\n"
+        "(defn cljc/user-tmp-dir* []\n"
+        "  (or @cljc/user-tmp-dir-cache\n"
+        "      (let [d (str (or (cljc/env* \"TMPDIR\") \"/tmp\") \"/cljc-\" (cljc/getuid))]\n"
+        "        (sh (str \"mkdir -p \" d \" && chmod 700 \" d))\n"
+        "        (when-not (zero? (:exit (sh (str \"test -d \" d \" && test -O \" d))))\n"
+        "          (throw (ex-info (str \"cljc: \" d \" exists but is not a directory \"\n"
+        "                               \"owned by this user; refusing to use it\") {})))\n"
+        "        (reset! cljc/user-tmp-dir-cache d)\n"
+        "        d)))\n"
         "(defn cljc/ffi-build [code libs]\n"
         ";; CLJC_CC (same env var bundle.clj honors) overrides the glue compiler —\n"
         ";; needed e.g. under Rosetta, where plain cc emits the wrong architecture.\n"
         ";; It participates in the cache key so two arches can't share a module.\n"
         "  (let [cc (or (cljc/env* \"CLJC_CC\") \"cc\")\n"
-        "        base (str \"/tmp/cljc-ffi4-\" (Math/abs (hash (str code libs cc))))]\n"
-        "    (when-not (zero? (:exit (sh (str \"test -f \" base \".so\"))))\n"
+        "        base (str (cljc/user-tmp-dir*) \"/ffi4-\" (Math/abs (hash (str code libs cc))))]\n"
+        /* test -O, not -f: the module is dlopen'd, so loading one this user
+         * does not own would execute someone else's code in this process. */
+        "    (when-not (zero? (:exit (sh (str \"test -O \" base \".so\"))))\n"
         "      (spit (str base \".c\") code)\n"
         "      (let [r (sh (str cc \" -shared -fPIC -O2 -o \" base \".so \" base \".c \" libs))]\n"
         "        (when-not (zero? (:exit r))\n"

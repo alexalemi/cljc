@@ -4,6 +4,24 @@
 
 ## v0.4.0 — 2026-09-05
 
+### Security
+- **FFI module cache was a local code-execution vector on multi-user hosts.**
+  It lived at `/tmp/cljc-ffi4-<hash>.so`, where the hash covers only
+  `(code, libs, cc)` and is therefore identical for every user on the machine;
+  cljc tested `-f` and then `dlopen`ed it with no ownership check. Any local
+  user could precompute the hash, plant a `.so`, and have it executed inside
+  another user's cljc process. The cache now lives in a private per-user
+  directory (`$TMPDIR/cljc-<uid>`, created 0700 and refused if it exists and
+  is not a directory this user owns), and a module is loaded only when
+  `test -O` confirms this user owns it. Setting `TMPDIR` alone was never a
+  mitigation, since the paths were hardcoded. Only reachable by code that
+  loads the FFI or JIT batteries.
+- `libc.clj` wrote its shim to a fixed `/tmp/cljc_libc_shim.h`. Because `/tmp`
+  is sticky, every user after the first could not overwrite it, breaking
+  `libc.clj` and `fs.clj` for them; it was also a symlink-follow target. It
+  moves into the same private per-user directory.
+- Added `(cljc/getuid)` — native, used to scope that directory.
+
 ### Added
 - `(cljc/now-us*)` — wall-clock microseconds since the Unix epoch, as an exact
   int64. Distinct from `now-ms*`, which stays `CLOCK_MONOTONIC` because it

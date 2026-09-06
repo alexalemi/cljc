@@ -2,7 +2,20 @@
 
 ## Unreleased
 
+## v0.4.0 — 2026-09-05
+
 ### Added
+- `(cljc/now-us*)` — wall-clock microseconds since the Unix epoch, as an exact
+  int64. Distinct from `now-ms*`, which stays `CLOCK_MONOTONIC` because it
+  backs `fiber/timer!`, `csp/timeout` and every deadline: a wall-clock deadline
+  stalls when NTP steps the clock. Returned as an integer, not a double — at
+  epoch magnitude a double's ulp is ~0.5 µs, so microseconds would not survive.
+- `(cljc/getpid)` — native, so no `require` and no `dlopen`, and it works on
+  Windows (`GetCurrentProcessId`) where `libc.clj`'s FFI binding self-skips.
+- `cljc test` with no file arguments discovers `*_test.clj`/`*_test.cljc` under
+  `.`, sorted, skipping `vendor`/`target`/`node_modules`/`out` and dotted dirs,
+  and prints what it found. Explicit arguments still win.
+- `make test-full` runs the GC-stress pass; `make test` no longer does.
 - Raw terminal input natives for TUIs, no FFI needed: `(cljc/raw-mode* bool)`
   enters/leaves raw mode (false when stdin isn't a tty; an `atexit` hook
   restores the terminal on a hard exit), `(cljc/read-key*)` blocks for one
@@ -20,6 +33,32 @@
   `ITransientVector`, `Cons`, `IRecord` (every `defrecord` type derives it),
   `Sorted`; sorted maps/sets derive the map/set interfaces.
   `(type (transient []))` is `:transient-vector` (was `:unknown`).
+
+### Changed
+- `System/exit` **actually exits**. It was `(defn System/exit [n] nil)`: it
+  returned nil *and let the script run on*, so `cljc script.clj || echo failed`
+  never fired whatever the script did. At a REPL prompt or inside an nREPL eval
+  it unwinds with an error instead of terminating, so a loaded file calling
+  `System/exit` cannot kill an editor's connection.
+- `System/currentTimeMillis`, `java.time.Instant/now` and `java.util.Date.`
+  report **wall-clock time**. They were derived from the monotonic `now-ms*`,
+  whose origin is boot, so they returned the machine's uptime — `Instant/now`
+  answered `1970-01-16T…`. `System/nanoTime` is unchanged: Java specifies it as
+  monotonic, so deriving it from `now-ms*` was already correct.
+- `Integer/toString` with a radix is **signed** (`-101`, was `101`) and
+  `Integer/toBinaryString` is **unsigned** two's complement over 32 bits
+  (`(Integer/toBinaryString -1)` → 32 ones, was `"1"`); new
+  `Long/toBinaryString` is the 64-bit form. These are different functions on
+  the JVM and one had been defined as the other, which dropped the sign: `+2^54`
+  and `-2^54` printed identically.
+- `babashka.cli` short flags **take a value**, as real babashka.cli does with or
+  without `:alias` — `-n 2` is `{:n 2}`, was `{:n true}`. The value had also
+  fallen through to the positional branch, so `-n 2 file` yielded
+  `{:args ["2" "file"]}`. **This changes existing parses**: a boolean short flag
+  followed by a positional argument now consumes it; declare booleans via
+  `:coerce` or use `--flag`.
+- `cljc test` with no arguments and no test files found exits **1**, not 0. A
+  green result that tested nothing passes CI whether or not the tests exist.
 
 ### Fixed
 - A top-level `(do ...)` evaluates its subforms one at a time, as JVM Clojure
@@ -54,6 +93,13 @@
   `*ns*` or `(ns-aliases *ns*)` inside a library fn first called from `user`
   saw `user` — JVM Clojure expands at definition time. `*ns*` is restored
   afterwards, including when the expansion throws.
+- Windows CI: three `spit`/`load-file` calls used absolute POSIX paths, which a
+  mingw build resolves against the current drive root — the suite aborted there.
+  The portable one now uses a relative path (and cleans up after itself); the
+  two that need a POSIX shell and the unix binary name are `when-unix` gated.
+- The nREPL test's read loop is bounded by a deadline. `csp/recv!` parks on
+  POLLIN with no timeout, so a server fiber dying without closing the socket
+  wedged the whole suite at 100% CPU — and any `./install.sh` running it.
 
 ## v0.3.0 — 2026-08-27
 

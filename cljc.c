@@ -122,7 +122,7 @@ static void cljc_no_sigpipe(int fd) {
 #endif
 }
 
-#define CLJC_VERSION "0.4.1"
+#define CLJC_VERSION "0.4.2"
 #ifndef CLJC_SHAREDIR
 #define CLJC_SHAREDIR "/usr/local/share/cljc"
 #endif

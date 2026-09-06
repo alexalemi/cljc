@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.2 — 2026-09-06
+
 ### Fixed
 - `compare` on strings, keywords and symbols follows Java's `String.compareTo`:
   the difference of the first differing character, or of the **lengths** when

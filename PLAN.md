@@ -4,7 +4,7 @@ Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
 (`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test`
 (suite + conformance); `make test-full` adds the `CLJC_GC_STRESS=1` pass.
 
-## Status (as of 2026-09-05, v0.4.1)
+## Status (as of 2026-09-06, v0.4.2)
 
 ~15,400 lines, zero warnings, ~1470 assertions in `tests.clj` + 412-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean

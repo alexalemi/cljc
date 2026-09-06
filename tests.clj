@@ -1987,6 +1987,24 @@
 (let [r (cljc-a/<!! (cljc-h/post "http://127.0.0.1:8093/echo" "payload"))]
   (assert= 201 (:status r))
   (assert= "payload" (:body r)))
+; http/serve binds LOOPBACK by default; it used to hardcode "0.0.0.0", exposing
+; every served app -- and this suite's own port -- to the whole network. Both
+; bindings answer identically on 127.0.0.1, so only the socket table tells them
+; apart: ss on Linux, netstat on macOS, and the address separator differs
+; (127.0.0.1:8093 vs 127.0.0.1.8093). Skips if neither tool is present.
+(let [probe (cond (zero? (:exit (sh "command -v ss")))      "ss -tln"
+                  (zero? (:exit (sh "command -v netstat"))) "netstat -an"
+                  :else nil)]
+  (if-not probe
+    (println "SKIP: socket-table check (no ss or netstat)")
+    (let [out (:out (sh (str probe " 2>/dev/null")))]
+      (assert= true  (some? (re-find #"127\.0\.0\.1[.:]8093" out)))   ; loopback
+      (assert= false (some? (re-find #"0\.0\.0\.0[.:]8093" out)))))) ; NOT all-interfaces
+; the host argument still opts in explicitly
+(cljc-h/serve 8094
+  (cljc-h/router [[:get "/hi/:who" (fn [req] (str "hi " (:who (:params req))))]])
+  "127.0.0.1")
+(assert= "hi bob" (:body (cljc-a/<!! (cljc-h/get "http://127.0.0.1:8094/hi/bob"))))
 ; nrepl.clj: bencode round-trip + a concurrent server eval through the loop
 (require '[nrepl :as cljc-n])
 (assert= [{"op" "eval" "id" "1" "code" "(+ 2 3)"} ""]      ; bencode encode/decode round-trip

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.4.1 — 2026-09-05
+
+### Security
+- `http/serve` binds **loopback** by default. It hardcoded `"0.0.0.0"` — every
+  interface — so anything served with the battery was reachable from the whole
+  network, and no argument could ask for anything else; running the test suite
+  exposed its own port 8093 for the duration of the run. Both bindings answer
+  identically on `127.0.0.1`, which is why it went unnoticed. `tcp/listen`
+  already defaults to loopback and `nrepl.clj` passes it explicitly; this was
+  the one place overriding that. Pass a host to opt back in:
+  `(serve 8080 h "0.0.0.0")`, likewise `run-server`. **Breaking** for anyone
+  relying on `http/serve` being reachable from another machine.
+
 ## v0.4.0 — 2026-09-05
 
 ### Security

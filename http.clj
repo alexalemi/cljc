@@ -110,8 +110,19 @@
 ;; ── server ───────────────────────────────────────────────────────────────
 ;; Returns the listening socket; spawns the accept loop as a go block. Call
 ;; (csp/run!) to drive it (or use run-server, which does both).
-(defn serve [port handler]
-  (let [srv (tcp/listen port "0.0.0.0")]
+;;
+;; Binds LOOPBACK by default, like nrepl.clj and like tcp/listen's own default.
+;; It used to hardcode "0.0.0.0" — every interface — so anything served was
+;; reachable from the whole network, and no argument could ask for anything
+;; else. Both bindings behave identically when you test against 127.0.0.1,
+;; which is why it went unnoticed. Pass a host to opt in:
+;;   (serve 8080 h)             loopback only
+;;   (serve 8080 h "0.0.0.0")   every interface
+;;   (serve 8080 h "100.x.y.z") one specific address
+(defn serve
+  ([port handler] (serve port handler "127.0.0.1"))
+  ([port handler host]
+  (let [srv (tcp/listen port host)]
     (csp/go-loop []
       (when-let [conn (csp/accept! srv)]
         (csp/go                          ; one goroutine per connection
@@ -122,12 +133,14 @@
               (csp/send! conn (response->str resp))))
           (tcp/close conn))
         (recur)))
-    srv))
+    srv)))
 
-(defn run-server [port handler]
-  (serve port handler)
-  (println (str "http: serving on http://0.0.0.0:" port "  (ctrl-c to stop)"))
-  (csp/run!))
+(defn run-server
+  ([port handler] (run-server port handler "127.0.0.1"))
+  ([port handler host]
+   (serve port handler host)
+   (println (str "http: serving on http://" host ":" port "  (ctrl-c to stop)"))
+   (csp/run!)))
 
 ;; ── client (returns a channel) ─────────────────────────────────────────────
 (defn- parse-url [url]
